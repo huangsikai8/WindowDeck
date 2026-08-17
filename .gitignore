@@ -1,0 +1,10 @@
+# SwiftPM build products (~255 MB) and the assembled .app bundle.
+.build/
+build/
+
+# The signing identity is machine-local; the app is signed at build time.
+*.p12
+
+.DS_Store
+xcuserdata/
+*.xcuserstate

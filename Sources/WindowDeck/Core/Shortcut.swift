@@ -1,0 +1,176 @@
+import AppKit
+import Carbon.HIToolbox
+
+/// Which way a group cycle moves through the strip order. Two keys rather than
+/// one key plus Shift, because up and down are the whole point — the list is in
+/// a fixed order and the arrow says where you are going in it.
+enum GroupCycleDirection: String, Hashable, Codable {
+    case previous, next
+
+    var step: Int { self == .previous ? -1 : 1 }
+}
+
+/// Something a shortcut can trigger.
+enum ShortcutAction: Hashable, Codable {
+    /// Cycle windows within the active group.
+    case cycleGroupWindows
+    /// Cycle windows of the frontmost app, within the active group.
+    case cycleAppWindows
+    /// Move through the groups themselves, in strip order.
+    case cycleGroups(GroupCycleDirection)
+    /// Jump to the group at this 1-based position.
+    case selectGroup(Int)
+
+    var storageKey: String {
+        switch self {
+        case .cycleGroupWindows: "cycleGroupWindows"
+        case .cycleAppWindows: "cycleAppWindows"
+        case .cycleGroups(let direction): "cycleGroups\(direction.rawValue.capitalized)"
+        case .selectGroup(let position): "selectGroup\(position)"
+        }
+    }
+
+    static func from(storageKey: String) -> ShortcutAction? {
+        switch storageKey {
+        case "cycleGroupWindows": return .cycleGroupWindows
+        case "cycleAppWindows": return .cycleAppWindows
+        case "cycleGroupsPrevious": return .cycleGroups(.previous)
+        case "cycleGroupsNext": return .cycleGroups(.next)
+        default:
+            guard storageKey.hasPrefix("selectGroup"),
+                  let position = Int(storageKey.dropFirst("selectGroup".count))
+            else { return nil }
+            return .selectGroup(position)
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .cycleGroupWindows: "Cycle windows in group"
+        case .cycleAppWindows: "Cycle windows of current app"
+        case .cycleGroups(.previous): "Previous group"
+        case .cycleGroups(.next): "Next group"
+        case .selectGroup(let position): "Switch to group \(position)"
+        }
+    }
+}
+
+/// A key plus its modifiers, stored in Carbon's terms because that is what
+/// `RegisterEventHotKey` consumes.
+struct Shortcut: Codable, Equatable, Hashable {
+    var keyCode: UInt16
+    /// Carbon modifier mask (`controlKey`, `optionKey`, `cmdKey`, `shiftKey`).
+    var carbonModifiers: UInt32
+
+    init(keyCode: UInt16, carbonModifiers: UInt32) {
+        self.keyCode = keyCode
+        self.carbonModifiers = carbonModifiers
+    }
+
+    init?(event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let carbon = Shortcut.carbonMask(from: flags)
+        // A shortcut with no modifier would swallow that key everywhere on the
+        // system — press it once and you could never type that character again.
+        guard carbon != 0 else { return nil }
+        self.keyCode = event.keyCode
+        self.carbonModifiers = carbon
+    }
+
+    static func carbonMask(from flags: NSEvent.ModifierFlags) -> UInt32 {
+        var mask: UInt32 = 0
+        if flags.contains(.control) { mask |= UInt32(controlKey) }
+        if flags.contains(.option) { mask |= UInt32(optionKey) }
+        if flags.contains(.command) { mask |= UInt32(cmdKey) }
+        if flags.contains(.shift) { mask |= UInt32(shiftKey) }
+        return mask
+    }
+
+    /// The modifier flags this shortcut is held with, used to notice the release
+    /// that commits a switcher cycle.
+    var triggerFlags: NSEvent.ModifierFlags {
+        var flags: NSEvent.ModifierFlags = []
+        if carbonModifiers & UInt32(controlKey) != 0 { flags.insert(.control) }
+        if carbonModifiers & UInt32(optionKey) != 0 { flags.insert(.option) }
+        if carbonModifiers & UInt32(cmdKey) != 0 { flags.insert(.command) }
+        // Shift is deliberately excluded: it is the reverse-direction key while
+        // cycling, so its release must not commit.
+        return flags
+    }
+
+    var displayString: String {
+        var text = ""
+        if carbonModifiers & UInt32(controlKey) != 0 { text += "⌃" }
+        if carbonModifiers & UInt32(optionKey) != 0 { text += "⌥" }
+        if carbonModifiers & UInt32(shiftKey) != 0 { text += "⇧" }
+        if carbonModifiers & UInt32(cmdKey) != 0 { text += "⌘" }
+        return text + Shortcut.keyName(for: keyCode)
+    }
+
+    static func keyName(for keyCode: UInt16) -> String {
+        if let named = specialKeyNames[Int(keyCode)] { return named }
+
+        // Ask the current keyboard layout what this key produces, so a shortcut
+        // reads correctly on non-US layouts.
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+        else { return "Key \(keyCode)" }
+
+        let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue() as Data
+        var deadKeyState: UInt32 = 0
+        var length = 0
+        var characters = [UniChar](repeating: 0, count: 4)
+
+        let status = data.withUnsafeBytes { buffer -> OSStatus in
+            guard let layout = buffer.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else {
+                return OSStatus(-1)
+            }
+            return UCKeyTranslate(
+                layout, keyCode, UInt16(kUCKeyActionDisplay), 0,
+                UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit),
+                &deadKeyState, characters.count, &length, &characters
+            )
+        }
+
+        guard status == noErr, length > 0 else { return "Key \(keyCode)" }
+        return String(utf16CodeUnits: characters, count: length).uppercased()
+    }
+
+    private static let specialKeyNames: [Int: String] = [
+        kVK_Space: "Space", kVK_Tab: "⇥", kVK_Return: "↩", kVK_Escape: "⎋",
+        kVK_Delete: "⌫", kVK_ForwardDelete: "⌦",
+        kVK_LeftArrow: "←", kVK_RightArrow: "→", kVK_UpArrow: "↑", kVK_DownArrow: "↓",
+        kVK_ANSI_Grave: "`",
+        kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4", kVK_F5: "F5",
+        kVK_F6: "F6", kVK_F7: "F7", kVK_F8: "F8", kVK_F9: "F9", kVK_F10: "F10",
+        kVK_F11: "F11", kVK_F12: "F12"
+    ]
+
+    /// ⌃` — the default for cycling windows in a group.
+    static let defaultGroupCycle = Shortcut(
+        keyCode: UInt16(kVK_ANSI_Grave),
+        carbonModifiers: UInt32(controlKey)
+    )
+
+    /// ⌘↑ / ⌘↓ — moving between the groups themselves.
+    ///
+    /// These are not free keys: Finder uses ⌘↑ for the enclosing folder and ⌘↓
+    /// to open, and text editors use them for start and end of document. A
+    /// global hotkey takes them from every app, which is why they are worth
+    /// rebinding if that bites — Settings will accept anything.
+    static func defaultGroupsCycle(_ direction: GroupCycleDirection) -> Shortcut {
+        Shortcut(
+            keyCode: UInt16(direction == .previous ? kVK_UpArrow : kVK_DownArrow),
+            carbonModifiers: UInt32(cmdKey)
+        )
+    }
+
+    static func groupSelect(position: Int) -> Shortcut? {
+        let codes = [
+            kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5,
+            kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9
+        ]
+        guard position >= 1, position <= codes.count else { return nil }
+        return Shortcut(keyCode: UInt16(codes[position - 1]), carbonModifiers: UInt32(controlKey))
+    }
+}

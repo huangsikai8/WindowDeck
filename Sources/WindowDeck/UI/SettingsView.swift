@@ -1,0 +1,778 @@
+import AppKit
+import SwiftUI
+import UniformTypeIdentifiers
+
+struct SettingsView: View {
+    @Bindable var store: AppStore
+
+    var body: some View {
+        TabView {
+            GroupsSettingsView(store: store)
+                .tabItem { Label("Groups", systemImage: "square.grid.2x2") }
+            AppearanceSettingsView(store: store)
+                .tabItem { Label("Appearance", systemImage: "paintbrush") }
+            BehaviorSettingsView(store: store)
+                .tabItem { Label("Behavior", systemImage: "gearshape") }
+            ShortcutsSettingsView(store: store)
+                .tabItem { Label("Shortcuts", systemImage: "keyboard") }
+            PermissionsSettingsView(store: store)
+                .tabItem { Label("Permissions", systemImage: "lock.shield") }
+        }
+        .padding(14)
+        .frame(width: 760, height: 480)
+    }
+}
+
+// MARK: - Groups
+
+struct GroupsSettingsView: View {
+    @Bindable var store: AppStore
+
+    @State private var selection: UUID?
+    @State private var filter = ""
+    @State private var pendingDelete: DeckGroup?
+
+    private var selectedGroup: DeckGroup? {
+        store.groups.first { $0.id == selection }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            sidebar.frame(width: 210)
+            Divider()
+            detail.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .onAppear { if selection == nil { selection = store.activeGroupID } }
+        .confirmationDialog(
+            pendingDelete.map { "Delete “\($0.name)”?" } ?? "",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                if let group = pendingDelete { store.deleteGroup(group.id) }
+                pendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text("The windows stay open — only the grouping is removed.")
+        }
+    }
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            List(selection: $selection) {
+                ForEach(store.groups) { group in
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(group.color.color)
+                            .frame(width: 9, height: 9)
+                            .opacity(group.isAll ? 0.35 : 1)
+                        Text(group.name)
+                        Spacer()
+                        // Position drives the shortcut, so it's shown here rather
+                        // than left as a hidden binding.
+                        if let shortcut = store.shortcutLabel(for: group.id) {
+                            Text(shortcut)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .strikethrough(!store.shortcutWorks(for: group.id))
+                                .help(store.shortcutWorks(for: group.id)
+                                      ? "Switches to this group"
+                                      : "Unavailable — macOS uses this for Switch to Desktop")
+                        }
+                    }
+                    .tag(group.id)
+                }
+                .onMove { store.moveGroups(from: $0, to: $1) }
+            }
+
+            Divider()
+
+            HStack(spacing: 6) {
+                Button { addGroup() } label: { Image(systemName: "plus") }
+                    .help("New group")
+                Button { requestDelete() } label: { Image(systemName: "minus") }
+                    .disabled(selectedGroup == nil || selectedGroup?.isAll == true)
+                    .help("Delete group")
+                Spacer()
+            }
+            .buttonStyle(.borderless)
+            .padding(8)
+        }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        if let group = selectedGroup {
+            if group.isAll {
+                allGroupDetail
+            } else {
+                groupDetail(group)
+            }
+        } else {
+            Text("Select a group")
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func groupDetail(_ group: DeckGroup) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Name")
+                TextField("Group name", text: Binding(
+                    get: { store.groups.first { $0.id == group.id }?.name ?? "" },
+                    set: { store.rename(group.id, to: $0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 280)
+            }
+
+            HStack(spacing: 8) {
+                Text("Colour")
+                ForEach(GroupColor.selectable) { swatch in
+                    Button {
+                        store.setColor(swatch, for: group.id)
+                    } label: {
+                        Circle()
+                            .fill(swatch.color)
+                            .frame(width: 17, height: 17)
+                            .overlay(
+                                Circle().strokeBorder(
+                                    .primary.opacity(group.color == swatch ? 0.85 : 0),
+                                    lineWidth: 2
+                                )
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .help(swatch.name)
+                }
+            }
+
+            HStack {
+                Text("Windows in this group").font(.headline)
+                Spacer()
+                TextField("Filter", text: $filter)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 170)
+            }
+
+            // A checkbox list rather than an available/selected shuttle: every
+            // window's membership is visible at once and assigning is one click.
+            List {
+                ForEach(filteredWindows) { window in
+                    Toggle(isOn: Binding(
+                        get: { store.isMember(window.id, of: group.id) },
+                        set: { _ in store.toggle(window.id, in: group.id) }
+                    )) {
+                        HStack(spacing: 8) {
+                            if let icon = window.icon {
+                                Image(nsImage: icon).resizable().frame(width: 16, height: 16)
+                            }
+                            Text(window.displayTitle).lineLimit(1)
+                            Spacer()
+                            Text(window.appName)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            // Every group this window is already in, so you can
+                            // see overlaps while assigning.
+                            ForEach(store.memberGroups(of: window.id)) { member in
+                                GroupBadge(group: member)
+                            }
+                        }
+                    }
+                }
+            }
+            .overlay {
+                if store.windows.isEmpty {
+                    Text("No open windows").foregroundStyle(.secondary)
+                }
+            }
+
+            Text("Pinned apps").font(.headline)
+            Text("Launchers shown while this group is active. Each group keeps its own.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            PinnedAppsEditor(store: store, groupID: group.id)
+                .frame(height: 120)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(memberCount(group)) of \(store.windows.count) open windows")
+                // Stated here, where the effort is being spent, rather than
+                // buried in documentation.
+                Text("Lists open windows only — membership resets when WindowDeck restarts.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(16)
+    }
+
+    private var allGroupDetail: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text("Name")
+                Text("All").fontWeight(.medium)
+                Text("(built-in)").foregroundStyle(.secondary)
+            }
+            Text("Every open window is listed automatically.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            Text("Pinned apps").font(.headline)
+            Text("Launchers shown in All. They stay put whether or not the app is running.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            PinnedAppsEditor(store: store, groupID: DeckGroup.allGroupID)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var filteredWindows: [WindowInfo] {
+        guard !filter.isEmpty else { return store.windows }
+        return store.windows.filter {
+            $0.displayTitle.localizedCaseInsensitiveContains(filter)
+                || $0.appName.localizedCaseInsensitiveContains(filter)
+        }
+    }
+
+    private func memberCount(_ group: DeckGroup) -> Int {
+        store.windows.filter { group.memberIDs.contains($0.id) }.count
+    }
+
+    private func addGroup() {
+        let existing = Set(store.groups.map(\.name))
+        var name = "New Group"
+        var suffix = 2
+        while existing.contains(name) {
+            name = "New Group \(suffix)"
+            suffix += 1
+        }
+        selection = store.addGroup(named: name).id
+    }
+
+    private func requestDelete() {
+        guard let group = selectedGroup, !group.isAll else { return }
+        // Only interrupt when there's something to lose.
+        if memberCount(group) == 0 {
+            store.deleteGroup(group.id)
+            selection = store.groups.first?.id
+        } else {
+            pendingDelete = group
+        }
+    }
+}
+
+// MARK: - Pinned apps
+
+struct PinnedAppsEditor: View {
+    @Bindable var store: AppStore
+    /// Which group's launchers are being edited. Pins are group-scoped, so this
+    /// editor is no longer a special case for All.
+    let groupID: UUID
+    @State private var selection: String?
+
+    private var pinned: [PinnedApp] { store.pinnedApps(in: groupID) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            List(selection: $selection) {
+                ForEach(pinned) { app in
+                    HStack(spacing: 8) {
+                        if let icon = app.icon {
+                            Image(nsImage: icon).resizable().frame(width: 18, height: 18)
+                        }
+                        Text(app.name)
+                        Spacer()
+                        if app.isRunning {
+                            Text("running").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .tag(app.bundleID)
+                }
+                .onMove { store.movePinnedApps(from: $0, to: $1, in: groupID) }
+            }
+            .overlay {
+                if pinned.isEmpty {
+                    Text("No pinned apps").foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+
+            HStack(spacing: 6) {
+                Button { addApps() } label: { Image(systemName: "plus") }
+                    .help("Pin an app")
+                Button {
+                    if let id = selection { store.unpin(id, in: groupID); selection = nil }
+                } label: { Image(systemName: "minus") }
+                .disabled(selection == nil)
+                .help("Remove")
+                Spacer()
+                Text("Drag to reorder").font(.caption).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .padding(8)
+        }
+    }
+
+    /// Remembers where apps were last picked from. Forcing `/Applications` every
+    /// time hid the web apps Safari's "Add to Dock" creates, which land in
+    /// *~/Applications* instead — reachable, but only if you knew to go looking.
+    @AppStorage("pinnedAppPickerDirectory") private var lastPickerDirectory = ""
+
+    private func addApps() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: lastPickerDirectory.isEmpty
+                                 ? "/Applications" : lastPickerDirectory)
+        panel.message = "Safari web apps (\u{201C}Add to Dock\u{201D}) live in your home folder\u{2019}s Applications."
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        // Accessory apps must activate before a modal will come forward.
+        NSApp.activate()
+        guard panel.runModal() == .OK else { return }
+        if let folder = panel.urls.first?.deletingLastPathComponent() {
+            lastPickerDirectory = folder.path
+        }
+        for url in panel.urls {
+            if let app = PinnedApp(url: url) { store.pin(app, in: groupID) }
+        }
+    }
+}
+
+// MARK: - Appearance
+
+struct AppearanceSettingsView: View {
+    @Bindable var store: AppStore
+
+    var body: some View {
+        Form {
+            Toggle("Show titles for apps with several windows", isOn: $store.showTitles)
+            Text("""
+            An app with one open window always shows as an icon alone — the icon already identifies it. \
+            Titles appear only where they disambiguate, when an app has several windows open, and they \
+            shrink to fit so the strip never scrolls. Turn this off to make every entry icon-only.
+
+            Full titles are always available on hover.
+            """)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .formStyle(.grouped)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+}
+
+// MARK: - Behavior
+
+struct BehaviorSettingsView: View {
+    @Bindable var store: AppStore
+
+    @State private var launchAtLogin = LaunchAtLogin.isEnabled
+    @State private var loginError: String?
+    /// Re-read on appear rather than stored: the grant is flipped outside the
+    /// app, so a cached value goes stale the moment the user visits Settings.
+    @State private var canMonitorInput = Permissions.canMonitorInput
+
+    private var fingerCountPicker: some View {
+        HStack {
+            Text("Fingers")
+            Spacer()
+            ForEach([3, 4], id: \.self) { count in
+                Toggle("\(count)", isOn: Binding(
+                    get: { store.swipeFingerCounts.contains(count) },
+                    set: { on in
+                        var counts = store.swipeFingerCounts
+                        if on { counts.insert(count) } else { counts.remove(count) }
+                        // Clearing both would leave the tap running and deaf.
+                        if counts.isEmpty { counts.insert(count) }
+                        store.swipeFingerCounts = counts
+                    }
+                ))
+                .toggleStyle(.checkbox)
+            }
+        }
+    }
+
+    private var sensitivityLabel: String {
+        switch store.swipeSensitivity {
+        case ..<0.25: "Sweep"
+        case ..<0.5: "Firm"
+        case ..<0.75: "Light"
+        default: "Flick"
+        }
+    }
+
+    @ViewBuilder
+    private var inputMonitoringStatus: some View {
+        HStack(spacing: 8) {
+            Image(systemName: canMonitorInput ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(canMonitorInput ? .green : .orange)
+            Text(canMonitorInput
+                 ? "Input Monitoring granted"
+                 : "Input Monitoring needed — swipes anywhere won't work until it's granted")
+                .font(.caption)
+            Spacer()
+            if !canMonitorInput {
+                Button("Open Settings…") { Permissions.openInputMonitoringPane() }
+            }
+        }
+        .onAppear { canMonitorInput = Permissions.canMonitorInput }
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Only show windows on the current Space", isOn: $store.currentSpaceOnly)
+                Text("""
+                On, the strip lists only what's on the desktop you're looking at. Apps whose windows \
+                all live on other Spaces — or that are fullscreen, which puts them on a Space of \
+                their own — won't appear at all. Turn this off to list every window everywhere.
+
+                Minimized windows are always listed regardless of this setting.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("Trackpad") {
+                Toggle("Swipe over the strip to switch groups", isOn: $store.swipeOverStrip)
+                Text("""
+                A horizontal swipe while the pointer is over the bar moves one group along. \
+                This needs no permission at all — the events reach the strip because you are \
+                pointing at it, not because the app is watching your input.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Toggle("Swipe anywhere to switch groups", isOn: $store.globalSwipeGesture)
+                Text("""
+                A three- or four-finger horizontal swipe anywhere on screen. This one requires \
+                Input Monitoring, which is broader than anything else the app asks for — it \
+                covers all keyboard and pointer input, so it stays off unless you turn it on.
+
+                macOS normally uses these swipes for switching Spaces and will keep doing so. \
+                Turn off "Swipe between full-screen applications" in System Settings › Trackpad › \
+                More Gestures, or both will happen at once.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                if store.globalSwipeGesture {
+                    fingerCountPicker
+                    inputMonitoringStatus
+                }
+
+                if store.swipeOverStrip || store.globalSwipeGesture {
+                    HStack {
+                        Text("Sensitivity")
+                        Slider(value: $store.swipeSensitivity, in: 0...1)
+                        Text(sensitivityLabel).font(.caption).foregroundStyle(.secondary)
+                            .frame(width: 62, alignment: .trailing)
+                    }
+                    Text("""
+                    How far your fingers must travel before the group changes. Higher means a \
+                    lighter flick is enough; lower asks for a deliberate sweep and is less likely \
+                    to fire while you are scrolling something.
+                    """)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                Toggle("Slide the strip when the group changes", isOn: $store.animateGroupChanges)
+                Text("""
+                The bar slides in the direction you moved and resizes to its new contents as it \
+                goes. Turn this off for an instant change.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("Groups") {
+                Toggle("Add new windows to the active group", isOn: $store.autoAddNewWindows)
+                Text("""
+                While a group other than All is showing, any window you open joins it automatically. \
+                Windows already open are untouched, and switching Space doesn't sweep anything in — \
+                only genuinely new windows are captured.
+
+                Paused while groups are still being restored after a restart, so reopening \
+                applications aren't swept into whichever group you happen to be viewing.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("Window behaviour") {
+                Toggle("Keep maximised windows above the strip", isOn: $store.clampZoomedWindows)
+                Text("""
+                Zooming a window — the green button, or double-clicking its title bar — normally \
+                runs it to the bottom of the screen and under the strip. This shortens it so it \
+                stops just above. Windows you position by hand are never moved, and a genuinely \
+                fullscreen app is left completely alone.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Toggle("Hide the strip in fullscreen", isOn: $store.hideInFullscreen)
+                Text("Push the cursor to the very bottom of the screen to bring it back, the way "
+                     + "the Dock behaves.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Separate ungrouped windows in All", isOn: $store.showUngroupedSeparately)
+                Text("In the All tab, windows that belong to no group are moved to the right of a "
+                     + "divider, so it is obvious at a glance what still needs filing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Show the focused window when it isn't in this group",
+                       isOn: $store.showOffGroupWindow)
+                Text("Appears faded at the end, after a separator, so the strip always says which "
+                     + "window you are actually in.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("On hover") {
+                Picker("Hovering an entry", selection: $store.previewMode) {
+                    ForEach(PreviewMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+
+                Text(store.previewMode.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Hover timing") {
+                TimingSlider("Title appears", value: $store.hoverTimings.titleDelay)
+                TimingSlider("Thumbnail appears", value: $store.hoverTimings.thumbnailDelay)
+                TimingSlider("Peek appears", value: $store.hoverTimings.peekDelay)
+                TimingSlider("Hide delay", value: $store.hoverTimings.hideGrace)
+                TimingSlider("Stay instant for", value: $store.hoverTimings.warmWindow,
+                             range: HoverTimings.warmRange)
+
+                HStack {
+                    Spacer()
+                    Button("Reset to defaults") { store.hoverTimings = .defaults }
+                        .disabled(store.hoverTimings == .defaults)
+                }
+
+                Text("""
+                Hide delay is the grace period before a popup disappears — it is what lets the \
+                cursor travel from an entry up to its thumbnail without it vanishing.
+
+                Stay instant for: once a thumbnail is up, moving to another entry shows its \
+                thumbnail with no wait. This is how long that lasts after the panel closes.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Open at login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, newValue in
+                        do {
+                            try LaunchAtLogin.set(newValue)
+                            loginError = nil
+                        } catch {
+                            loginError = error.localizedDescription
+                            launchAtLogin = LaunchAtLogin.isEnabled
+                        }
+                    }
+                if let loginError {
+                    Text(loginError).font(.caption).foregroundStyle(.red)
+                }
+            }
+
+            Section("Shortcuts") {
+                Text("⌃1 … ⌃9 switch to the group at that position in the Groups list.")
+                    .font(.caption)
+                // Worth stating: these are macOS's own Spaces shortcuts, and
+                // whoever registers first wins.
+                Text("If you still use multiple Desktops, macOS claims ⌃1–⌃9 for "
+                     + "\"Switch to Desktop\" and those shortcuts won't reach WindowDeck.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onAppear { launchAtLogin = LaunchAtLogin.isEnabled }
+    }
+}
+
+/// A small coloured pill naming a group a window belongs to.
+struct GroupBadge: View {
+    let group: DeckGroup
+
+    var body: some View {
+        Text(group.name)
+            .font(.system(size: 10, weight: .medium))
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule().fill(group.color.color.opacity(0.22))
+            )
+            .overlay(
+                Capsule().strokeBorder(group.color.color.opacity(0.55), lineWidth: 1)
+            )
+    }
+}
+
+/// A labelled delay slider showing its current value in seconds.
+struct TimingSlider: View {
+    let label: String
+    @Binding var value: TimeInterval
+    let range: ClosedRange<Double>
+
+    init(_ label: String, value: Binding<TimeInterval>, range: ClosedRange<Double> = HoverTimings.range) {
+        self.label = label
+        self._value = value
+        self.range = range
+    }
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .frame(width: 130, alignment: .leading)
+            Slider(value: $value, in: range, step: 0.05)
+            Text(String(format: "%.2fs", value))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 46, alignment: .trailing)
+        }
+    }
+}
+
+// MARK: - Shortcuts
+
+struct ShortcutsSettingsView: View {
+    @Bindable var store: AppStore
+
+    /// Named rather than sliced out of one list by position — the sections drifted
+    /// apart the moment an action was added in the middle.
+    private static let windowActions: [ShortcutAction] = [.cycleGroupWindows, .cycleAppWindows]
+    private static let groupCycleActions: [ShortcutAction] = [
+        .cycleGroups(.previous), .cycleGroups(.next)
+    ]
+    private var groupSelectActions: [ShortcutAction] {
+        (1...min(store.groups.count, 9)).map { ShortcutAction.selectGroup($0) }
+    }
+
+    var body: some View {
+        Form {
+            Section("Switching") {
+                ForEach(Self.windowActions, id: \.storageKey) { action in
+                    row(action)
+                }
+                Text("""
+                Hold the modifier and tap the key to move through windows; let go to switch. \
+                Add Shift to go backwards, or press Escape to cancel without changing anything. \
+                Ordering is most-recently-used, so a single tap flips back to the window you \
+                were in before.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                TimingSlider("Hold before showing", value: $store.switcherHoldDelay,
+                             range: 0...0.8)
+                Text("""
+                Release the key faster than this and it simply switches, with no interface shown \
+                at all. Hold longer and the switcher appears so you can pick. Set it to 0 to \
+                always show it.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("Groups") {
+                ForEach(Self.groupCycleActions, id: \.storageKey) { action in
+                    row(action)
+                }
+                Text("""
+                Same hold-and-tap behaviour: tap to move one group, or hold to open the list and \
+                keep tapping, then let go to switch. The list runs in strip order and wraps at \
+                both ends.
+
+                ⌘↑ and ⌘↓ are used by other apps — Finder's enclosing folder and open, and \
+                start and end of document in text editors. Recording them here takes them from \
+                those apps, so pick something else if you rely on them.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                ForEach(groupSelectActions, id: \.storageKey) { action in
+                    row(action)
+                }
+                Text("""
+                macOS claims ⌃1–⌃9 for "Switch to Desktop" whenever you have more than one \
+                Desktop, and it wins. If one shows as in use, record a different combination here.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Button("Reset to defaults") { store.resetShortcuts() }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private func row(_ action: ShortcutAction) -> some View {
+        ShortcutRow(
+            action: action,
+            shortcut: store.shortcuts[action],
+            isRegistered: store.registeredActions.contains(action),
+            onRecord: { store.setShortcut($0, for: action) },
+            onClear: { store.setShortcut(nil, for: action) }
+        )
+    }
+}
+
+// MARK: - Permissions
+
+struct PermissionsSettingsView: View {
+    @Bindable var store: AppStore
+
+    var body: some View {
+        Form {
+            LabeledContent("Accessibility") {
+                if store.isTrusted {
+                    Label("Granted", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                } else {
+                    Label("Not granted", systemImage: "xmark.circle.fill").foregroundStyle(.red)
+                }
+            }
+
+            Button("Open Privacy & Security…") { Permissions.openSettingsPane() }
+
+            Text("""
+            WindowDeck needs Accessibility to read window titles and to raise a specific window. \
+            It is the only permission required — Screen Recording is deliberately avoided.
+
+            The app is signed ad-hoc, so its signature changes on every rebuild and macOS may treat \
+            an existing grant as stale. If the strip stops listing windows after a rebuild, remove \
+            WindowDeck from the Accessibility list and add it again.
+            """)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .formStyle(.grouped)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onAppear { store.refreshTrust() }
+    }
+}
