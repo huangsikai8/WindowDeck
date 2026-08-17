@@ -91,6 +91,10 @@ final class HoverController {
 
     // MARK: - Strip entry hover
 
+    /// The in-flight preview capture, so it can be abandoned the moment the
+    /// pointer moves somewhere else.
+    private var captureTask: Task<Void, Never>?
+
     func entryHover(_ window: WindowInfo, anchor: CGRect, entering: Bool) {
         guard entering else {
             // Sliding from one entry to the next, SwiftUI delivers the new
@@ -110,6 +114,10 @@ final class HoverController {
             currentAnchor = anchor
             return
         }
+
+        // Whatever was being captured for the previous entry is no longer
+        // wanted; letting it finish is pure waste.
+        captureTask?.cancel()
 
         current = window
         currentAnchor = anchor
@@ -173,8 +181,20 @@ final class HoverController {
             return
         }
 
-        Task { [weak self] in
+        // Cancellable, and deliberately not started immediately.
+        //
+        // Sweeping the pointer along the strip used to fire one capture per tile
+        // passed over. The results were discarded once the cursor moved on, but
+        // the captures still ran to completion — twenty tiles meant twenty
+        // ScreenCaptureKit captures to display one image, which is what made
+        // hovering feel heavy. Waiting for the pointer to settle means a sweep
+        // now issues none at all.
+        captureTask?.cancel()
+        captureTask = Task { [weak self] in
             guard let self else { return }
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            guard !Task.isCancelled, self.current?.id == window.id else { return }
+
             let image = await self.service.image(
                 for: window,
                 maxSize: CGSize(
@@ -183,7 +203,7 @@ final class HoverController {
                 )
             )
             // The cursor may have moved on while the capture was in flight.
-            guard self.current?.id == window.id else { return }
+            guard !Task.isCancelled, self.current?.id == window.id else { return }
 
             guard let image else {
                 // Capture refused or the window vanished. Settle back to the
@@ -287,6 +307,7 @@ final class HoverController {
         expandWork?.cancel()
         peekWork?.cancel()
         hideWork?.cancel()
+        captureTask?.cancel()
         // Drop stale captures here rather than on a timer — full-size window
         // images are large, and this is the natural idle moment.
         service.evictExpired()

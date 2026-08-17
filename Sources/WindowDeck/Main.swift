@@ -7,6 +7,8 @@ struct WindowDeckApp {
     @MainActor
     static func main() {
         let app = NSApplication.shared
+        if SelfTest.isRequested { SelfTest.run() }
+
         let delegate = AppDelegate()
         app.delegate = delegate
         // .accessory keeps WindowDeck out of the Dock and out of Cmd-Tab, which

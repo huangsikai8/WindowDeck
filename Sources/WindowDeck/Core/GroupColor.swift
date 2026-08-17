@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The accent assigned to a group.
@@ -61,5 +62,28 @@ enum GroupColor: Int, CaseIterable, Identifiable {
 
     static func from(index: Int) -> GroupColor {
         GroupColor(rawValue: index) ?? .neutral
+    }
+}
+
+extension Color {
+    /// Parses "rrggbb" or "#rrggbb". Returns nil for anything else, so a corrupt
+    /// value in the state file falls back to the preset rather than throwing.
+    init?(hex: String) {
+        let cleaned = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        guard cleaned.count == 6, let value = UInt32(cleaned, radix: 16) else { return nil }
+        self.init(.sRGB,
+                  red: Double((value >> 16) & 0xFF) / 255,
+                  green: Double((value >> 8) & 0xFF) / 255,
+                  blue: Double(value & 0xFF) / 255,
+                  opacity: 1)
+    }
+
+    /// The inverse, for storing a picked colour.
+    var hexString: String? {
+        guard let srgb = NSColor(self).usingColorSpace(.sRGB) else { return nil }
+        return String(format: "%02X%02X%02X",
+                      Int((srgb.redComponent * 255).rounded()),
+                      Int((srgb.greenComponent * 255).rounded()),
+                      Int((srgb.blueComponent * 255).rounded()))
     }
 }

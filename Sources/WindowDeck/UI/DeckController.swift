@@ -208,7 +208,13 @@ final class DeckController {
         let changedGroup = lastLaidOutGroupID != store.activeGroupID
         lastLaidOutGroupID = store.activeGroupID
 
-        guard changedGroup, store.animateGroupChanges, panel.isVisible else {
+        // Animating a resize of a 1240pt panel re-lays out every tile in the
+        // hosting view on each frame, so overlapping animations from fast
+        // swiping stack that cost up. `animateThisChange` is false once a switch
+        // interrupts the previous one, and the strip's own slide is gated on the
+        // same flag so the two never disagree.
+        guard changedGroup, store.animateThisChange, store.animateGroupChanges,
+              panel.isVisible else {
             panel.setContentSize(NSSize(width: width, height: DeckMetrics.height))
             reposition()
             return

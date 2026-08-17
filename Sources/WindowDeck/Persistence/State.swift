@@ -41,6 +41,8 @@ struct PersistedGroup: Codable {
     var id: String
     var name: String
     var colorIndex: Int
+    /// A colour picked outside the preset palette, as "rrggbb".
+    var customColorHex: String?
     var members: [MemberRef]
     /// The manual left-to-right arrangement — windows and pinned apps share it.
     var order: [OrderRef]
@@ -51,6 +53,7 @@ struct PersistedGroup: Codable {
         id: String,
         name: String,
         colorIndex: Int,
+        customColorHex: String? = nil,
         members: [MemberRef],
         order: [OrderRef] = [],
         clusters: [PersistedCluster] = [],
@@ -60,6 +63,7 @@ struct PersistedGroup: Codable {
         self.id = id
         self.name = name
         self.colorIndex = colorIndex
+        self.customColorHex = customColorHex
         self.members = members
         self.order = order
         self.clusters = clusters
@@ -75,6 +79,7 @@ struct PersistedGroup: Codable {
         name = container.lenient(String.self, .name) ?? "Group"
         colorIndex = container.lenient(Int.self, .colorIndex)
             ?? GroupColor.blue.rawValue
+        customColorHex = container.lenient(String.self, .customColorHex)
         members = container.lenient([MemberRef].self, .members) ?? []
         if let refs = container.lenient([OrderRef].self, .order) {
             order = refs
@@ -125,6 +130,10 @@ struct PersistedState: Codable {
     /// Finger counts the global gesture accepts.
     var swipeFingerCounts: [Int] = [3, 4]
     /// 0 = long deliberate sweep, 1 = light flick.
+    /// Keep an entry for a running app after its last window closes.
+    var showRunningApps: Bool = true
+    /// In All, bucket windows into a capsule per group instead of one flat row.
+    var pillView: Bool = false
     var swipeSensitivity: Double = 0.5
     var animateGroupChanges: Bool = true
     /// Keyed by `ShortcutAction.storageKey`, since the action isn't a plain
@@ -171,10 +180,14 @@ struct PersistedState: Codable {
         swipeOverStrip: Bool,
         globalSwipeGesture: Bool,
         swipeFingerCounts: [Int],
+        showRunningApps: Bool,
+        pillView: Bool,
         swipeSensitivity: Double,
         animateGroupChanges: Bool,
         bootTime: Double
     ) {
+        self.showRunningApps = showRunningApps
+        self.pillView = pillView
         self.bootTime = bootTime
         self.swipeSensitivity = swipeSensitivity
         self.animateGroupChanges = animateGroupChanges
@@ -271,6 +284,9 @@ struct PersistedState: Codable {
             ?? fallback.globalSwipeGesture
         swipeFingerCounts = container.lenient([Int].self, .swipeFingerCounts)
             ?? fallback.swipeFingerCounts
+        showRunningApps = container.lenient(Bool.self, .showRunningApps)
+            ?? fallback.showRunningApps
+        pillView = container.lenient(Bool.self, .pillView) ?? fallback.pillView
         swipeSensitivity = container.lenient(Double.self, .swipeSensitivity)
             ?? fallback.swipeSensitivity
         animateGroupChanges = container.lenient(Bool.self, .animateGroupChanges)
@@ -304,6 +320,8 @@ struct PersistedState: Codable {
         try container.encode(swipeOverStrip, forKey: .swipeOverStrip)
         try container.encode(globalSwipeGesture, forKey: .globalSwipeGesture)
         try container.encode(swipeFingerCounts, forKey: .swipeFingerCounts)
+        try container.encode(showRunningApps, forKey: .showRunningApps)
+        try container.encode(pillView, forKey: .pillView)
         try container.encode(swipeSensitivity, forKey: .swipeSensitivity)
         try container.encode(animateGroupChanges, forKey: .animateGroupChanges)
         try container.encode(bootTime, forKey: .bootTime)
@@ -316,7 +334,7 @@ struct PersistedState: Codable {
         case clampZoomedWindows, hideInFullscreen
         case shortcuts, switcherHoldDelay, shortcutSeedVersion
         case swipeOverStrip, globalSwipeGesture, swipeFingerCounts
-        case swipeSensitivity, animateGroupChanges, bootTime
+        case swipeSensitivity, animateGroupChanges, bootTime, showRunningApps, pillView
         /// Retired in favour of `groups`; still read so existing files migrate.
         case userGroupNames
     }
@@ -325,6 +343,13 @@ struct PersistedState: Codable {
 enum StateStore {
 
     static var fileURL: URL {
+        // `WINDOWDECK_STATE_DIR` redirects the whole state file elsewhere. It
+        // exists for the self-test, which must never be pointed at the real one:
+        // running destructive persistence checks against live state once left
+        // fabricated groups in the running app.
+        if let override = ProcessInfo.processInfo.environment["WINDOWDECK_STATE_DIR"] {
+            return URL(fileURLWithPath: override).appendingPathComponent("state.json")
+        }
         let base = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("WindowDeck", isDirectory: true)

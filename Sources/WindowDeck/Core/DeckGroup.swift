@@ -1,3 +1,4 @@
+import SwiftUI
 import AppKit
 
 /// A saved reference to a window, used only to rebuild membership after a
@@ -85,6 +86,11 @@ struct DeckGroup: Identifiable, Hashable {
     /// opened never displaces what you already arranged.
     var order: [String]
     var colorIndex: Int
+    /// A colour chosen from the picker, as "rrggbb". Overrides `colorIndex` when
+    /// set, so the eight presets stay a one-click choice and anything else is
+    /// still possible. Stored as hex rather than a `Color` because `Color` is
+    /// not usefully Codable and the state file has to stay plain JSON.
+    var customColorHex: String?
     /// Snapshot for restore. Entries are removed as they are matched, so a
     /// window the user later removes by hand is never silently re-added.
     var savedMembers: [MemberRef]
@@ -106,12 +112,20 @@ struct DeckGroup: Identifiable, Hashable {
         isAll ? .neutral : GroupColor.from(index: colorIndex)
     }
 
+    /// What the strip actually draws: the custom colour if one was picked,
+    /// otherwise the preset. Everything user-facing goes through this.
+    var displayColor: Color {
+        if !isAll, let hex = customColorHex, let custom = Color(hex: hex) { return custom }
+        return color.color
+    }
+
     init(
         id: UUID = UUID(),
         name: String,
         memberIDs: Set<CGWindowID> = [],
         order: [String] = [],
         colorIndex: Int = GroupColor.blue.rawValue,
+        customColorHex: String? = nil,
         savedMembers: [MemberRef] = [],
         savedOrder: [OrderRef] = [],
         clusters: [WindowCluster] = [],
@@ -124,6 +138,7 @@ struct DeckGroup: Identifiable, Hashable {
         self.memberIDs = memberIDs
         self.order = order
         self.colorIndex = colorIndex
+        self.customColorHex = customColorHex
         self.savedMembers = savedMembers
         self.savedOrder = savedOrder
         self.clusters = clusters

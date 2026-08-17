@@ -49,7 +49,7 @@ struct GroupSelector: View {
         HStack(spacing: 6) {
             if !store.activeGroup.isAll {
                 Circle()
-                    .fill(store.activeGroup.color.color)
+                    .fill(store.activeGroup.displayColor)
                     .frame(width: 7, height: 7)
             }
             Text(store.activeGroup.name)
@@ -68,7 +68,7 @@ struct GroupSelector: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(
-                    store.activeGroup.isAll ? .clear : store.activeGroup.color.color.opacity(0.55),
+                    store.activeGroup.isAll ? .clear : store.activeGroup.displayColor.opacity(0.55),
                     lineWidth: 1
                 )
         )
@@ -81,11 +81,11 @@ struct GroupSelector: View {
 
     /// A small colour dot for the drop-up menu. NSMenu takes an NSImage, so the
     /// swatch is drawn rather than expressed in SwiftUI.
-    private static func swatch(_ color: GroupColor) -> NSImage {
+    private static func swatch(_ color: Color) -> NSImage {
         let size = NSSize(width: 10, height: 10)
         let image = NSImage(size: size)
         image.lockFocus()
-        NSColor(color.color).setFill()
+        NSColor(color).setFill()
         NSBezierPath(ovalIn: NSRect(origin: .zero, size: size)).fill()
         image.unlockFocus()
         return image
@@ -96,7 +96,7 @@ struct GroupSelector: View {
     private var tint: Color {
         let group = store.activeGroup
         guard !group.isAll else { return .primary.opacity(isHovering ? 0.18 : 0.10) }
-        return group.color.color.opacity(isHovering ? 0.32 : 0.20)
+        return group.displayColor.opacity(isHovering ? 0.32 : 0.20)
     }
 
     private func showMenu() {
@@ -117,7 +117,7 @@ struct GroupSelector: View {
             item.representedObject = group.id
             item.state = (group.id == store.activeGroupID) ? .on : .off
             if !group.isAll {
-                item.image = Self.swatch(group.color)
+                item.image = Self.swatch(group.displayColor)
             }
             menu.addItem(item)
         }

@@ -45,8 +45,20 @@ final class AppStore {
                 switchedForward = to > from
             }
             pendingSwitchDirection = nil
+
+            // Swiping quickly means the previous slide never finished. Playing
+            // them all is both unreadable and expensive — each one rebuilds the
+            // whole strip and resizes the panel — so a change that interrupts
+            // one lands instantly instead.
+            let now = Date()
+            animateThisChange = now.timeIntervalSince(lastGroupChangeAt) >= 0.30
+            lastGroupChangeAt = now
         }
     }
+
+    /// False when this group change interrupted the previous one's animation.
+    private(set) var animateThisChange = true
+    @ObservationIgnored private var lastGroupChangeAt = Date.distantPast
 
     /// Which way the last group change moved, so the strip can slide with it.
     private(set) var switchedForward = true
@@ -63,6 +75,12 @@ final class AppStore {
     var showOffGroupWindow: Bool = true { didSet { scheduleSave() } }
     /// In All, split windows belonging to no group off to the right.
     var showUngroupedSeparately: Bool = true { didSet { scheduleSave() } }
+    /// Keep an entry for a running app once its last window is closed, the way
+    /// the Dock does.
+    var showRunningApps: Bool = true { didSet { scheduleSave() } }
+    /// In All, bucket windows into a capsule per group. Meaningless in a named
+    /// group, which is already one bucket.
+    var pillView: Bool = false { didSet { scheduleSave() } }
     /// Stop zoomed windows extending under the strip.
     var clampZoomedWindows: Bool = true { didSet { onSettingsChanged?(); scheduleSave() } }
     /// Hide the strip while an app is genuinely fullscreen.
@@ -95,9 +113,55 @@ final class AppStore {
     /// so it borrows the system accent.
     var focusTint: Color {
         let group = activeGroup
-        return group.isAll ? Color.accentColor : group.color.color
+        return group.isAll ? Color.accentColor : group.displayColor
     }
     var hoverTimings: HoverTimings = .defaults { didSet { scheduleSave() } }
+
+    /// What the running-app world looks like, sampled on the engine's cadence
+    /// rather than read inside `visibleItems`.
+    ///
+    /// `visibleItems` is a computed property, so it runs on every strip redraw
+    /// *and* every pass of the layout observer. Calling
+    /// `NSWorkspace.runningApplications` from inside it — once for the candidate
+    /// set and again per candidate to test each one — roughly doubled idle CPU.
+    /// Sampling costs the same work a couple of times a second instead of dozens.
+    struct RunningApps: Equatable {
+        /// Bundle ids of apps the Dock would show: `activationPolicy == .regular`.
+        var dockApps: Set<String> = []
+        /// Every running bundle id, Dock-worthy or not.
+        var all: Set<String> = []
+        /// Bundle ids owning a window on *any* Space, so an app with windows one
+        /// Desktop away is not mistaken for having none.
+        var withWindows: Set<String> = []
+    }
+
+    /// Observed, not ignored. A launcher draws unlit when its app is not in this
+    /// set, and the set starts empty — so with the view unable to see it change,
+    /// a pin for a running app stayed faded until something *else* happened to
+    /// force a redraw. Assignment is guarded by equality because `@Observable`
+    /// notifies on every assignment regardless of value, and this is rebuilt
+    /// twice a second.
+    private(set) var runningApps = RunningApps()
+    @ObservationIgnored private var runningAppsSampledAt = Date.distantPast
+
+    /// Rate-limited: app launches and quits are rare compared with refreshes, and
+    /// the engine already forces a refresh on both, so a short staleness window
+    /// costs nothing visible.
+    func sampleRunningApps(windowOwnerPIDs: Set<pid_t>, force: Bool = false) {
+        guard force || Date().timeIntervalSince(runningAppsSampledAt) >= 1.5 else { return }
+        runningAppsSampledAt = Date()
+
+        var sample = RunningApps()
+        for app in NSWorkspace.shared.runningApplications {
+            guard let bundleID = app.bundleIdentifier else { continue }
+            sample.all.insert(bundleID)
+            if app.activationPolicy == .regular { sample.dockApps.insert(bundleID) }
+            if windowOwnerPIDs.contains(app.processIdentifier) {
+                sample.withWindows.insert(bundleID)
+            }
+        }
+        if sample != runningApps { runningApps = sample }
+    }
 
     /// Fires when a setting the engine cares about changes.
     @ObservationIgnored var onSettingsChanged: (() -> Void)?
@@ -168,9 +232,12 @@ final class AppStore {
 
     /// Moves one item to sit where another currently is, within the active
     /// group. Keys rather than window ids, so a pin can be dragged among windows.
-    func moveItem(_ key: String, before target: String) {
+    /// `groupID` is the arrangement being edited — the capsule's group in pill
+    /// view, and the active group everywhere else. Without it every drag wrote to
+    /// All's order, which a capsule does not read.
+    func moveItem(_ key: String, before target: String, in groupID: UUID? = nil) {
         guard key != target,
-              let index = groups.firstIndex(where: { $0.id == activeGroupID })
+              let index = groups.firstIndex(where: { $0.id == (groupID ?? activeGroupID) })
         else { return }
 
         // Seed from what's on screen right now, so the first drag nudges one
@@ -182,12 +249,30 @@ final class AppStore {
         var order = groups[index].order
         if order.isEmpty {
             let pinKeys = groups[index].pinnedApps.map { "p\($0.bundleID)" }
-            order = pinKeys + visibleItems.map(\.orderKey).filter { !pinKeys.contains($0) }
+            // Seed from what that group actually shows. In pill view the group
+            // being reordered is often not the one on screen, so `visibleItems`
+            // would seed it with the wrong row entirely.
+            let shown = groups[index].id == activeGroupID
+                ? visibleItems.map(\.orderKey)
+                : sections.first { $0.groupID == groups[index].id }?
+                    .items.map(\.orderKey) ?? []
+            order = pinKeys + shown.filter { !pinKeys.contains($0) }
+        }
+
+        // Which way the drag is going, decided *before* the key is pulled out.
+        // Inserting only ever before the target made the last position
+        // unreachable: dropping on the rightmost tile put you to its left, so a
+        // tile could never be dragged to the end of a row.
+        let movingRight: Bool
+        if let from = order.firstIndex(of: key), let to = order.firstIndex(of: target) {
+            movingRight = from < to
+        } else {
+            movingRight = false
         }
 
         order.removeAll { $0 == key }
         if let targetIndex = order.firstIndex(of: target) {
-            order.insert(key, at: targetIndex)
+            order.insert(key, at: movingRight ? targetIndex + 1 : targetIndex)
         } else {
             order.append(key)
         }
@@ -246,7 +331,14 @@ final class AppStore {
     /// how the off-group signal silently never appeared for groups without
     /// clusters.
     private func finishItems(_ items: [DeckItem]) -> [DeckItem] {
-        let ordered = applyManualOrder(pins(alongside: items) + items, order: activeGroup.order)
+        // Pins take part in the manual arrangement; running-app launchers do
+        // not. They come and go as you close and reopen windows, so letting them
+        // sit among the windows meant the row rearranged itself around things
+        // that aren't windows. They trail everything instead, behind a divider —
+        // the same treatment ungrouped windows get, for the same reason: a
+        // different kind of thing, separated rather than mixed in.
+        let launchers = pins(alongside: items) + runningAppItems(alongside: items)
+        let ordered = applyManualOrder(launchers + items, order: activeGroup.order)
         return appendGhostIfNeeded(to: partitionUngrouped(ordered))
     }
 
@@ -267,6 +359,177 @@ final class AppStore {
         return activeGroup.pinnedApps
             .filter { !present.contains($0.bundleID) }
             .map { DeckItem.pinned($0) }
+    }
+
+    /// Applications that are running with no window on show — what the Dock keeps
+    /// an icon and a dot for once you close the last window with the red button.
+    ///
+    /// `activationPolicy == .regular` is the Dock's own test for whether an app
+    /// belongs on it, so menu-bar utilities, helpers and background agents are
+    /// excluded without needing a judgement about which ones are interesting.
+    ///
+    /// In All every such app qualifies. Inside a group only apps that had a
+    /// window *here* do — the group is a record of what you were working with,
+    /// so an app you never opened in it has no business appearing.
+    private func runningAppItems(alongside items: [DeckItem]) -> [DeckItem] {
+        guard showRunningApps else { return [] }
+
+        // "Has no windows" means none anywhere, not none on this Desktop. With
+        // current-Space filtering on, `windows` omits other Spaces, so judging by
+        // it alone claimed an app had nothing open while its windows sat one
+        // Desktop away.
+        let present = runningApps.withWindows
+        let alreadyPinned = Set(activeGroup.pinnedApps.map(\.bundleID))
+        let selfID = Bundle.main.bundleIdentifier
+        let live = Set(windows.map(\.id))
+
+        // The closed member window each app can stand in for, so the slot keeps
+        // its position and its group dots. First one wins per app: the strip
+        // draws one placeholder for an app, not a row of them.
+        var slotFor: [String: CGWindowID] = [:]
+        for group in (activeGroup.isAll ? groups.filter { !$0.isAll } : [activeGroup]) {
+            for id in group.memberIDs where !live.contains(id) {
+                guard let ref = knownRefs[id], slotFor[ref.bundleID] == nil else { continue }
+                slotFor[ref.bundleID] = id
+            }
+        }
+
+        // In All, every app the Dock would show. Inside a group, only apps that
+        // had a window there — a group is a record of what you work with in it.
+        var wanted = activeGroup.isAll
+            ? runningApps.dockApps
+            : Set(slotFor.keys).intersection(runningApps.dockApps)
+
+        wanted.subtract(present)
+        wanted.subtract(alreadyPinned)
+        if let selfID { wanted.remove(selfID) }
+
+        return Self.pinnedApps(from: wanted.sorted())
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            .map { DeckItem.running($0, placeholderFor: slotFor[$0.bundleID]) }
+    }
+
+    /// The single description of what the strip draws.
+    ///
+    /// Both views come through here. Flat view is one section with no capsule and
+    /// no bucketing; pill view is one section per group. Having two separate
+    /// pipelines — a flat one and a bucketed one — meant every rule about
+    /// ordering and dragging existed twice and drifted apart, which is where a
+    /// run of pill-view bugs came from. One shape, one set of rules.
+    var sections: [DeckSection] {
+        guard pillView, activeGroup.isAll else {
+            return [DeckSection(id: "flat", groupID: activeGroupID, color: nil,
+                                dividerBefore: false, items: visibleItems)]
+        }
+
+        let windows = visibleWindows
+        var sections: [DeckSection] = []
+
+        // All's own launchers lead the row without a capsule: All is not one of
+        // the groups being bucketed, so it has no pill to sit inside.
+        // Against the real window list, not an empty one. `pins(alongside:)`
+        // decides whether a launcher stands aside by looking at what windows are
+        // present, so handing it nothing meant no pin ever hid and a pinned app
+        // with a window open drew its icon twice — the duplicate the rule exists
+        // to prevent, reintroduced the moment pill view bypassed it.
+        let windowItems = windows.map { DeckItem.window($0) }
+        let leading = pins(alongside: windowItems) + runningAppItems(alongside: windowItems)
+        if !leading.isEmpty {
+            sections.append(DeckSection(id: "leading", groupID: nil, color: nil,
+                                        dividerBefore: false, items: leading))
+        }
+
+        for group in groups where !group.isAll {
+            let members = windows.filter { group.memberIDs.contains($0.id) }
+            // Both kinds of launcher, not just pinned ones: a group's app that is
+            // running with its window closed belongs in that group's capsule for
+            // the same reason its pins do.
+            // Same standing-aside rule as everywhere else. Adding a group's pins
+            // unconditionally drew a launcher beside the very window it would
+            // have opened.
+            let present = Set(members.compactMap(\.bundleID))
+            var items = group.pinnedApps
+                .filter { !present.contains($0.bundleID) }
+                .map { DeckItem.pinned($0) }
+            items += runningLaunchers(for: group, live: Set(windows.map(\.id)))
+            items += foldClusters(members, in: group)
+            guard !items.isEmpty else { continue }
+            // Each capsule honours its own group's arrangement, the way a Chrome
+            // tab group owns the order of the tabs inside it.
+            items = applyManualOrder(items, order: group.order)
+            sections.append(DeckSection(id: group.id.uuidString, groupID: group.id,
+                                        color: group.displayColor,
+                                        dividerBefore: false, items: items))
+        }
+
+        let unfiled = windows.filter { window in
+            !groups.contains { !$0.isAll && $0.memberIDs.contains(window.id) }
+        }
+        if !unfiled.isEmpty {
+            let ordered = applyManualOrder(unfiled.map { DeckItem.window($0) },
+                                           order: activeGroup.order)
+            sections.append(DeckSection(id: "ungrouped", groupID: nil, color: .secondary,
+                                        dividerBefore: true, items: ordered))
+        }
+
+        return sections
+    }
+
+    /// A group's apps that are running with every window closed.
+    private func runningLaunchers(for group: DeckGroup, live: Set<CGWindowID>) -> [DeckItem] {
+        guard showRunningApps else { return [] }
+        let pinned = Set(group.pinnedApps.map(\.bundleID))
+        var slotFor: [String: CGWindowID] = [:]
+        for id in group.memberIDs where !live.contains(id) {
+            guard let ref = knownRefs[id], slotFor[ref.bundleID] == nil,
+                  runningApps.dockApps.contains(ref.bundleID),
+                  !runningApps.withWindows.contains(ref.bundleID),
+                  !pinned.contains(ref.bundleID)
+            else { continue }
+            slotFor[ref.bundleID] = id
+        }
+        return Self.pinnedApps(from: slotFor.keys.sorted())
+            .map { DeckItem.running($0, placeholderFor: slotFor[$0.bundleID]) }
+    }
+
+    /// What a drag from one section to another means.
+    ///
+    /// Windows move: they join the target group and leave the one they came from.
+    /// Dropping into a section with no group — the unfiled capsule — only removes
+    /// the source membership, leaving any others intact. Pins move the same way.
+    func moveItem(_ key: String, from source: UUID?, to target: UUID?) {
+        guard source != target else { return }
+
+        if key.hasPrefix("w"), let windowID = CGWindowID(key.dropFirst()) {
+            if let target { add(windowID, to: target) }
+            if let source { remove(windowID, from: source) }
+            return
+        }
+
+        if key.hasPrefix("p") {
+            let bundleID = String(key.dropFirst())
+            if let target { pinApp(bundleID: bundleID, in: target) }
+            if let source { unpin(bundleID, in: source) }
+        }
+    }
+
+    /// Folds a group's clusters into its window list, leaving loose windows alone.
+    private func foldClusters(_ windows: [WindowInfo], in group: DeckGroup) -> [DeckItem] {
+        guard !group.clusters.isEmpty else { return windows.map { .window($0) } }
+        var consumed: Set<CGWindowID> = []
+        var items: [DeckItem] = []
+        for window in windows where !consumed.contains(window.id) {
+            guard let cluster = group.clusters.first(where: { $0.contains(window.id) }) else {
+                items.append(.window(window)); consumed.insert(window.id); continue
+            }
+            let members = cluster.memberIDs.compactMap { id in windows.first { $0.id == id } }
+            guard members.count >= 2 else {
+                items.append(.window(window)); consumed.insert(window.id); continue
+            }
+            items.append(.cluster(cluster, members))
+            consumed.formUnion(members.map(\.id))
+        }
+        return items
     }
 
     /// In All, moves windows belonging to no group to the end, marked so the
@@ -398,8 +661,10 @@ final class AppStore {
 
     /// Group colours for a window, in group order — the dots under a strip entry
     /// and the badges in Settings.
-    func colors(containing windowID: CGWindowID) -> [GroupColor] {
-        groups.filter { !$0.isAll && $0.memberIDs.contains(windowID) }.map(\.color)
+    /// Resolved colours, not palette cases — a group may carry a custom colour
+    /// that no `GroupColor` can express.
+    func colors(containing windowID: CGWindowID) -> [Color] {
+        groups.filter { !$0.isAll && $0.memberIDs.contains(windowID) }.map(\.displayColor)
     }
 
     /// Groups a window belongs to, in order, for labelled badges.
@@ -509,9 +774,19 @@ final class AppStore {
         return group
     }
 
+    /// Clears any custom colour: picking a preset is how you get back to one.
+    func setCustomColor(_ color: Color?, for groupID: UUID) {
+        guard let index = groups.firstIndex(where: { $0.id == groupID }) else { return }
+        groups[index].customColorHex = color?.hexString
+        scheduleSave()
+    }
+
     func setColor(_ color: GroupColor, for groupID: UUID) {
         guard let index = groups.firstIndex(where: { $0.id == groupID }), !groups[index].isAll else { return }
         groups[index].colorIndex = color.rawValue
+        // Choosing a preset clears the custom colour, so the swatches always mean
+        // what they show rather than being silently overridden.
+        groups[index].customColorHex = nil
         scheduleSave()
     }
 
@@ -575,6 +850,153 @@ final class AppStore {
     }
 
     // MARK: - Pinned apps
+
+    /// Runs the prune immediately, bypassing its rate limit. Self-test only.
+    func forcePruneForTesting() {
+        lastPrunedAt = .distantPast
+        pruneDeadMembers()
+    }
+
+    /// Read and write a group's arrangement directly. Used by the self-test,
+    /// which has no way to perform a drag.
+    func order(in groupID: UUID) -> [String] {
+        groups.first { $0.id == groupID }?.order ?? []
+    }
+
+    func setOrder(_ order: [String], in groupID: UUID) {
+        guard let index = groups.firstIndex(where: { $0.id == groupID }) else { return }
+        groups[index].order = order
+    }
+
+    /// Groups worth offering when pinning this window's app: the ones it is
+    /// already filed in, plus the group on screen if that is not All. Offering
+    /// every group would make the menu as long as the group list.
+    func pinTargets(for windowID: CGWindowID) -> [DeckGroup] {
+        var targets = groups.filter { !$0.isAll && $0.memberIDs.contains(windowID) }
+        if !activeGroup.isAll, !targets.contains(where: { $0.id == activeGroupID }) {
+            targets.append(activeGroup)
+        }
+        return targets
+    }
+
+    /// One entry in the "Group with" menu.
+    struct GroupWithTarget: Identifiable {
+        let id: String
+        let name: String
+        /// The app, or how many windows a cluster holds.
+        let detail: String
+        let icon: NSImage?
+        /// The window to merge into; a cluster is joined through any member.
+        let windowID: CGWindowID
+        let isCluster: Bool
+        /// The window being right-clicked. Listed but not selectable, so its
+        /// position among the others is visible — the menu is in strip order, and
+        /// a gap where you are standing makes that order harder to read.
+        let isSelf: Bool
+    }
+
+    /// What this window can be merged with, in the order the strip draws them.
+    ///
+    /// Deliberately not bucketed by application or anything else: the list reads
+    /// left to right exactly as the row does, so finding an entry is the same
+    /// problem as finding its tile. Any clever reordering means the menu and the
+    /// strip disagree about where something is.
+    ///
+    /// Combining used to be a drag gesture: dwell on a tile for 0.7s and the two
+    /// merged. It could not be made to work — every drag reorders the row live,
+    /// so the target slid out from under the pointer and the dwell never
+    /// completed. A menu has no timing to lose.
+    func groupWithTargets(for windowID: CGWindowID, in groupID: UUID?) -> [GroupWithTarget] {
+        let group = groups.first { $0.id == (groupID ?? activeGroupID) }
+        let pool: [WindowInfo]
+        if let group, !group.isAll {
+            pool = windows.filter { group.memberIDs.contains($0.id) }
+        } else {
+            pool = visibleWindows
+        }
+
+        let clusters = group?.clusters ?? []
+        // Members of a cluster are offered through the cluster, not one by one.
+        let clustered = Set(clusters.flatMap(\.memberIDs))
+
+        // Position in the group's arrangement, so buckets keep strip order.
+        let rank: [String: Int] = (group?.order ?? []).enumerated()
+            .reduce(into: [:]) { $0[$1.element] = $1.offset }
+        func position(_ id: CGWindowID) -> Int { rank["w\(id)"] ?? Int.max }
+
+        var targets: [GroupWithTarget] = []
+
+        for cluster in clusters {
+            guard let first = cluster.memberIDs.first,
+                  let member = windows.first(where: { $0.id == first }) else { continue }
+            let live = cluster.memberIDs.filter { id in windows.contains { $0.id == id } }.count
+            targets.append(GroupWithTarget(
+                id: "c\(cluster.id)",
+                name: cluster.customName ?? member.appName,
+                detail: "\(live) windows",
+                icon: member.icon?.menuSized,
+                windowID: first,
+                isCluster: true,
+                isSelf: cluster.contains(windowID)
+            ))
+        }
+
+        let loose = pool
+            .filter { !clustered.contains($0.id) }
+            .sorted { position($0.id) < position($1.id) }
+
+        for window in loose {
+            targets.append(GroupWithTarget(
+                id: "w\(window.id)",
+                // Long document titles make every row as wide as the worst one.
+                name: window.displayTitle.truncated(to: 34),
+                detail: window.appName,
+                icon: window.icon?.menuSized,
+                windowID: window.id,
+                isCluster: false,
+                isSelf: window.id == windowID
+            ))
+        }
+
+        // Strip order throughout. Clusters sit at the position of their first
+        // member, which is where the strip draws them too.
+        return targets.sorted { position($0.windowID) < position($1.windowID) }
+    }
+
+    /// Whether an app is pinned in a group. Nil means All.
+    func isPinned(_ bundleID: String, in groupID: UUID?) -> Bool {
+        let target = groupID ?? DeckGroup.allGroupID
+        return groups.first { $0.id == target }?
+            .pinnedApps.contains { $0.bundleID == bundleID } ?? false
+    }
+
+    /// Pin or unpin, so one menu shows the state and changes it — the same shape
+    /// as the group-membership menu, rather than a one-way "remove" that cannot
+    /// tell you where the app is currently pinned.
+    func togglePin(_ bundleID: String, in groupID: UUID?) {
+        if isPinned(bundleID, in: groupID) {
+            unpin(bundleID, in: groupID ?? DeckGroup.allGroupID)
+        } else {
+            pinApp(bundleID: bundleID, in: groupID)
+        }
+    }
+
+    /// Groups worth listing when pinning an *app* rather than a window: wherever
+    /// it is already pinned, plus the group on screen.
+    func pinTargets(forApp bundleID: String) -> [DeckGroup] {
+        var targets = groups.filter { !$0.isAll && $0.pinnedApps.contains { $0.bundleID == bundleID } }
+        if !activeGroup.isAll, !targets.contains(where: { $0.id == activeGroupID }) {
+            targets.append(activeGroup)
+        }
+        return targets
+    }
+
+    /// Pins the application a window belongs to. `groupID` nil means All.
+    func pinApp(bundleID: String, in groupID: UUID?) {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+              let app = PinnedApp(url: url) else { return }
+        pin(app, in: groupID ?? DeckGroup.allGroupID)
+    }
 
     func pin(_ app: PinnedApp, in groupID: UUID? = nil) {
         let target = groupID ?? activeGroupID
@@ -683,9 +1105,15 @@ final class AppStore {
                         let key = "p\(bundleID)"
                         if !order.contains(key) { order.append(key) }
                     case .window(let member):
-                        if let match = windows.first(where: {
-                            member.matches($0) && !order.contains("w\($0.id)")
-                        }) {
+                        // The same window-id-first matcher membership uses. This
+                        // was exact-title only, so an arrangement silently
+                        // reshuffled on relaunch whenever a title had moved on —
+                        // which for Terminal, browsers and editors is most of
+                        // the time.
+                        let taken = Set(order.compactMap { key -> CGWindowID? in
+                            key.hasPrefix("w") ? CGWindowID(key.dropFirst()) : nil
+                        })
+                        if let match = candidate(for: member, in: windows, excluding: taken) {
                             order.append("w\(match.id)")
                         } else {
                             stillMissing.append(ref)
@@ -722,9 +1150,13 @@ final class AppStore {
 
     /// Combines two entries into one icon, or grows an existing cluster when
     /// either side is already part of one.
-    func combine(_ windowID: CGWindowID, into targetID: CGWindowID) {
+    /// `groupID` is the capsule the drag happened in. Clusters belong to a group,
+    /// and in pill view the *active* group is always All — so combining windows
+    /// inside Actelligent's capsule built the cluster in All, where the capsule
+    /// never looks, and nothing appeared to happen.
+    func combine(_ windowID: CGWindowID, into targetID: CGWindowID, in groupID: UUID? = nil) {
         guard windowID != targetID,
-              let index = groups.firstIndex(where: { $0.id == activeGroupID })
+              let index = groups.firstIndex(where: { $0.id == (groupID ?? activeGroupID) })
         else { return }
 
         // Dropping onto a cluster adds to it rather than nesting.
@@ -742,14 +1174,28 @@ final class AppStore {
         saveNow()
     }
 
-    func dissolveCluster(_ clusterID: UUID) {
-        guard let index = groups.firstIndex(where: { $0.id == activeGroupID }) else { return }
+    func dissolveCluster(_ clusterID: UUID, in groupID: UUID? = nil) {
+        // Same reasoning as `combine`: dissolve the cluster in the group that
+        // owns it, which in pill view is not the one on screen.
+        guard let index = groupID.flatMap({ id in groups.firstIndex { $0.id == id } })
+                ?? groupIndexOwning(cluster: clusterID) else { return }
         groups[index].clusters.removeAll { $0.id == clusterID }
         saveNow()
     }
 
+    /// The group that owns a cluster. In pill view the active group is All while
+    /// the cluster lives in one of the bucketed groups, so every cluster
+    /// operation has to look it up rather than assume.
+    private func groupIndexOwning(cluster clusterID: UUID) -> Int? {
+        groups.firstIndex { $0.clusters.contains { $0.id == clusterID } }
+    }
+
+    private func groupIndexOwningWindowInCluster(_ windowID: CGWindowID) -> Int? {
+        groups.firstIndex { $0.clusters.contains { $0.contains(windowID) } }
+    }
+
     func renameCluster(_ clusterID: UUID, to name: String) {
-        guard let index = groups.firstIndex(where: { $0.id == activeGroupID }),
+        guard let index = groupIndexOwning(cluster: clusterID),
               let clusterIndex = groups[index].clusters.firstIndex(where: { $0.id == clusterID })
         else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -758,7 +1204,7 @@ final class AppStore {
     }
 
     func removeFromCluster(_ windowID: CGWindowID) {
-        guard let index = groups.firstIndex(where: { $0.id == activeGroupID }) else { return }
+        guard let index = groupIndexOwningWindowInCluster(windowID) else { return }
         detach(windowID, in: index)
         saveNow()
     }
@@ -822,7 +1268,15 @@ final class AppStore {
     ///   applications reopen over tens of seconds and every one of those windows
     ///   is genuinely new — without this, switching to a group during that
     ///   window would sweep dozens of unrelated windows into it.
-    func captureNewWindows(_ created: Set<CGWindowID>, claimedByRestore: Set<CGWindowID> = []) {
+    /// `focusHint` is whatever was focused *before* this refresh. A new window
+    /// takes focus the instant it appears, so by the time it is processed the
+    /// focused window is the new one — which belongs to nothing. Asking what you
+    /// were working in a moment ago is the only way to know which group you
+    /// meant, and it is why creating windows in Actelligent filed them as
+    /// unfiled.
+    func captureNewWindows(_ created: Set<CGWindowID>,
+                           claimedByRestore: Set<CGWindowID> = [],
+                           focusHint: CGWindowID? = nil) {
         let now = Date()
 
         // Queue rather than act immediately. A window reaches the window server
@@ -834,9 +1288,44 @@ final class AppStore {
         //
         // The group is recorded per window, so a window opened in Main still
         // joins Main even if the active group changes while it settles.
-        if autoAddNewWindows, !activeGroup.isAll, now >= launchGraceEnds {
+        // Which groups a new window should join.
+        //
+        // Normally the group you are looking at. But in All there is no such
+        // group, and in pill view All is *always* what you are looking at — so
+        // auto-capture would never fire for anyone using it. Falling back to the
+        // groups of the window you are actually working in keeps the behaviour
+        // meaningful there: open something while in a Study window and it joins
+        // Study, which is what you would have wanted anyway.
+        let targets: [UUID]
+        if !activeGroup.isAll {
+            targets = [activeGroupID]
+        } else if let reference = focusHint ?? focusedWindowID {
+            var found = groups.filter { !$0.isAll && $0.memberIDs.contains(reference) }.map(\.id)
+            // A window queued but not yet flushed counts as already belonging.
+            //
+            // Capture is deferred — a new window reaches the window server before
+            // Accessibility can describe it — while focus moves to that window
+            // immediately. So opening several in a row broke after the first few:
+            // by the third, the focused window was one that had been queued for
+            // Study but not yet added to it, so it looked like it belonged to
+            // nothing and the chain stopped.
+            if found.isEmpty, let queued = pendingCaptures[reference] {
+                found = queued.groupIDs
+            }
+            // And if the reference itself was the previous new window, follow it
+            // back one more step: opening several in a row chains through them.
+            if found.isEmpty, let current = focusedWindowID,
+               let queued = pendingCaptures[current] {
+                found = queued.groupIDs
+            }
+            targets = found
+        } else {
+            targets = []
+        }
+
+        if autoAddNewWindows, !targets.isEmpty, now >= launchGraceEnds {
             for id in created.subtracting(claimedByRestore) {
-                pendingCaptures[id] = PendingCapture(groupID: activeGroupID, seen: now)
+                pendingCaptures[id] = PendingCapture(groupIDs: targets, seen: now)
             }
         }
 
@@ -847,7 +1336,10 @@ final class AppStore {
         for id in claimedByRestore { pendingCaptures.removeValue(forKey: id) }
         // Anything that never becomes trackable — transient dialogs, panels —
         // is dropped rather than queued forever.
-        pendingCaptures = pendingCaptures.filter { now.timeIntervalSince($0.value.seen) < 5 }
+        // Ten seconds, not five. An application under load can take a while to
+        // describe a new window through Accessibility, and a queue entry that
+        // expires first loses the capture silently.
+        pendingCaptures = pendingCaptures.filter { now.timeIntervalSince($0.value.seen) < 10 }
 
         guard autoAddNewWindows, !pendingCaptures.isEmpty else { return }
         flushPendingCaptures()
@@ -863,12 +1355,14 @@ final class AppStore {
         var changed = false
         for (windowID, pending) in ready {
             pendingCaptures.removeValue(forKey: windowID)
-            guard let index = groups.firstIndex(where: { $0.id == pending.groupID }),
-                  !groups[index].isAll,
-                  !groups[index].memberIDs.contains(windowID)
-            else { continue }
-            groups[index].memberIDs.insert(windowID)
-            changed = true
+            for groupID in pending.groupIDs {
+                guard let index = groups.firstIndex(where: { $0.id == groupID }),
+                      !groups[index].isAll,
+                      !groups[index].memberIDs.contains(windowID)
+                else { continue }
+                groups[index].memberIDs.insert(windowID)
+                changed = true
+            }
         }
 
         if changed { saveNow() }
@@ -883,11 +1377,157 @@ final class AppStore {
     /// A window seen by the window server but not yet reported by the
     /// Accessibility API, along with the group it should join once it is.
     private struct PendingCapture {
-        let groupID: UUID
+        let groupIDs: [UUID]
         let seen: Date
     }
 
     @ObservationIgnored private var pendingCaptures: [CGWindowID: PendingCapture] = [:]
+
+    /// Drops group members whose window is gone for good.
+    ///
+    /// A member's id lingers after its window closes, which is deliberate — it is
+    /// what lets the strip keep the slot while the app is still running, and what
+    /// lets a reopened window reclaim it. But nothing ever removed them, so every
+    /// close-and-reopen left another dead id behind: six generations of one
+    /// WhatsApp window in a single group, each persisted as a member.
+    ///
+    /// Two rules, both conservative:
+    /// * the application is no longer running — the window cannot come back, so
+    ///   there is nothing left to hold a place for;
+    /// * more than one dead id for the same application in one group — the strip
+    ///   only ever draws one placeholder for an app and a reopened window only
+    ///   claims one slot, so the rest are unreachable bookkeeping.
+    ///
+    /// Never touches a live member, and never runs against `savedMembers`, which
+    /// is the restore queue for windows that have not come back *yet*.
+    /// Deliberately not run on the engine's cadence. Nothing here changes twice a
+    /// second, and it walks every member of every group.
+    private static let pruneInterval: TimeInterval = 15
+    @ObservationIgnored private var lastPrunedAt = Date.distantPast
+
+    func pruneDeadMembers() {
+        guard Date().timeIntervalSince(lastPrunedAt) >= Self.pruneInterval else { return }
+        lastPrunedAt = Date()
+
+        // The restore queue is where the real accumulation happens. An entry that
+        // never finds its window stays queued and is written back on every save,
+        // so each relaunch adds another copy: six identical WhatsApp references
+        // in one group, for an app with no windows at all.
+        //
+        // Only exact duplicates go. A reference matches at most one window, so
+        // two identical ones can only ever describe the same window twice —
+        // unlike two references that merely share an app, which are two
+        // different documents and must both survive.
+        // Keyed on app and title, *not* on the reference itself: `MemberRef` is
+        // Hashable including its window id, so six queued references to the same
+        // WhatsApp window — one per relaunch, each carrying that session's id —
+        // compare as six different things and survive a naive dedupe.
+        func identity(_ ref: MemberRef) -> String { "\(ref.bundleID)\u{1}\(ref.title)" }
+
+        for index in groups.indices {
+            var seen: Set<String> = []
+            let deduped = groups[index].savedMembers.filter { seen.insert(identity($0)).inserted }
+            if deduped.count != groups[index].savedMembers.count {
+                groups[index].savedMembers = deduped
+                saveNow()
+            }
+
+            var seenOrder: Set<String> = []
+            let dedupedOrder = groups[index].savedOrder.filter { ref in
+                switch ref {
+                case .window(let member): seenOrder.insert("w" + identity(member)).inserted
+                case .pinned(let bundleID): seenOrder.insert("p" + bundleID).inserted
+                }
+            }
+            if dedupedOrder.count != groups[index].savedOrder.count {
+                groups[index].savedOrder = dedupedOrder
+                saveNow()
+            }
+        }
+
+        let live = Set(windows.map(\.id))
+        var changed = false
+
+        for index in groups.indices where !groups[index].isAll {
+            for id in groups[index].memberIDs where !live.contains(id) {
+                // Only when the application itself is gone. An earlier version
+                // also dropped a second dead id for the same app, which quietly
+                // cost real membership: close three editor windows in a group and
+                // reopening them restored one. Growth is already bounded by this
+                // rule plus `rebindReopenedWindows` reclaiming slots instead of
+                // adding ids, so the extra rule bought nothing.
+                let unreachable = knownRefs[id].map { !runningApps.all.contains($0.bundleID) } ?? true
+                guard unreachable else { continue }
+                groups[index].memberIDs.remove(id)
+                groups[index].order.removeAll { $0 == "w\(id)" }
+                changed = true
+            }
+        }
+
+        if changed { saveNow() }
+    }
+
+    /// Re-attaches a reopened window to the slot its predecessor held.
+    ///
+    /// Closing a window with the red button and opening it again produces a
+    /// *different* `CGWindowID`. Membership and the manual arrangement are both
+    /// keyed by id, so without this the returning window is no longer a member of
+    /// anything and sorts wherever the default order puts it — the group loses it
+    /// and the strip visibly reshuffles. Which is exactly what "it jumps around"
+    /// looked like.
+    ///
+    /// Matching is by application, restricted to a member whose window is gone,
+    /// so a reopened window can only ever claim a slot that is genuinely vacant.
+    /// Returns the ids it claimed so they aren't also swept up as brand new.
+    @discardableResult
+    func rebindReopenedWindows(_ created: Set<CGWindowID>) -> Set<CGWindowID> {
+        guard !created.isEmpty else { return [] }
+        let live = Set(windows.map(\.id))
+        var claimed: Set<CGWindowID> = []
+
+        for newID in created {
+            guard let window = windows.first(where: { $0.id == newID }),
+                  let bundleID = window.bundleID else { continue }
+
+            for index in groups.indices {
+                if groups[index].isAll {
+                    // All has no membership, but it does have an arrangement, so
+                    // the returning window should still land where it sat.
+                    if let oldID = vacantMemberID(in: groups[index].order,
+                                                  bundleID: bundleID, live: live),
+                       let slot = groups[index].order.firstIndex(of: "w\(oldID)") {
+                        groups[index].order[slot] = "w\(newID)"
+                    }
+                    continue
+                }
+
+                guard let oldID = groups[index].memberIDs.first(where: {
+                    !live.contains($0) && knownRefs[$0]?.bundleID == bundleID
+                }) else { continue }
+
+                groups[index].memberIDs.remove(oldID)
+                groups[index].memberIDs.insert(newID)
+                if let slot = groups[index].order.firstIndex(of: "w\(oldID)") {
+                    groups[index].order[slot] = "w\(newID)"
+                }
+                claimed.insert(newID)
+            }
+        }
+
+        // Membership changed, and membership is the thing most expensive to lose.
+        if !claimed.isEmpty { saveNow() }
+        return claimed
+    }
+
+    private func vacantMemberID(in order: [String], bundleID: String,
+                                live: Set<CGWindowID>) -> CGWindowID? {
+        for key in order where key.hasPrefix("w") {
+            guard let id = CGWindowID(key.dropFirst()), !live.contains(id),
+                  knownRefs[id]?.bundleID == bundleID else { continue }
+            return id
+        }
+        return nil
+    }
 
     /// Called when an application launches, so windows arriving late still get
     /// matched.
@@ -918,6 +1558,7 @@ final class AppStore {
                 id: UUID(uuidString: saved.id) ?? UUID(),
                 name: saved.name,
                 colorIndex: saved.colorIndex,
+                customColorHex: saved.customColorHex,
                 savedMembers: saved.members,
                 savedOrder: saved.order,
                 clusters: saved.clusters.map(Self.cluster(from:)),
@@ -945,6 +1586,8 @@ final class AppStore {
         swipeOverStrip = state.swipeOverStrip
         globalSwipeGesture = state.globalSwipeGesture
         swipeFingerCounts = Set(state.swipeFingerCounts)
+        showRunningApps = state.showRunningApps
+        pillView = state.pillView
         swipeSensitivity = state.swipeSensitivity
         animateGroupChanges = state.animateGroupChanges
         // Within a tolerance: the recorded boot time can wobble by a hair across
@@ -1041,6 +1684,7 @@ final class AppStore {
                     id: $0.id.uuidString,
                     name: $0.name,
                     colorIndex: $0.colorIndex,
+                    customColorHex: $0.customColorHex,
                     members: snapshot(of: $0),
                     order: orderSnapshot(of: $0),
                     clusters: $0.clusters.map(persisted),
@@ -1067,6 +1711,8 @@ final class AppStore {
             swipeOverStrip: swipeOverStrip,
             globalSwipeGesture: globalSwipeGesture,
             swipeFingerCounts: swipeFingerCounts.sorted(),
+            showRunningApps: showRunningApps,
+            pillView: pillView,
             swipeSensitivity: swipeSensitivity,
             animateGroupChanges: animateGroupChanges,
             bootTime: Self.systemBootTime

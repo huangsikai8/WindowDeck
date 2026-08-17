@@ -56,10 +56,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // the whole strip — re-sorting the windows, recomputing the layout
             // and rebuilding every tile. Refreshes fire several times a second
             // during use and usually carry identical content.
+            self.store.sampleRunningApps(windowOwnerPIDs: snapshot.windowOwnerPIDs)
             if windows != self.store.windows {
                 self.store.windows = windows
                 self.store.noteWindowRefs(windows)
             }
+            // Recorded before focus is updated: a window that has just opened
+            // already holds focus, so the group context has to come from what we
+            // were in immediately before.
+            let previousFocus = self.store.focusedWindowID
+
             // Don't let a stale reading overwrite a focus we just requested;
             // activate() is asynchronous and the server lags behind it.
             if Date() >= self.optimisticFocusUntil || snapshot.focusedWindowID == self.store.focusedWindowID {
@@ -77,8 +83,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Restore first: a window that belongs to a saved group should rejoin
             // it rather than be captured by whichever group is active.
             let restored = self.store.restorePass(against: windows)
-            self.store.captureNewWindows(snapshot.created, claimedByRestore: restored)
+            // Before auto-capture: a window returning to a group it already
+            // belonged to must not be treated as brand new and swept into
+            // whichever group happens to be showing.
+            let rebound = self.store.rebindReopenedWindows(snapshot.created)
+            self.store.captureNewWindows(snapshot.created,
+                                         claimedByRestore: restored.union(rebound),
+                                         focusHint: previousFocus)
             self.store.pruneClusters()
+            self.store.pruneDeadMembers()
         }
 
         NSWorkspace.shared.notificationCenter.addObserver(

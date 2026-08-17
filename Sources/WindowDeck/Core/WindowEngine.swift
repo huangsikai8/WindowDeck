@@ -23,6 +23,10 @@ final class WindowEngine {
         /// True while a genuinely fullscreen window is frontmost — its own
         /// Space, menu bar hidden. Distinct from a merely zoomed window.
         let isFullscreen: Bool
+        /// Process ids owning an ordinary window on *any* Space. Lets the store
+        /// tell "this app has nothing open" apart from "nothing open on this
+        /// Desktop", without a second window-server query per redraw.
+        let windowOwnerPIDs: Set<pid_t>
     }
 
     var onChange: ((Snapshot) -> Void)?
@@ -49,6 +53,11 @@ final class WindowEngine {
     private var knownWindowIDs: Set<CGWindowID> = []
     private var hasSeededKnownIDs = false
     private var refreshWork: DispatchWorkItem?
+    /// Windows seen reporting `AXStandardWindow` at least once. A window's
+    /// subrole can change while it is minimised, and this is what stops that
+    /// looking like the window closed. Pruned against the window server each
+    /// refresh so it cannot grow for the life of the process.
+    private var standardWindowIDs: Set<CGWindowID> = []
 
     /// Windows smaller than this are palettes, HUDs and inspectors, not documents.
     private let minimumWindowSide: CGFloat = 80
@@ -194,6 +203,10 @@ final class WindowEngine {
             hasSeededKnownIDs = true
         }
         knownWindowIDs = server.allIDs
+        // Forget windows that genuinely went away.
+        if standardWindowIDs.count > server.allIDs.count {
+            standardWindowIDs.formIntersection(server.allIDs)
+        }
 
         // A window the server has just reported often isn't fully described by
         // the Accessibility API yet. Force a full scan on the very next tick so
@@ -214,7 +227,8 @@ final class WindowEngine {
             windows: windows,
             created: created,
             focusedWindowID: focused,
-            isFullscreen: fullscreen
+            isFullscreen: fullscreen,
+            windowOwnerPIDs: server.ownerPIDs
         ))
     }
 
@@ -229,6 +243,7 @@ final class WindowEngine {
         var onScreenIDs: Set<CGWindowID> = []
         var bounds: [CGWindowID: CGRect] = [:]
         var frontmostID: CGWindowID?
+        var ownerPIDs: Set<pid_t> = []
     }
 
     private func queryWindowServer() -> WindowServerSnapshot {
@@ -271,6 +286,9 @@ final class WindowEngine {
             guard (entry[kCGWindowLayer as String] as? Int) == 0 else { continue }
             guard let id = entry[kCGWindowNumber as String] as? CGWindowID else { continue }
             snapshot.allIDs.insert(id)
+            if let pid = entry[kCGWindowOwnerPID as String] as? pid_t {
+                snapshot.ownerPIDs.insert(pid)
+            }
         }
 
         return snapshot
@@ -407,25 +425,63 @@ final class WindowEngine {
         appName: String,
         onScreen: Set<CGWindowID>
     ) -> WindowInfo? {
-        // Standard windows only: drops sheets, popovers, palettes and inspectors.
-        let subrole: String? = AX.value(element, kAXSubroleAttribute)
-        guard subrole == kAXStandardWindowSubrole as String else { return nil }
-
         guard let id = AX.windowID(of: element) else { return nil }
 
+        let subrole: String? = AX.value(element, kAXSubroleAttribute)
         let isMinimized = AX.bool(element, kAXMinimizedAttribute)
+        let title: String = AX.value(element, kAXTitleAttribute) ?? ""
+        let isStandard = subrole == kAXStandardWindowSubrole as String
+        let isHiddenApp = app.isHidden
+
+        // Standard windows only — that filter is what keeps sheets, popovers,
+        // palettes and inspectors out of the strip. But it cannot be the whole
+        // story, because **a window's subrole can change while it is minimised**:
+        // Activity Monitor's main window reports `AXDialog` once minimised, so a
+        // strict test dropped it from every group and minimising was
+        // indistinguishable from closing.
+        //
+        // Two escapes, both narrow. A window already seen as standard stays
+        // accepted for as long as it exists, since minimising cannot turn a real
+        // window into a dialog. And a *minimised* dialog carrying a title is
+        // treated as real — genuine dialogs are modal and cannot be minimised at
+        // all, which is what keeps this from readmitting sheets. The second rule
+        // matters on a cold start, where nothing has been seen yet.
+        // Measured: a window reports `AXDialog` whenever it is *put away* —
+        // minimised, or belonging to an application hidden with ⌘H. Not only
+        // minimised, which is what the first version of this assumed, so nine
+        // hidden apps' windows were still being dropped: Firefox, Excel, Word,
+        // Outlook, Notes, Terminal, TextEdit, Activity Monitor, Google Docs.
+        //
+        // Still narrow. A genuine dialog is modal and can be neither minimised
+        // nor hidden, so requiring one of those states plus a title is what keeps
+        // sheets and alerts out.
+        let wasStandard = standardWindowIDs.contains(id)
+        let isPutAway = isMinimized || isHiddenApp
+        let dialogButRealWindow = isPutAway && !title.isEmpty
+            && subrole == kAXDialogSubrole as String
+        guard isStandard || wasStandard || dialogButRealWindow else { return nil }
+        if isStandard { standardWindowIDs.insert(id) }
 
         // Minimized windows leave the on-screen set but must still be listed —
-        // they're the ones a user most wants a click target for.
-        if currentSpaceOnly && !isMinimized && !onScreen.contains(id) { return nil }
+        // they're the ones a user most wants a click target for. So do the
+        // windows of an application hidden with ⌘H, and that exemption was
+        // missing: hiding an app made every one of its windows disappear from
+        // the strip as though it had quit. Measured on a machine with a single
+        // Space, twelve apps hidden this way — Excel, Word, Outlook, Terminal,
+        // Spotify and more — accounted for nearly every window the strip was
+        // not showing, and it looked for all the world like a Spaces problem.
+        //
+        // "Off screen" answers *where the window is drawn*, which is not the same
+        // question as *does this window exist on this Desktop*.
+        if currentSpaceOnly && !isMinimized && !isHiddenApp && !onScreen.contains(id) {
+            return nil
+        }
 
         // Zero-size and tiny windows are offscreen scratch windows some apps keep.
         if !isMinimized, let size = AX.size(element),
            size.width < minimumWindowSide || size.height < minimumWindowSide {
             return nil
         }
-
-        let title: String = AX.value(element, kAXTitleAttribute) ?? ""
 
         return WindowInfo(
             id: id,
@@ -456,6 +512,46 @@ final class WindowEngine {
     /// the keypress appears to do nothing.
     var onFocusRequested: ((CGWindowID) -> Void)?
 
+    /// Brings an application forward, overriding cooperative activation.
+    ///
+    /// Plain `activate()` is a *request*, and macOS refuses it whenever the
+    /// asking app is not already frontmost — which WindowDeck never is, because
+    /// the strip is a `.nonactivatingPanel` on purpose. Measured directly in the
+    /// settings window: `NSApp.isActive` stayed false after every single call.
+    /// The result is a window correctly raised within its own app while the app
+    /// itself stays behind whatever you were looking at, so clicking an entry
+    /// looked like it had done nothing.
+    ///
+    /// The deprecated option is not a shortcut here; it is the only form that
+    /// works from a background agent.
+    private func bringForward(pid: pid_t) {
+        let app = NSRunningApplication(processIdentifier: pid)
+
+        // Unhiding is a separate verb from activating, and `activate()` will not
+        // do it. Hiding an app with ⌘H used to remove its windows from the strip
+        // entirely, so this never came up; now that they are listed, clicking one
+        // raised the window inside an application that stayed hidden.
+        if app?.isHidden == true { app?.unhide() }
+
+        // Accessibility, not AppKit, is what actually brings the app forward.
+        //
+        // `NSRunningApplication.activate()` is a request under cooperative
+        // activation and macOS refuses it for an app that is not already
+        // frontmost — which WindowDeck never is, the strip being a
+        // `.nonactivatingPanel` by design. The `ignoringOtherApps` option looks
+        // like the escape hatch and is not: the compiler reports it deprecated
+        // "and will have no effect" on macOS 14, so calls carrying it did nothing
+        // beyond the plain request that was already failing.
+        //
+        // Setting `kAXFrontmost` on the application element goes through the
+        // Accessibility API instead, which WindowDeck already holds permission
+        // for, and is not subject to that refusal.
+        AX.setBool(AXUIElementCreateApplication(pid), kAXFrontmostAttribute, true)
+
+        // Kept as a belt-and-braces follow-up; harmless when the AX route worked.
+        app?.activate()
+    }
+
     func focus(_ window: WindowInfo) {
         onFocusRequested?(window.id)
         if AX.bool(window.element, kAXMinimizedAttribute) {
@@ -463,7 +559,7 @@ final class WindowEngine {
         }
         AX.perform(window.element, kAXRaiseAction)
         AX.setBool(window.element, kAXMainAttribute, true)
-        NSRunningApplication(processIdentifier: window.pid)?.activate()
+        bringForward(pid: window.pid)
         // Deferred, and light: raising changes which window is in front, not
         // what windows exist, so the Accessibility pass is skipped entirely.
         scheduleRefresh(full: false)
@@ -485,7 +581,7 @@ final class WindowEngine {
             }
             AX.perform(window.element, kAXRaiseAction)
             AX.setBool(window.element, kAXMainAttribute, true)
-            NSRunningApplication(processIdentifier: window.pid)?.activate()
+            bringForward(pid: window.pid)
         }
         scheduleRefresh()
     }

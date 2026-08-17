@@ -53,3 +53,21 @@ enum IconCache {
         cache.removeValue(forKey: pid)
     }
 }
+
+
+extension WindowInfo {
+    /// Only for the self-test. A real `WindowInfo` carries an `AXUIElement`,
+    /// which cannot be conjured; a null element is fine because the harness never
+    /// touches Accessibility.
+    static func testInstance(id: CGWindowID, bundleID: String, title: String) -> WindowInfo {
+        WindowInfo(
+            id: id,
+            pid: 0,
+            bundleID: bundleID,
+            appName: bundleID,
+            title: title,
+            isMinimized: false,
+            element: AXUIElementCreateApplication(0)
+        )
+    }
+}

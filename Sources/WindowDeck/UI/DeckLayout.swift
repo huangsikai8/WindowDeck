@@ -21,7 +21,14 @@ enum DeckLayout {
         let width: CGFloat
         let showsTitle: Bool
         let iconSize: CGFloat
-        var id: String { item.id }
+        /// Which pill this slot was drawn for, or nil outside pill view.
+        var sectionID: String?
+        /// The section takes part in the identity because pill view draws the
+        /// same window once per group it belongs to. Without it those copies
+        /// share one id, and SwiftUI cannot reconcile two views claiming to be
+        /// the same thing — which is what rendered the switcher rotated with two
+        /// highlights the last time it happened.
+        var id: String { sectionID.map { "\($0)/\(item.id)" } ?? item.id }
     }
 
     struct Result {
@@ -62,11 +69,15 @@ enum DeckLayout {
         }
     }
 
+    /// Width a capsule adds around its contents, per side.
+    static let pillInset: CGFloat = 5
+
     static func compute(
         items: [DeckItem],
         pinnedCount: Int,
         titlesEnabled: Bool,
-        maxWidth: CGFloat
+        maxWidth: CGFloat,
+        pillCount: Int = 0
     ) -> Result {
 
         let spacing = spacing(forCount: items.count)
@@ -77,7 +88,12 @@ enum DeckLayout {
         var ghostChrome: CGFloat = 0
         if items.contains(where: \.isGhost) { ghostChrome += DeckMetrics.dividerWidth + spacing }
         if items.contains(where: \.isUngrouped) { ghostChrome += DeckMetrics.dividerWidth + spacing }
-        let chrome = chromeWidth(pinnedCount: pinnedCount, spacing: spacing) + ghostChrome
+        // Each capsule costs its own padding on both sides plus the gap to its
+        // neighbour. Unaccounted, a bucketed All runs past the strip's edge —
+        // the same failure separators caused before they were charged for.
+        let pillChrome = CGFloat(pillCount) * (pillInset * 2 + spacing)
+        let chrome = chromeWidth(pinnedCount: pinnedCount, spacing: spacing)
+            + ghostChrome + pillChrome
 
         guard !items.isEmpty else {
             return Result(slots: [], spacing: spacing,

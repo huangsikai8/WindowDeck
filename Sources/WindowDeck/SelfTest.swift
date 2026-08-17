@@ -1,0 +1,497 @@
+import AppKit
+import SwiftUI
+
+/// Exercises the logic that has no other way of being checked.
+///
+/// There is no test target: the app is a single SwiftPM executable, and the
+/// pieces worth testing need `AppStore`, which is `@MainActor` and reads the
+/// state file. Running in-process against a throwaway state directory gets the
+/// coverage without either problem.
+///
+/// Run with `WINDOWDECK_SELFTEST=1`, which also sets a temporary state directory
+/// in `build.sh`. It must never run against the real state file.
+@MainActor
+enum SelfTest {
+
+    private static var failures: [String] = []
+    private static var passes = 0
+
+    static var isRequested: Bool {
+        ProcessInfo.processInfo.environment["WINDOWDECK_SELFTEST"] == "1"
+    }
+
+    private static func check(_ name: String, _ condition: Bool, _ detail: @autoclosure () -> String = "") {
+        if condition {
+            passes += 1
+        } else {
+            failures.append("FAIL  \(name)\(detail().isEmpty ? "" : "  — \(detail())")")
+        }
+    }
+
+    static func run() -> Never {
+        precondition(ProcessInfo.processInfo.environment["WINDOWDECK_STATE_DIR"] != nil,
+                     "self-test refuses to run against the real state file")
+
+        persistence()
+        ordering()
+        matching()
+        membership()
+        sections()
+        layout()
+        sectionsWithWindows()
+        reopening()
+        clustering()
+        edgeCases()
+        runningState()
+        pruning()
+        restoring()
+
+        print("\n=== self-test: \(passes) passed, \(failures.count) failed ===")
+        for line in failures { print(line) }
+        exit(failures.isEmpty ? 0 : 1)
+    }
+
+    // MARK: - Persistence
+
+    private static func persistence() {
+        // A file written before a field existed must still load.
+        let legacy = """
+        {"groups":[{"id":"A","name":"Old","colorIndex":1,"members":[{"bundleID":"x","title":"t"}]}]}
+        """
+        let decoded = try? JSONDecoder().decode(PersistedState.self, from: Data(legacy.utf8))
+        check("legacy file decodes", decoded != nil)
+        check("legacy group survives", decoded?.groups.first?.name == "Old")
+        check("legacy member survives", decoded?.groups.first?.members.count == 1)
+        check("absent field takes its default", decoded?.showRunningApps == true)
+
+        // A field whose *type* changed must degrade to its default, not fail the
+        // file — this is the shape that once wiped every group.
+        let wrongType = """
+        {"groups":[{"id":"A","name":"Keep","colorIndex":1,"members":[]}],"showTitles":"yes","swipeSensitivity":[1,2]}
+        """
+        let salvaged = try? JSONDecoder().decode(PersistedState.self, from: Data(wrongType.utf8))
+        check("changed field type does not fail the file", salvaged != nil)
+        check("groups survive a bad sibling field", salvaged?.groups.first?.name == "Keep")
+        check("bad field falls back to default", salvaged?.showTitles == true)
+
+        // Round trip.
+        var state = PersistedState()
+        state.groups = [PersistedGroup(id: "G", name: "Round", colorIndex: 2,
+                                       customColorHex: "FF8800",
+                                       members: [MemberRef(bundleID: "b", title: "t", windowID: 42)])]
+        state.pillView = true
+        let data = try? JSONEncoder().encode(state)
+        let back = data.flatMap { try? JSONDecoder().decode(PersistedState.self, from: $0) }
+        check("round trip keeps custom colour", back?.groups.first?.customColorHex == "FF8800")
+        check("round trip keeps window id", back?.groups.first?.members.first?.windowID == 42)
+        check("round trip keeps pill view", back?.pillView == true)
+
+        check("hex parses", Color(hex: "FF8800") != nil)
+        check("bad hex is rejected", Color(hex: "nope") == nil)
+    }
+
+    // MARK: - Ordering
+
+    private static func ordering() {
+        let store = AppStore()
+        let group = store.groups.first { !$0.isAll }
+        guard let group else { return check("a group exists to order", false) }
+
+        store.setOrder(["w1", "w2", "w3", "w4"], in: group.id)
+
+        // The bug that made the last position unreachable.
+        store.moveItem("w1", before: "w4", in: group.id)
+        check("drag to the far right lands last",
+              store.order(in: group.id) == ["w2", "w3", "w4", "w1"],
+              "\(store.order(in: group.id))")
+
+        store.moveItem("w1", before: "w2", in: group.id)
+        check("drag leftward lands before the target",
+              store.order(in: group.id) == ["w1", "w2", "w3", "w4"],
+              "\(store.order(in: group.id))")
+
+        store.moveItem("w3", before: "w2", in: group.id)
+        check("short leftward move",
+              store.order(in: group.id) == ["w1", "w3", "w2", "w4"],
+              "\(store.order(in: group.id))")
+    }
+
+    // MARK: - Restore matching
+
+    private static func matching() {
+        let exact = MemberRef(bundleID: "com.x", title: "Report.docx", windowID: 7)
+        let window = WindowInfo.testInstance(id: 99, bundleID: "com.x", title: "Report.docx")
+        check("exact title matches", exact.matches(window))
+
+        let renamed = WindowInfo.testInstance(id: 99, bundleID: "com.x", title: "Merging: Report.docx")
+        check("exact match rejects a changed title", !exact.matches(renamed))
+        check("loose match survives a prefix", exact.looselyMatches(renamed))
+
+        let otherApp = WindowInfo.testInstance(id: 99, bundleID: "com.y", title: "Report.docx")
+        check("loose match never crosses apps", !exact.looselyMatches(otherApp))
+
+        let short = MemberRef(bundleID: "com.x", title: "Inbox", windowID: 1)
+        let alsoShort = WindowInfo.testInstance(id: 2, bundleID: "com.x", title: "Inbox — Work")
+        check("loose match ignores short titles", !short.looselyMatches(alsoShort))
+    }
+
+    // MARK: - Membership
+
+    private static func membership() {
+        let store = AppStore()
+        guard store.groups.count >= 3 else { return check("two groups exist", false) }
+        let a = store.groups[1].id, b = store.groups[2].id
+
+        store.add(5, to: a)
+        check("added to a group", store.isMember(5, of: a))
+
+        store.moveItem("w5", from: a, to: b)
+        check("move joins the target", store.isMember(5, of: b))
+        check("move leaves the source", !store.isMember(5, of: a))
+
+        // Dropping into the unfiled capsule: no target, so only a removal.
+        store.moveItem("w5", from: b, to: nil)
+        check("drop on unfiled removes the source membership", !store.isMember(5, of: b))
+
+        store.pinApp(bundleID: "com.apple.finder", in: a)
+        check("pinned to a group", store.pinnedApps(in: a).contains { $0.bundleID == "com.apple.finder" })
+        store.moveItem("pcom.apple.finder", from: a, to: b)
+        check("pin moves to the target", store.pinnedApps(in: b).contains { $0.bundleID == "com.apple.finder" })
+        check("pin leaves the source", !store.pinnedApps(in: a).contains { $0.bundleID == "com.apple.finder" })
+    }
+
+    // MARK: - Sections
+
+    private static func sections() {
+        let store = AppStore()
+        store.pillView = false
+        check("flat view is a single section", store.sections.count == 1)
+        check("flat section carries no capsule", store.sections.first?.color == nil)
+
+        store.pillView = true
+        store.selectGroup(store.groups[0].id)   // All
+        // With no windows, every group is empty and must be omitted.
+        check("empty groups are omitted", store.sections.allSatisfy { !$0.isPill })
+    }
+
+    // MARK: - Sections with real windows
+
+    private static func sectionsWithWindows() {
+        let store = AppStore()
+        guard store.groups.count >= 3 else { return check("two groups exist", false) }
+        let a = store.groups[1].id, b = store.groups[2].id
+
+        // A real bundle id: `pinApp` resolves the application on disk and does
+        // nothing for one that does not exist, which would make the pin check
+        // below pass vacuously.
+        let shared = WindowInfo.testInstance(id: 10, bundleID: "com.apple.finder", title: "Shared")
+        let onlyA = WindowInfo.testInstance(id: 11, bundleID: "com.y", title: "OnlyA")
+        let loose = WindowInfo.testInstance(id: 12, bundleID: "com.z", title: "Loose")
+        store.windows = [shared, onlyA, loose]
+        store.add(10, to: a); store.add(10, to: b); store.add(11, to: a)
+
+        store.pillView = true
+        store.selectGroup(store.groups[0].id)
+        let sections = store.sections
+
+        let pills = sections.filter(\.isPill)
+        check("one capsule per non-empty group, plus unfiled", pills.count == 3, "\(pills.count)")
+
+        let inA = sections.first { $0.groupID == a }?.items.compactMap { $0.windows.first?.id } ?? []
+        let inB = sections.first { $0.groupID == b }?.items.compactMap { $0.windows.first?.id } ?? []
+        check("window in two groups appears in both", inA.contains(10) && inB.contains(10))
+        check("window in one group appears once", inA.contains(11) && !inB.contains(11))
+
+        let unfiled = sections.first { $0.id == "ungrouped" }
+        check("unfiled capsule exists", unfiled != nil)
+        check("unfiled holds only the loose window",
+              unfiled?.items.compactMap { $0.windows.first?.id } == [12])
+        check("unfiled comes last", sections.last?.id == "ungrouped")
+        check("unfiled is preceded by a divider", unfiled?.dividerBefore == true)
+
+        // A launcher must stand aside while its app has a window on show —
+        // otherwise the same icon appears twice, which is the duplicate the
+        // whole pin-hiding rule exists to prevent.
+        store.pinApp(bundleID: "com.apple.finder", in: nil)
+        check("the pin was actually created",
+              store.pinnedApps(in: DeckGroup.allGroupID).contains { $0.bundleID == "com.apple.finder" })
+        let leading = store.sections.first { $0.id == "leading" }
+        let leadingPins = leading?.items.compactMap { item -> String? in
+            if case .pinned(let app) = item { return app.bundleID }
+            return nil
+        } ?? []
+        check("a pin hides while its app has a window",
+              !leadingPins.contains("com.apple.finder"), "\(leadingPins)")
+
+        // The same rule has to hold inside a group capsule, not just the leading
+        // launchers: a group pinned to an app whose window is in that very
+        // capsule would otherwise draw the icon twice.
+        store.pinApp(bundleID: "com.apple.finder", in: a)
+        let pillA = store.sections.first { $0.groupID == a }
+        let pinsInA = pillA?.items.compactMap { item -> String? in
+            if case .pinned(let app) = item { return app.bundleID }
+            return nil
+        } ?? []
+        check("a group pin hides while its app has a window here",
+              !pinsInA.contains("com.apple.finder"), "\(pinsInA)")
+
+        // Duplicated windows must not share a slot identity.
+        let ids = sections.flatMap { section in
+            section.items.map { "\(section.id)/\($0.id)" }
+        }
+        check("slot identities are unique across capsules", Set(ids).count == ids.count)
+    }
+
+    // MARK: - Clusters
+
+    private static func clustering() {
+        let store = AppStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        let a = WindowInfo.testInstance(id: 60, bundleID: "com.f", title: "A")
+        let b = WindowInfo.testInstance(id: 61, bundleID: "com.f", title: "B")
+        store.windows = [a, b]
+        store.noteWindowRefs([a, b])
+        store.add(60, to: group); store.add(61, to: group)
+
+        // Pill view: All is active while the drag happens inside a group capsule.
+        store.pillView = true
+        store.selectGroup(store.groups[0].id)
+        check("All is the active group", store.activeGroup.isAll)
+
+        store.combine(60, into: 61, in: group)
+
+        let owner = store.groups.first { $0.id == group }
+        check("the cluster is built in the capsule's group",
+              owner?.clusters.count == 1, "\(owner?.clusters.count ?? -1)")
+        check("All did not receive the cluster",
+              store.groups.first { $0.isAll }?.clusters.isEmpty == true)
+        check("the cluster holds both windows",
+              owner?.clusters.first?.memberIDs.sorted() == [60, 61])
+
+        // It must actually appear in that capsule.
+        let section = store.sections.first { $0.groupID == group }
+        check("the capsule draws the cluster",
+              section?.items.contains { $0.isCluster } == true)
+
+        // The "Group with" list must lead with what you are most likely to want.
+        let c = WindowInfo.testInstance(id: 62, bundleID: "com.other", title: "Elsewhere")
+        let d = WindowInfo.testInstance(id: 63, bundleID: "com.f", title: "C")
+        let e = WindowInfo.testInstance(id: 64, bundleID: "com.f", title: "D")
+        store.windows = [a, b, c, d, e]
+        store.noteWindowRefs([a, b, c, d, e])
+        store.add(62, to: group); store.add(63, to: group); store.add(64, to: group)
+
+        // Everything is listed, including where you are standing — the menu is in
+        // strip order, and a gap makes that order harder to read. What you cannot
+        // do is group a window with itself, so those entries are marked.
+        let fromInside = store.groupWithTargets(for: 60, in: group)
+        check("a window's own cluster is shown", fromInside.contains { $0.isCluster })
+        check("but it is not selectable",
+              fromInside.first { $0.isCluster }?.isSelf == true)
+
+        let targets = store.groupWithTargets(for: 63, in: group)
+        check("the window itself is listed", targets.contains { $0.windowID == 63 })
+        check("the window itself is not selectable",
+              targets.first { $0.windowID == 63 }?.isSelf == true)
+        check("every other entry is selectable",
+              targets.filter { $0.windowID != 63 && !$0.isCluster }.allSatisfy { !$0.isSelf })
+        check("the cluster is offered", targets.contains { $0.isCluster })
+        check("windows already in a cluster are not offered separately",
+              !targets.contains { !$0.isCluster && $0.windowID == 61 })
+
+        // And dissolving finds it without being told which group owns it.
+        if let clusterID = owner?.clusters.first?.id {
+            store.dissolveCluster(clusterID)
+            check("dissolve finds the owning group",
+                  store.groups.first { $0.id == group }?.clusters.isEmpty == true)
+        }
+    }
+
+    // MARK: - Close and reopen
+
+    private static func reopening() {
+        let store = AppStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        let original = WindowInfo.testInstance(id: 20, bundleID: "com.app", title: "Doc")
+        store.windows = [original]
+        store.noteWindowRefs([original])
+        store.add(20, to: group)
+        store.setOrder(["w20", "w99"], in: group)
+
+        // Closed, then reopened under a new id — what the red button does.
+        let reopened = WindowInfo.testInstance(id: 21, bundleID: "com.app", title: "Doc")
+        store.windows = [reopened]
+        store.noteWindowRefs([reopened])
+        let claimed = store.rebindReopenedWindows([21])
+
+        check("a reopened window is claimed", claimed.contains(21))
+        check("it inherits the membership", store.isMember(21, of: group))
+        check("the dead id is released", !store.isMember(20, of: group))
+        check("it inherits the arrangement slot",
+              store.order(in: group).first == "w21", "\(store.order(in: group))")
+
+        // A window of an unrelated app must not steal the slot.
+        let other = AppStore()
+        let held = WindowInfo.testInstance(id: 30, bundleID: "com.one", title: "A")
+        other.windows = [held]; other.noteWindowRefs([held])
+        other.add(30, to: other.groups[1].id)
+        other.windows = []
+        let stranger = WindowInfo.testInstance(id: 31, bundleID: "com.two", title: "B")
+        other.windows = [stranger]; other.noteWindowRefs([stranger])
+        check("a different app does not claim the slot",
+              !other.rebindReopenedWindows([31]).contains(31))
+    }
+
+    // MARK: - Edges
+
+    private static func edgeCases() {
+        let store = AppStore()
+        guard let group = store.groups.first(where: { !$0.isAll })?.id else { return }
+
+        // Dragging something that has no place in the order yet.
+        store.setOrder([], in: group)
+        store.moveItem("w1", before: "w2", in: group)
+        check("dragging with no arrangement does not crash", true)
+
+        // A key that appears twice must not survive a move.
+        store.setOrder(["w1", "w2", "w1"], in: group)
+        store.moveItem("w1", before: "w2", in: group)
+        check("a duplicated key is collapsed by a move",
+              store.order(in: group).filter { $0 == "w1" }.count == 1,
+              "\(store.order(in: group))")
+
+        // Moving onto itself is a no-op, not a corruption.
+        store.setOrder(["w1", "w2"], in: group)
+        store.moveItem("w1", before: "w1", in: group)
+        check("moving onto itself changes nothing", store.order(in: group) == ["w1", "w2"])
+
+        // An empty layout must still produce a usable width.
+        let empty = DeckLayout.compute(items: [], pinnedCount: 0, titlesEnabled: true, maxWidth: 1240)
+        check("empty layout has no slots", empty.slots.isEmpty)
+        check("empty layout still has a width", empty.totalWidth > 0)
+
+        // A single window on a tiny display must not produce a negative width.
+        let tiny = DeckLayout.compute(items: [.window(WindowInfo.testInstance(id: 1, bundleID: "a", title: "t"))],
+                                      pinnedCount: 0, titlesEnabled: true, maxWidth: 200)
+        check("tiny display yields positive widths", tiny.slots.allSatisfy { $0.width > 0 })
+    }
+
+    // MARK: - Running-app state
+
+    private static func runningState() {
+        let store = AppStore()
+        check("running apps start empty", store.runningApps.all.isEmpty)
+
+        store.sampleRunningApps(windowOwnerPIDs: [], force: true)
+        check("sampling finds running applications", !store.runningApps.all.isEmpty)
+        check("sampling finds Dock-worthy applications", !store.runningApps.dockApps.isEmpty)
+        check("this very process is running", store.runningApps.all.contains(Bundle.main.bundleIdentifier ?? "?")
+              || store.runningApps.all.contains("com.apple.finder"))
+
+        // Windows are attributed to their owning application.
+        let finder = NSWorkspace.shared.runningApplications
+            .first { $0.bundleIdentifier == "com.apple.finder" }
+        if let finder {
+            store.sampleRunningApps(windowOwnerPIDs: [finder.processIdentifier], force: true)
+            check("an app owning a window is marked as having one",
+                  store.runningApps.withWindows.contains("com.apple.finder"))
+        }
+    }
+
+    // MARK: - Pruning
+
+    private static func pruning() {
+        let store = AppStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        // One member of an app that is genuinely running, one of an app that is
+        // not. Only the second may be dropped.
+        let realBundle = "com.apple.finder"
+        let live = WindowInfo.testInstance(id: 40, bundleID: realBundle, title: "Live")
+        let ghostReal = WindowInfo.testInstance(id: 41, bundleID: realBundle, title: "Closed")
+        let ghostGone = WindowInfo.testInstance(id: 42, bundleID: "com.nonexistent.app", title: "Gone")
+        store.windows = [live, ghostReal, ghostGone]
+        store.noteWindowRefs([live, ghostReal, ghostGone])
+        store.add(40, to: group); store.add(41, to: group); store.add(42, to: group)
+
+        // Only the first is still open.
+        store.windows = [live]
+        store.sampleRunningApps(windowOwnerPIDs: [], force: true)
+        store.forcePruneForTesting()
+
+        check("a live member is never pruned", store.isMember(40, of: group))
+        check("a closed window of a running app is kept", store.isMember(41, of: group))
+        check("a closed window of a quit app is dropped", !store.isMember(42, of: group))
+
+        // Duplicated restore references collapse; distinct ones do not.
+        let index = store.groups.firstIndex { $0.id == group }!
+        store.groups[index].savedMembers = [
+            MemberRef(bundleID: "com.a", title: "Same", windowID: 1),
+            MemberRef(bundleID: "com.a", title: "Same", windowID: 2),
+            MemberRef(bundleID: "com.a", title: "Same", windowID: 3),
+            MemberRef(bundleID: "com.a", title: "Different", windowID: 4)
+        ]
+        store.forcePruneForTesting()
+        let saved = store.groups[index].savedMembers
+        check("identical references collapse to one",
+              saved.filter { $0.title == "Same" }.count == 1, "\(saved.count)")
+        check("a different document is kept",
+              saved.contains { $0.title == "Different" })
+    }
+
+    // MARK: - Restoring
+
+    private static func restoring() {
+        let store = AppStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let index = store.groups.firstIndex { !$0.isAll }!
+        let group = store.groups[index].id
+
+        store.groups[index].savedMembers = [
+            MemberRef(bundleID: "com.x", title: "Exact", windowID: 500),
+            MemberRef(bundleID: "com.y", title: "Report.docx", windowID: nil),
+            MemberRef(bundleID: "com.z", title: "Never comes back", windowID: nil)
+        ]
+
+        // Same id, different title — the id must win.
+        let byID = WindowInfo.testInstance(id: 500, bundleID: "com.x", title: "Title has changed")
+        // Different id, title decorated — loose matching must catch it.
+        let byLoose = WindowInfo.testInstance(id: 501, bundleID: "com.y", title: "Merging: Report.docx")
+        let windows = [byID, byLoose]
+        store.windows = windows
+        store.noteWindowRefs(windows)
+
+        let claimed = store.restorePass(against: windows)
+        check("window id beats a changed title", store.isMember(500, of: group))
+        check("loose title match recovers a decorated title", store.isMember(501, of: group))
+        check("restore reports what it claimed", claimed.contains(500) && claimed.contains(501))
+        check("an absent window stays queued",
+              store.groups[index].savedMembers.contains { $0.title == "Never comes back" })
+        check("a matched reference is consumed",
+              !store.groups[index].savedMembers.contains { $0.title == "Exact" })
+    }
+
+    // MARK: - Layout
+
+    private static func layout() {
+        let windows = (1...40).map { WindowInfo.testInstance(id: CGWindowID($0), bundleID: "com.x", title: "W\($0)") }
+        let items = windows.map { DeckItem.window($0) }
+        let result = DeckLayout.compute(items: items, pinnedCount: 0,
+                                        titlesEnabled: true, maxWidth: 1240)
+        check("layout never exceeds the display", result.totalWidth <= 1240,
+              "\(result.totalWidth)")
+        let content = result.slots.reduce(0) { $0 + $1.width }
+            + CGFloat(max(result.slots.count - 1, 0)) * result.spacing
+        check("content fits inside the panel", content <= 1240, "\(content)")
+        check("every window gets a slot", result.slots.count == items.count)
+
+        let pilled = DeckLayout.compute(items: items, pinnedCount: 0,
+                                        titlesEnabled: true, maxWidth: 1240, pillCount: 5)
+        check("capsules are charged to the budget", pilled.totalWidth <= 1240)
+    }
+}

@@ -216,6 +216,66 @@ clamped *down*.
 clusters skipped the ghost logic, so the off-group signal never appeared for most groups. It happened
 twice — once for the ghost, once for the ungrouped split.
 
+**"Off screen" is not the same question as "on another Space".** A window leaves the on-screen list when
+it is minimised, when its application is hidden with ⌘H, *and* when it lives on another Space. The
+current-Space filter exempted minimised windows but not hidden ones, so hiding an app made every one of
+its windows vanish from the strip as though it had quit. Measured on a machine with a single Space:
+twelve apps hidden that way — Excel, Word, Outlook, Terminal, Spotify, Firefox and more — accounted for
+almost every window the strip was not showing, and it presented convincingly as a Spaces problem. Both
+`isMinimized` and `NSRunningApplication.isHidden` must be exempted.
+
+**A window's AX subrole can change when it is minimised.** Activity Monitor's main window reports
+`AXStandardWindow` normally and `AXDialog` once minimised, so a strict standard-window filter dropped
+it from every group the moment it was minimised — indistinguishable from closing it, and it took
+Microsoft Excel with it. `describe()` therefore remembers every window id it has seen reporting
+standard, and also accepts a *minimised* dialog that carries a title: real dialogs are modal and
+cannot be minimised, which is what stops that readmitting sheets and popovers.
+
+**`activate()` is a request macOS refuses.** Cooperative activation only grants it to an app that is
+already frontmost, and WindowDeck never is — the strip is a `.nonactivatingPanel` on purpose. Measured
+in the settings window: `NSApp.isActive` stayed false after every call, so the window was ordered front
+*within* the app and sat behind whatever was actually in front, which looked like the click doing
+nothing.
+
+**`ignoringOtherApps` does not rescue it.** The compiler says so outright — *"deprecated in macOS 14.0
+and will have no effect"* — so the calls that carry it are doing nothing more than a plain `activate()`.
+What actually works is different for each case, and it is worth being precise because the flag looks
+like the fix and is not:
+
+* the settings window comes forward because of `orderFrontRegardless()`, plus switching the activation
+  policy to `.regular` while it is open (and back to `.accessory` once no window remains);
+* a hidden application comes forward because of `unhide()`, which is a separate verb from activating
+  and the only thing that clears that state.
+
+**A reopened window is a different window.** Closing with the red button and reopening produces a new
+`CGWindowID`, and both membership and the manual arrangement are keyed by id — so without
+`rebindReopenedWindows` the returning window belongs to nothing and sorts wherever the default order
+puts it. It claims its predecessor's slot, matched by application and only against a member whose
+window is genuinely gone.
+
+**Order restore needs the same matcher as membership.** Ordering was left on exact-title matching when
+membership moved to window ids, so four VS Code windows arranged side by side came back split: the ones
+whose titles still matched took their slots and the rest fell to the end.
+
+**Dead members accumulate unless pruned.** A member's id lingers after its window closes — deliberately,
+since that is what holds the slot while the app runs and lets a reopened window reclaim it. Nothing
+removed them, so six generations of one WhatsApp window ended up persisted in a single group.
+`pruneDeadMembers` drops a dead id once its app is gone, or when it duplicates another dead id for the
+same app. The queue of unmatched `savedMembers` needed deduping too, keyed on **app and title rather
+than the reference itself** — `MemberRef` is Hashable including its window id, so one reference per
+relaunch compares as many distinct things and survives a naive dedupe.
+
+**A discarded result is not a cancelled one.** Hovering along the strip fired a ScreenCaptureKit
+capture per tile passed over. Each result was thrown away once the pointer moved on, but every capture
+still ran to completion — twenty tiles meant twenty captures to display one image, which is what made
+hovering feel heavy. The capture is now a cancellable `Task` that waits 90ms for the pointer to settle,
+so a sweep issues none at all.
+
+**Animating the panel's frame re-lays out every tile, every frame.** Group changes animate the strip's
+resize, and swiping quickly stacked those animations on top of each other. `AppStore.animateThisChange`
+is false whenever a change interrupts the previous one; both the SwiftUI slide and the panel resize are
+gated on it so they cannot disagree.
+
 **TextEdit and Finder can open tabs rather than windows.** Tabs have no window ID and cannot appear in
 the strip. Not a bug.
 
@@ -319,6 +379,26 @@ trackpad's "swipe between pages" setting produces one; three- and four-finger ho
 normally bound to Mission Control, where macOS acts on them without ever synthesising one. The
 underlying touches are reported on gesture events regardless, so averaging their travel works under
 any trackpad configuration.
+
+**Pill view buckets All by group.** Off by default. Each group's windows and launchers are drawn inside
+a capsule tinted with its colour; a window in several groups appears in each of them; unfiled windows
+get a neutral capsule last, behind a divider; empty groups are omitted. Two things it forced:
+
+* **Identity has to include the section.** The same window drawn in three pills is three views, and
+  they cannot share an id — the same fault that once rendered the switcher rotated with two highlights.
+  `DeckLayout.Slot.id` is `"\(sectionID)/\(item.id)"`.
+* **Sizing runs on the flattened list.** Every tile in the row is measured in one pass and each
+  capsule's padding is charged to the width budget, exactly as separators are. A capsule with its own
+  budget pushes the row past the strip's edge.
+
+Dragging between capsules *moves* a window: it joins the target group and leaves the source. Within a
+capsule it reorders. Live reordering is suppressed across capsules, since the row's order there comes
+from the grouping and would snap back.
+
+**A build that never finishes is usually the type-checker.** One deeply nested SwiftUI expression in
+the pill renderer type-checked for minutes without completing, which is indistinguishable from a hung
+build. Splitting it into small functions with explicit return types took it to seven seconds. Suspect
+this before suspecting the toolchain.
 
 **Groups cycle in strip order, not MRU.** ⌘↑/⌘↓ move through the arrangements with the same
 hold-and-tap shape as the window switcher — tap to step one, hold to open the list and keep tapping,

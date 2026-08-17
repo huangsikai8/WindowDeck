@@ -11,7 +11,6 @@ struct ClusterTile: View {
     let width: CGFloat
     let iconSize: CGFloat
     let isDragging: Bool
-    let isCombineTarget: Bool
     let onActivate: () -> Void
     let onSeparate: () -> Void
     let onRename: () -> Void
@@ -43,7 +42,6 @@ struct ClusterTile: View {
         }
         .buttonStyle(.plain)
         .opacity(isDragging ? 0.35 : 1)
-        .scaleEffect(isCombineTarget ? 1.12 : 1)
         .onHover { hovering in
             isHovering = hovering
             onHover(hovering, frame)

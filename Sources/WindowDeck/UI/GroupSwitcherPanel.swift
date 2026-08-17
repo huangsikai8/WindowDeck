@@ -128,7 +128,7 @@ private struct GroupSwitcherContent: View {
                 .frame(width: 12)
 
             Circle()
-                .fill(group.isAll ? Color.clear : group.color.color)
+                .fill(group.isAll ? Color.clear : group.displayColor)
                 .frame(width: 8, height: 8)
 
             Text(group.name)

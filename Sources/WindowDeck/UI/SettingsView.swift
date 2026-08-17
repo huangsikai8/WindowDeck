@@ -19,7 +19,7 @@ struct SettingsView: View {
                 .tabItem { Label("Permissions", systemImage: "lock.shield") }
         }
         .padding(14)
-        .frame(width: 760, height: 480)
+        .frame(minWidth: 760, minHeight: 560)
     }
 }
 
@@ -67,7 +67,7 @@ struct GroupsSettingsView: View {
                 ForEach(store.groups) { group in
                     HStack(spacing: 7) {
                         Circle()
-                            .fill(group.color.color)
+                            .fill(group.displayColor)
                             .frame(width: 9, height: 9)
                             .opacity(group.isAll ? 0.35 : 1)
                         Text(group.name)
@@ -120,6 +120,16 @@ struct GroupsSettingsView: View {
     }
 
     private func groupDetail(_ group: DeckGroup) -> some View {
+        // Scrolls, because the colour row, the window list and the pinned editor
+        // together outgrow a short window and the bottom was simply cut off.
+        // The lists inside carry fixed heights so they never fight the scroll
+        // view for size — a self-sizing List inside a ScrollView collapses.
+        ScrollView {
+            groupDetailContent(group)
+        }
+    }
+
+    private func groupDetailContent(_ group: DeckGroup) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Name")
@@ -142,13 +152,36 @@ struct GroupsSettingsView: View {
                             .frame(width: 17, height: 17)
                             .overlay(
                                 Circle().strokeBorder(
-                                    .primary.opacity(group.color == swatch ? 0.85 : 0),
+                                    // Only marked as chosen when no custom colour
+                                    // is overriding it, or two swatches would
+                                    // appear selected at once.
+                                    .primary.opacity(
+                                        group.customColorHex == nil && group.color == swatch
+                                        ? 0.85 : 0),
                                     lineWidth: 2
                                 )
                             )
                     }
                     .buttonStyle(.plain)
                     .help(swatch.name)
+                }
+
+                Divider().frame(height: 18)
+
+                // The eight are the quick choices; anything else is still
+                // possible. Binding writes through on every drag of the picker,
+                // so the strip updates live.
+                ColorPicker("", selection: Binding(
+                    get: { group.displayColor },
+                    set: { store.setCustomColor($0, for: group.id) }
+                ), supportsOpacity: false)
+                .labelsHidden()
+                .help("Custom colour")
+
+                if group.customColorHex != nil {
+                    Button("Reset") { store.setCustomColor(nil, for: group.id) }
+                        .buttonStyle(.link)
+                        .help("Go back to the palette colour")
                 }
             }
 
@@ -191,13 +224,17 @@ struct GroupsSettingsView: View {
                     Text("No open windows").foregroundStyle(.secondary)
                 }
             }
+            // Two lists stacked in one column split the height evenly, which left
+            // the window list a few rows tall. Giving this one a floor and the
+            // pinned editor a fixed size means the windows get whatever is left.
+            .frame(height: 260)
 
             Text("Pinned apps").font(.headline)
             Text("Launchers shown while this group is active. Each group keeps its own.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             PinnedAppsEditor(store: store, groupID: group.id)
-                .frame(height: 120)
+                .frame(height: 116)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("\(memberCount(group)) of \(store.windows.count) open windows")
@@ -443,6 +480,35 @@ struct BehaviorSettingsView: View {
                 .foregroundStyle(.secondary)
             }
 
+            Section {
+                Toggle("Keep running apps after their last window closes",
+                       isOn: $store.showRunningApps)
+                Text("""
+                Closing a window with the red button doesn't quit the app, and the Dock keeps its \
+                icon and dot. This does the same: the app stays in the strip as a launcher until \
+                you actually quit it. Only apps the Dock itself would show are included, so \
+                menu-bar utilities and background helpers stay out.
+
+                In All this covers every running app. Inside a group it covers only apps that had \
+                a window in that group.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Group windows by arrangement in All", isOn: $store.pillView)
+                Text("""
+                All draws each group's windows inside a capsule tinted with that group's colour, \
+                rather than one flat row. A window in several groups appears in each of them, and \
+                unfiled windows sit in a plain capsule at the end.
+
+                Dragging a window from one capsule to another moves it between those groups.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
             Section("Trackpad") {
                 Toggle("Swipe over the strip to switch groups", isOn: $store.swipeOverStrip)
                 Text("""
@@ -623,10 +689,10 @@ struct GroupBadge: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(
-                Capsule().fill(group.color.color.opacity(0.22))
+                Capsule().fill(group.displayColor.opacity(0.22))
             )
             .overlay(
-                Capsule().strokeBorder(group.color.color.opacity(0.55), lineWidth: 1)
+                Capsule().strokeBorder(group.displayColor.opacity(0.55), lineWidth: 1)
             )
     }
 }

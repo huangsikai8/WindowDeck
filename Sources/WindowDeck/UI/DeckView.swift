@@ -12,7 +12,14 @@ struct DeckView: View {
     let onRenameCluster: (WindowCluster) -> Void
 
     @State private var dragging: String?
-    @State private var combineTarget: String?
+    /// Which pill the current drag started in, so a drop elsewhere can move the
+    /// window between groups rather than merely reorder it.
+    @State private var draggingFromGroup: UUID?
+    /// Sections, not groups, decide whether a drop is a reorder or a move: two
+    /// different sections can both have no group — the unfiled capsule and All's
+    /// leading launchers — and comparing group ids alone would call that a
+    /// reorder.
+    @State private var draggingFromSection: String?
 
     var body: some View {
         // Computed once and threaded through: the spacing it chooses has to be
@@ -61,7 +68,7 @@ struct DeckView: View {
                 // Pinned launchers are part of the row now, not a section of
                 // their own — which is what stops them holding a fixed width
                 // while the windows compress around them.
-                entries(layout)
+                pills(layout)
                     // Identity is the group, so switching replaces the row and
                     // gives the transition something to animate between.
                     .id(store.activeGroupID)
@@ -70,7 +77,8 @@ struct DeckView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, DeckMetrics.padding)
-        .animation(store.animateGroupChanges ? .easeOut(duration: 0.22) : nil,
+        .animation(store.animateGroupChanges && store.animateThisChange
+                   ? .easeOut(duration: 0.22) : nil,
                    value: store.activeGroupID)
     }
 
@@ -84,40 +92,22 @@ struct DeckView: View {
         )
     }
 
-    private func entries(_ layout: DeckLayout.Result) -> some View {
-        // No scrolling: the layout pass already sized everything to fit.
+    /// Pill view: the same slots, drawn inside one capsule per group.
+    ///
+    /// Sizing is done on the flattened list so every tile in the row is measured
+    /// together — a capsule must not get its own width budget, or the row stops
+    /// fitting. The slots are then handed back out to their sections in order.
+    ///
+    /// Deliberately split into small functions with explicit return types. Written
+    /// as one nested expression it type-checked for minutes without finishing,
+    /// which reads exactly like a hung build.
+    private func pills(_ layout: DeckLayout.Result) -> some View {
         HStack(spacing: layout.spacing) {
-            ForEach(layout.slots) { slot in
-                // Separates the off-group window from the group's real members.
-                if slot.item.isGhost {
+            ForEach(drawnSections(layout), id: \.section.id) { entry in
+                if entry.section.dividerBefore {
                     Divider().frame(height: 22)
                 }
-                // Only before the *first* ungrouped tile. The ghost case above
-                // gets away without this check because there is at most one
-                // ghost; there can be many ungrouped windows, and a divider
-                // before each would fence off every single one.
-                if slot.id == firstUngroupedSlotID(layout) {
-                    Divider().frame(height: 22)
-                }
-                slotView(slot)
-                    .onDrag {
-                        dragging = slot.item.orderKey
-                        // The payload is unused — reordering is driven by the
-                        // in-process `dragging` state — but a provider is
-                        // required for the drag to start at all.
-                        return NSItemProvider(object: slot.item.orderKey as NSString)
-                    }
-                    .onDrop(
-                        of: [UTType.text],
-                        delegate: EntryDropDelegate(
-                            target: slot.item.orderKey,
-                            targetWindowID: slot.item.primaryWindowID,
-                            dragging: $dragging,
-                            combineTarget: $combineTarget,
-                            move: { store.moveItem($0, before: $1) },
-                            combine: { store.combine($0, into: $1) }
-                        )
-                    )
+                pill(entry.section, slots: entry.slots, spacing: layout.spacing)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -133,12 +123,132 @@ struct DeckView: View {
         }
     }
 
+    private struct SectionSlots: Identifiable {
+        let section: DeckSection
+        let slots: [DeckLayout.Slot]
+        var id: String { section.id }
+    }
+
+    /// Hands the flat slot list back out to the sections that produced it.
+    private func drawnSections(_ layout: DeckLayout.Result) -> [SectionSlots] {
+        var remaining = layout.slots[...]
+        var result: [SectionSlots] = []
+        for section in store.sections {
+            var take = Array(remaining.prefix(section.items.count))
+            remaining = remaining.dropFirst(section.items.count)
+            // Stamp the section onto each slot: the same window is drawn once per
+            // group it belongs to, and those copies must not share an identity.
+            for index in take.indices { take[index].sectionID = section.id }
+            result.append(SectionSlots(section: section, slots: take))
+        }
+        return result
+    }
+
+    private func pill(_ section: DeckSection,
+                      slots: [DeckLayout.Slot],
+                      spacing: CGFloat) -> some View {
+        let firstUngrouped = slots.first { $0.item.isUngrouped }?.id
+        return HStack(spacing: spacing) {
+            ForEach(slots) { slot in
+                // Flat view is a single section, so its internal separators live
+                // here: the off-group ghost, and the start of the unfiled run.
+                if slot.item.isGhost {
+                    Divider().frame(height: 22)
+                }
+                // Only before the *first* unfiled tile — there is at most one
+                // ghost, but many unfiled windows, and a divider before each
+                // would fence off every single one.
+                if slot.id == firstUngrouped {
+                    Divider().frame(height: 22)
+                }
+                draggableSlot(slot, section: section)
+            }
+        }
+        .padding(.horizontal, section.isPill ? DeckLayout.pillInset : 0)
+        .frame(height: DeckMetrics.tileHeight + 6)
+        .background(pillBackground(section))
+    }
+
+    @ViewBuilder
+    private func pillBackground(_ section: DeckSection) -> some View {
+        if let color = section.color {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(color.opacity(0.16))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(color.opacity(0.38), lineWidth: 1)
+                )
+        } else {
+            Color.clear
+        }
+    }
+
+    /// One drag implementation for both views. `groupID` is the pill the slot is
+    /// drawn in, so a drop can tell a reorder from a move between groups.
+    @ViewBuilder
+    private func draggableSlot(_ slot: DeckLayout.Slot, section: DeckSection) -> some View {
+        slotView(slot, sectionGroupID: section.groupID)
+            .onDrag {
+                dragging = slot.item.orderKey
+                draggingFromSection = section.id
+                draggingFromGroup = section.groupID
+                armDragSafety()
+                // The payload is unused — reordering is driven by the in-process
+                // `dragging` state — but a provider is required for the drag to
+                // start at all.
+                return NSItemProvider(object: slot.item.orderKey as NSString)
+            }
+            .onDrop(
+                of: [UTType.text],
+                delegate: EntryDropDelegate(
+                    target: slot.item.orderKey,
+                    targetWindowID: slot.item.primaryWindowID,
+                    targetSectionID: section.id,
+                    sourceSectionID: draggingFromSection,
+                    targetGroupID: section.groupID,
+                    sourceGroupID: draggingFromGroup,
+                    dragging: $dragging,
+                    move: { store.moveItem($0, before: $1, in: section.groupID) },
+                    moveBetweenGroups: { store.moveItem($0, from: $1, to: $2) }
+                )
+            )
+    }
+
+    /// Clears the drag state if the drag never lands anywhere.
+    ///
+    /// A dragged tile is drawn at 35% to show it is in flight, and `dragging` is
+    /// only reset by a drop. SwiftUI gives no callback for a drag that is
+    /// abandoned — released over the desktop, or cancelled — so the tile stayed
+    /// faded indefinitely and looked like a rendering glitch. Watching for the
+    /// mouse coming up ends the session wherever it happens.
+    private func armDragSafety() {
+        var monitors: [Any] = []
+        let finish = {
+            dragging = nil
+            draggingFromSection = nil
+            draggingFromGroup = nil
+            for monitor in monitors { NSEvent.removeMonitor(monitor) }
+            monitors.removeAll()
+        }
+        // Global for the usual case — the pointer is over another application
+        // while dragging — and local for a drag that stays over the strip.
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { _ in finish() } {
+            monitors.append(m)
+        }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { event in
+            finish(); return event
+        } {
+            monitors.append(m)
+        }
+    }
+
     private func firstUngroupedSlotID(_ layout: DeckLayout.Result) -> String? {
         layout.slots.first { $0.item.isUngrouped }?.id
     }
 
+
     @ViewBuilder
-    private func slotView(_ slot: DeckLayout.Slot) -> some View {
+    private func slotView(_ slot: DeckLayout.Slot, sectionGroupID: UUID?) -> some View {
         switch slot.item {
         case .window(let window), .ghost(let window), .ungrouped(let window):
             EntryTile(
@@ -150,7 +260,6 @@ struct DeckView: View {
                 memberships: store.groupsContaining(window.id),
                 memberColors: store.colors(containing: window.id),
                 isDragging: dragging == slot.item.orderKey,
-                isCombineTarget: combineTarget == slot.item.orderKey,
                 isFocused: store.focusedWindowID == window.id,
                 isGhost: slot.item.isGhost,
                 isUngrouped: slot.item.isUngrouped,
@@ -158,9 +267,19 @@ struct DeckView: View {
                 onActivate: { onActivate(window) },
                 onToggleGroup: { store.toggle(window.id, in: $0) },
                 onClose: { onClose(window) },
-                onHover: { hovering, frame in onHover(window, hovering, frame) }
+                onHover: { hovering, frame in onHover(window, hovering, frame) },
+                onPin: { groupID in
+                    guard let bundleID = window.bundleID else { return }
+                    store.togglePin(bundleID, in: groupID)
+                },
+                isPinnedIn: { groupID in
+                    guard let bundleID = window.bundleID else { return false }
+                    return store.isPinned(bundleID, in: groupID)
+                },
+                pinTargets: store.pinTargets(for: window.id),
+                groupWithTargets: store.groupWithTargets(for: window.id, in: sectionGroupID),
+                onGroupWith: { store.combine($0, into: window.id, in: sectionGroupID) }
             )
-            .opacity(slot.item.isGhost ? 0.62 : 1)
 
         case .pinned(let app):
             PinnedTile(
@@ -168,8 +287,32 @@ struct DeckView: View {
                 width: slot.width,
                 iconSize: slot.iconSize,
                 isDragging: dragging == slot.item.orderKey,
+                isRunning: store.runningApps.all.contains(app.bundleID),
                 onOpen: { AppLauncher.open(app) },
+                onTogglePin: { store.togglePin(app.bundleID, in: $0) },
+                isPinnedIn: { store.isPinned(app.bundleID, in: $0) },
+                pinTargets: store.pinTargets(forApp: app.bundleID),
                 onUnpin: { store.unpin(app.bundleID) }
+            )
+
+        case .running(let app, let closedWindowID):
+            PinnedTile(
+                app: app,
+                width: slot.width,
+                iconSize: slot.iconSize,
+                isDragging: dragging == slot.item.orderKey,
+                isPinned: false,
+                // Membership survives the window, so the dots do too.
+                memberColors: closedWindowID.map { store.colors(containing: $0) } ?? [],
+                // Reaching this case at all means the app is running.
+                isRunning: true,
+                onOpen: { AppLauncher.open(app) },
+                onTogglePin: { store.togglePin(app.bundleID, in: $0) },
+                isPinnedIn: { store.isPinned(app.bundleID, in: $0) },
+                pinTargets: store.pinTargets(forApp: app.bundleID),
+                // Right-clicking promotes it to a real pin, so an app you keep
+                // reaching for stops depending on it happening to be running.
+                onUnpin: { store.pin(app) }
             )
 
         case .cluster(let cluster, let members):
@@ -179,7 +322,6 @@ struct DeckView: View {
                 width: slot.width,
                 iconSize: slot.iconSize,
                 isDragging: dragging == slot.item.orderKey,
-                isCombineTarget: combineTarget == slot.item.orderKey,
                 onActivate: { onActivateAll(members) },
                 onSeparate: { store.dissolveCluster(cluster.id) },
                 onRename: { onRenameCluster(cluster) },
@@ -193,11 +335,16 @@ struct DeckView: View {
     }
 
     private var layout: DeckLayout.Result {
-        DeckLayout.compute(
-            items: store.visibleItems,
+        // Always measured on the flattened list, so the whole row is sized in one
+        // pass regardless of how it is bucketed. A capsule that budgeted its own
+        // width would let the row grow past the strip's edge.
+        let sections = store.sections
+        return DeckLayout.compute(
+            items: sections.flatMap(\.items),
             pinnedCount: 0,
             titlesEnabled: store.showTitles,
-            maxWidth: DeckMetrics.maxWidth()
+            maxWidth: DeckMetrics.maxWidth(),
+            pillCount: sections.filter(\.isPill).count
         )
     }
 
@@ -225,6 +372,10 @@ enum DeckMetrics {
     static let pinnedTileWidth: CGFloat = 40
     static let tileSpacing: CGFloat = 6
     static let selectorWidth: CGFloat = 108
+    /// Status dots — group membership on a window tile, running state on a
+    /// launcher. Shared so the two kinds line up along the bottom of the row.
+    static let statusDotSize: CGFloat = 4
+    static let statusDotInset: CGFloat = 1.5
     static let dividerWidth: CGFloat = 1
     /// Gap between the strip and the screen edge.
     static let edgeInset: CGFloat = 8

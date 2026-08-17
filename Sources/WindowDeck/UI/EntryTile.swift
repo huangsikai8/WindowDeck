@@ -13,10 +13,9 @@ struct EntryTile: View {
     let groups: [DeckGroup]
     let memberships: Set<UUID>
     /// Colours of the groups this window belongs to, in group order.
-    let memberColors: [GroupColor]
+    let memberColors: [Color]
     let isDragging: Bool
-    /// Dwelling here with a drag will merge the two into a cluster.
-    let isCombineTarget: Bool
+
     /// This window is frontmost — the one you're actually in.
     let isFocused: Bool
     /// Focused but not a member of the group on show.
@@ -31,6 +30,17 @@ struct EntryTile: View {
     /// Reports hover state plus the tile's frame, which the preview panel
     /// anchors to.
     let onHover: (Bool, CGRect) -> Void
+    /// Toggles a pin for this window's application. Nil means All.
+    var onPin: ((UUID?) -> Void)?
+    /// Whether it is currently pinned there, for the tick.
+    var isPinnedIn: ((UUID?) -> Bool)?
+    /// Groups offered in the pin submenu: the ones this window belongs to, plus
+    /// whichever group is on screen. In All the first is the only useful list —
+    /// there is no "current group" to pin to there.
+    var pinTargets: [DeckGroup] = []
+    /// What this window can be merged with, and the action that does it.
+    var groupWithTargets: [AppStore.GroupWithTarget] = []
+    var onGroupWith: ((CGWindowID) -> Void)?
 
     @State private var isHovering = false
     @State private var frame: CGRect = .zero
@@ -90,27 +100,18 @@ struct EntryTile: View {
                     HStack(spacing: 2.5) {
                         ForEach(Array(memberColors.enumerated()), id: \.offset) { _, color in
                             Circle()
-                                .fill(color.color)
-                                .frame(width: 4, height: 4)
+                                .fill(color)
+                                .frame(width: DeckMetrics.statusDotSize,
+                                       height: DeckMetrics.statusDotSize)
                         }
                     }
-                    .padding(.bottom, 1.5)
+                    .padding(.bottom, DeckMetrics.statusDotInset)
                 }
             }
             .background(frameReader)
         }
         .buttonStyle(.plain)
         .opacity(isDragging ? 0.35 : 1)
-        // Growing is the signal that releasing here combines rather than
-        // reorders.
-        .scaleEffect(isCombineTarget ? 1.12 : 1)
-        .overlay {
-            if isCombineTarget {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(.blue, lineWidth: 2)
-            }
-        }
-        .animation(.easeOut(duration: 0.12), value: isCombineTarget)
         .onHover { hovering in
             isHovering = hovering
             onHover(hovering, frame)
@@ -119,6 +120,19 @@ struct EntryTile: View {
         // problem. The title chip shown from HoverController names the window
         // instantly instead.
         .contextMenu { contextMenu }
+    }
+
+    /// A checkmark reads better than separate add and remove commands: one
+    /// stable menu whose state you can see at a glance, matching how group
+    /// membership is already presented.
+    @ViewBuilder
+    private func pinItem(_ name: String, groupID: UUID?,
+                         onPin: @escaping (UUID?) -> Void) -> some View {
+        Button {
+            onPin(groupID)
+        } label: {
+            Label(name, systemImage: isPinnedIn?(groupID) == true ? "checkmark" : "")
+        }
     }
 
     /// Red, deliberately outside the group palette. Tinting the off-group window
@@ -178,45 +192,90 @@ struct EntryTile: View {
             }
         }
 
+        // Below the rule, with pinning: these are actions on the window, while
+        // the checkmarks above are its membership. Sitting flush against that
+        // list made this read as one more group to tick.
         Divider()
+
+        // Merging windows behind one icon. A menu rather than a drag gesture:
+        // dragging reorders the row live, so a dwell-to-combine target moved out
+        // from under the pointer and the gesture could not be completed.
+        if let onGroupWith, !groupWithTargets.isEmpty {
+            Menu("Group with") {
+                ForEach(groupWithTargets) { target in
+                    Button {
+                        onGroupWith(target.windowID)
+                    } label: {
+                        // Icon and app name: a bare "Downloads" or "PR.md" says
+                        // little without knowing which application it belongs to.
+                        if let icon = target.icon {
+                            Image(nsImage: icon)
+                        }
+                        // Said in words rather than left to the dimming: a greyed
+                        // row otherwise reads as "unavailable" rather than "this
+                        // is where you are".
+                        Text(target.isCluster
+                             ? "Add to \(target.name) (\(target.detail))"
+                             : "\(target.detail) — \(target.name)"
+                             + (target.isSelf ? "   (this window)" : ""))
+                    }
+                    // Shown, not selectable: you can see where you are in the
+                    // order without being able to group a window with itself.
+                    .disabled(target.isSelf)
+                }
+            }
+        }
+
+        // Pinning from here is the natural place to reach for it: you are already
+        // right-clicking the app you want a launcher for.
+        if let onPin {
+            Menu("Pin \(window.appName) to") {
+                pinItem("All", groupID: nil, onPin: onPin)
+                if !pinTargets.isEmpty { Divider() }
+                ForEach(pinTargets) { group in
+                    pinItem(group.name, groupID: group.id, onPin: onPin)
+                }
+            }
+            Divider()
+        }
 
         Button("Close Window", action: onClose)
     }
 }
 
-/// Handles both gestures the strip supports with one drag.
+/// Reordering, and moving items between capsules.
 ///
-/// Passing over a tile reorders, as before. *Dwelling* on one for
-/// `combineDelay` arms a combine instead — the tile grows to say so, and
-/// releasing there merges the two into a cluster. Same idea as dropping one app
-/// onto another to make a folder on a phone, and it's the only way to tell
-/// "I'm heading somewhere past this" apart from "I mean this one".
+/// It used to arm a *combine* as well, when a drag dwelled on one tile for
+/// `combineDelay`. That could never work: passing over a tile reorders the row
+/// immediately, so the tile being dwelled on slid away and the timer was
+/// repeatedly cancelled. Merging is a menu action now, and this handles movement
+/// only.
 struct EntryDropDelegate: DropDelegate {
     /// Ordering key — windows and pins share one namespace.
     let target: String
     /// Only windows can be combined into a cluster; a pin has none.
     let targetWindowID: CGWindowID?
+    /// Which section this target is in, and which the drag began in. Sections
+    /// rather than groups decide reorder-versus-move: two sections can both have
+    /// no group — unfiled windows and All's leading launchers — and comparing
+    /// group ids alone would mistake a move between them for a reorder.
+    var targetSectionID: String?
+    var sourceSectionID: String?
+    var targetGroupID: UUID?
+    var sourceGroupID: UUID?
     @Binding var dragging: String?
-    @Binding var combineTarget: String?
     let move: (String, String) -> Void
-    let combine: (CGWindowID, CGWindowID) -> Void
-
-    static let combineDelay: TimeInterval = 0.7
+    /// Key, source group, target group. Either group may be nil: dropping into
+    /// the unfiled capsule removes the source membership without adding one.
+    var moveBetweenGroups: ((String, UUID?, UUID?) -> Void)?
 
     func dropEntered(info: DropInfo) {
         guard let dragging, dragging != target else { return }
+        // Reordering live as the drag passes only makes sense within one pill.
+        // Across pills the row's order comes from the grouping, so a live
+        // reorder would fight the layout and snap back.
+        guard targetSectionID == sourceSectionID else { return }
         move(dragging, target)
-
-        let source = dragging
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.combineDelay) {
-            // Only arm if the same drag is still in progress and hasn't moved on.
-            guard self.dragging == source else { return }
-            combineTarget = target
-        }
-    }
-
-    func dropExited(info: DropInfo) {
-        if combineTarget == target { combineTarget = nil }
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
@@ -224,16 +283,16 @@ struct EntryDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        // Combining is window-to-window only; dropping a pin onto one reorders.
-        if combineTarget == target,
-           let dragging, dragging != target,
-           dragging.hasPrefix("w"),
-           let source = CGWindowID(dragging.dropFirst()),
-           let targetWindowID {
-            combine(source, targetWindowID)
+        // A drop in a different pill moves the window between groups rather than
+        // reordering: it joins the pill it was dropped in and leaves the one it
+        // came from, the way dragging a file between folders behaves.
+        if let dragging, targetSectionID != sourceSectionID {
+            moveBetweenGroups?(dragging, sourceGroupID, targetGroupID)
+            self.dragging = nil
+            return true
         }
+
         dragging = nil
-        combineTarget = nil
         return true
     }
 }
