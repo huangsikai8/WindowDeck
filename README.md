@@ -1,8 +1,18 @@
-<img src="Resources/icon.png" width="120" align="right" alt="WindowDeck icon">
+<p align="center">
+  <img src="Resources/readme-icon.png" width="150" alt="WindowDeck">
+</p>
 
-# WindowDeck
+<h1 align="center">WindowDeck</h1>
 
-A macOS Dock replacement that groups **individual windows** rather than apps.
+<p align="center">
+  A macOS Dock replacement that groups <b>individual windows</b> rather than apps.
+</p>
+
+<p align="center">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey">
+  <img alt="Swift" src="https://img.shields.io/badge/Swift-6.2-orange">
+  <img alt="Xcode" src="https://img.shields.io/badge/Xcode-not%20required-brightgreen">
+</p>
 
 One horizontal strip at the bottom of the screen, with a drop-up selector for switching between named
 arrangements — All, Work, Study, or whatever you call them. Two windows of the same application can
@@ -52,7 +62,7 @@ Desktop, with logical groups instead of virtual ones.
 ## Building
 
 ```bash
-git clone <this repo> WindowDeck
+git clone https://github.com/huangsikai8/WindowDeck.git
 cd WindowDeck
 ./build.sh
 open ./build/WindowDeck.app
