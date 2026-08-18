@@ -265,6 +265,31 @@ same app. The queue of unmatched `savedMembers` needed deduping too, keyed on **
 than the reference itself** — `MemberRef` is Hashable including its window id, so one reference per
 relaunch compares as many distinct things and survives a naive dedupe.
 
+**Capture must outrank rebinding.** Opening a window while working in one group had it seized by a
+long-dead slot of the same app in another. Three fixes failed before the cause was measured: matching
+on title as well as app did not help because browsers reuse titles ("New Tab"); a recency guard did
+not help because each seized window then died in the wrong group, leaving a *fresh* slot for the next
+one, so the mistake fed itself. The fix is precedence — `captureTargets(focusHint:)` is computed
+first and passed to `rebindReopenedWindows(_:preferring:)`, which will not claim a window for a group
+the decision did not name. Note also that opening one Chrome window creates **six** window ids.
+
+**"The group on screen" is not "the group being acted on".** Pill view broke that assumption
+everywhere it was encoded. `combine`, `dissolveCluster`, `renameCluster` and `removeFromCluster` all
+wrote to `activeGroupID`, which in pill view is always All — so clustering four windows inside
+Actelligent's capsule built the cluster in All, where nothing looks for it. Cluster operations now
+find the owning group. Ordering had the same fault: a capsule honours *its own* group's arrangement,
+so `moveItem` takes the group being reordered.
+
+**Item building bypassed the shared rules three times.** Pill view constructed each section's items
+directly instead of going through `pins(alongside:)`, so a pinned app drew a launcher beside the very
+window it would have opened — first for All's leading launchers, then again inside group capsules.
+Unifying the *rendering* pipeline did not fix this, because the duplication was in item building.
+
+**Count the gaps the row actually draws.** `contentWidth` assumed `N-1` gaps between items, but with
+sections the real count is `N - sectionCount`, and the joins between sections are charged separately.
+Over-counting made the panel wider than its contents, and since the row is leading-aligned the
+surplus showed as dead space on the right that the left edge did not have.
+
 **A discarded result is not a cancelled one.** Hovering along the strip fired a ScreenCaptureKit
 capture per tile passed over. Each result was thrown away once the pointer moved on, but every capture
 still ran to completion — twenty tiles meant twenty captures to display one image, which is what made
@@ -400,6 +425,18 @@ the pill renderer type-checked for minutes without completing, which is indistin
 build. Splitting it into small functions with explicit return types took it to seven seconds. Suspect
 this before suspecting the toolchain.
 
+**Folded groups.** A group can be collapsed out of All's pill view (right-click its capsule). It
+leaves the row and joins an overflow control on the right — one overlapping dot per folded group, and
+the number of *windows* hidden. Dots answer "which groups", the number answers "how much"; capping the
+dots while the number counted something else produced "three dots, four" and answered neither.
+Pressing the control opens `AllGroupsPanel` above the strip, listing every group. Its width is
+computed from the same constants the view draws with, or the plate stops hugging its contents.
+
+**Menu counts use `NSMenuItemBadge`.** The drop-up is a real `NSMenu`, and macOS 14 provides the same
+right-aligned pill Apple uses for unread counts — it aligns and dims itself, unlike hand-built tab
+stops. Build it with `NSMenuItemBadge(string:)`, not `(count:)`: the count form suppresses a zero, and
+an empty group showing nothing looks like a badge that failed to render.
+
 **Groups cycle in strip order, not MRU.** ⌘↑/⌘↓ move through the arrangements with the same
 hold-and-tap shape as the window switcher — tap to step one, hold to open the list and keep tapping,
 release to switch. Strip order rather than most-recently-used because the arrows have to *mean*
@@ -424,6 +461,28 @@ switcher's timing is the most hard-earned code here. Generalising would risk the
 something that fits on a screen.
 
 ---
+
+## The self-test
+
+```bash
+WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
+```
+
+~90 checks, about a second, covering persistence (legacy files, a changed field type degrading rather
+than wiping the file, round-trips), ordering, restore matching, membership moves, pruning, clustering,
+section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never
+touch the real state file — destructive persistence tests once left fabricated groups in the running
+app.
+
+Two things it taught, both worth keeping in mind:
+
+* **A test that passes on first write is suspect.** The first 53 checks all passed and were worth
+  little; the first real bug surfaced only when writing a test for something that seemed obviously
+  fine.
+* **A green test can assert nothing.** `pinApp` silently does nothing for a bundle id with no
+  application on disk, so a pin test passed while never pinning anything. Assert the precondition.
+
+It cannot test gestures, drags or appearance. Add a case for every bug fixed that it *can* reach.
 
 ## Verification
 

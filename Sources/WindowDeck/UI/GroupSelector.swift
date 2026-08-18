@@ -116,6 +116,13 @@ struct GroupSelector: View {
             item.target = controller
             item.representedObject = group.id
             item.state = (group.id == store.activeGroupID) ? .on : .off
+            // The native badge, the same right-aligned pill Apple uses for unread
+            // counts. It aligns and dims itself, which hand-built tab stops in an
+            // attributed title do not.
+            // Built from a string rather than a count: `NSMenuItemBadge(count:)`
+            // suppresses a zero, and an empty group showing nothing is
+            // indistinguishable from a group whose badge failed to appear.
+            item.badge = NSMenuItemBadge(string: "\(store.windowCount(of: group))")
             if !group.isAll {
                 item.image = Self.swatch(group.displayColor)
             }

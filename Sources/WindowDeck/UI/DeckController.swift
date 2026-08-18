@@ -11,6 +11,7 @@ final class DeckController {
     private let panel: DeckPanel
     private let hosting: NSHostingView<DeckView>
     let hover = HoverController()
+    private let allGroups = AllGroupsPanel()
 
     private var isHiddenForFullscreen = false
     /// Hidden deliberately via the menu bar item, which fullscreen must not undo.
@@ -28,8 +29,9 @@ final class DeckController {
     ) {
         self.store = store
 
-        // Assigned after init so the hover handler can reach `self`.
+        // Assigned after init so the handlers can reach `self`.
         var hoverHandler: (WindowInfo, Bool, CGRect) -> Void = { _, _, _ in }
+        var showAllGroups: () -> Void = {}
         self.hosting = NSHostingView(rootView: DeckView(
             store: store,
             onActivate: onActivate,
@@ -38,7 +40,8 @@ final class DeckController {
             onEditGroups: onEditGroups,
             onHover: { window, hovering, frame in hoverHandler(window, hovering, frame) },
             onActivateAll: onActivateAll,
-            onRenameCluster: onRenameCluster
+            onRenameCluster: onRenameCluster,
+            onShowAllGroups: { showAllGroups() }
         ))
 
         // Empty sizing options: by default NSHostingView installs constraints
@@ -64,6 +67,16 @@ final class DeckController {
             name: NSWorkspace.didActivateApplicationNotification,
             object: nil
         )
+
+        showAllGroups = { [weak self] in self?.presentAllGroups() }
+
+        allGroups.onSelect = { [weak self] window in
+            guard let self else { return }
+            self.onActivateWindow?(window)
+        }
+        allGroups.onExpand = { [weak self] groupID in
+            self?.store.setCollapsed(false, for: groupID)
+        }
 
         hoverHandler = { [weak self] window, hovering, frame in
             guard let self else { return }
@@ -161,6 +174,27 @@ final class DeckController {
     }
 
     var isVisible: Bool { panel.isVisible }
+
+    /// Raising a window from the all-groups panel goes through the same path a
+    /// click on the strip does.
+    var onActivateWindow: ((WindowInfo) -> Void)?
+
+    /// Builds the panel's rows fresh each time: which groups are folded, and what
+    /// each holds, both change constantly.
+    private func presentAllGroups() {
+        guard !allGroups.isVisible else { return allGroups.hide() }
+        let live = store.visibleWindows
+        allGroups.model.groups = store.groups.filter { !$0.isAll }.map { group in
+            AllGroupsModel.Row(
+                id: group.id,
+                name: group.name,
+                color: group.displayColor,
+                isCollapsed: group.isCollapsed,
+                windows: live.filter { group.memberIDs.contains($0.id) }
+            )
+        }
+        allGroups.show(anchor: panel.frame)
+    }
 
     /// Horizontal swipes made while the pointer is over the strip. Needs no
     /// permission — these events come to us because the pointer is here.

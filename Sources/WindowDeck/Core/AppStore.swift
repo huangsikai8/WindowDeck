@@ -184,6 +184,17 @@ final class AppStore {
     /// Last known app + title for every window seen this session, so a member can
     /// still be described after it leaves the visible list.
     @ObservationIgnored private var knownRefs: [CGWindowID: MemberRef] = [:]
+    /// When each window was last seen alive, so a slot can be told from a relic.
+    @ObservationIgnored private var lastSeenAt: [CGWindowID: Date] = [:]
+
+    /// How recently a member's window must have vanished for a new one to be
+    /// treated as it returning.
+    ///
+    /// Without this, rebinding matched on application and title alone — and
+    /// Chrome reuses titles, so a window closed hours ago in one group seized
+    /// every new Chrome window opened in another. Reopening after a red-button
+    /// close happens in seconds; anything older is a different window.
+    private static let rebindWindow: TimeInterval = 90
 
     /// How long after launch to keep trying to rematch saved members. Generous,
     /// because a reboot reopens applications gradually.
@@ -416,7 +427,11 @@ final class AppStore {
     /// pipelines — a flat one and a bucketed one — meant every rule about
     /// ordering and dragging existed twice and drifted apart, which is where a
     /// run of pill-view bugs came from. One shape, one set of rules.
-    var sections: [DeckSection] {
+    var sections: [DeckSection] { sections(includingCollapsed: false) }
+
+    /// `includingCollapsed` is what the overflow panel asks for: the same row,
+    /// with nothing folded away.
+    func sections(includingCollapsed: Bool) -> [DeckSection] {
         guard pillView, activeGroup.isAll else {
             return [DeckSection(id: "flat", groupID: activeGroupID, color: nil,
                                 dividerBefore: false, items: visibleItems)]
@@ -440,6 +455,7 @@ final class AppStore {
         }
 
         for group in groups where !group.isAll {
+            if group.isCollapsed && !includingCollapsed { continue }
             let members = windows.filter { group.memberIDs.contains($0.id) }
             // Both kinds of launcher, not just pinned ones: a group's app that is
             // running with its window closed belongs in that group's capsule for
@@ -851,6 +867,11 @@ final class AppStore {
 
     // MARK: - Pinned apps
 
+    /// Ages a window out of the recency window. Self-test only.
+    func forgetLastSeenForTesting(_ windowID: CGWindowID) {
+        lastSeenAt[windowID] = Date(timeIntervalSinceNow: -3600)
+    }
+
     /// Runs the prune immediately, bypassing its rate limit. Self-test only.
     func forcePruneForTesting() {
         lastPrunedAt = .distantPast
@@ -877,6 +898,40 @@ final class AppStore {
             targets.append(activeGroup)
         }
         return targets
+    }
+
+    /// How many windows a group is currently showing. All counts everything.
+    func windowCount(of group: DeckGroup) -> Int {
+        group.isAll ? windows.count : windows.filter { group.memberIDs.contains($0.id) }.count
+    }
+
+    /// Folds a group into the overflow cluster, or brings it back.
+    func setCollapsed(_ collapsed: Bool, for groupID: UUID) {
+        guard let index = groups.firstIndex(where: { $0.id == groupID }), !groups[index].isAll
+        else { return }
+        groups[index].isCollapsed = collapsed
+        scheduleSave()
+    }
+
+    /// Groups folded away, with what each is holding — the dots on the right.
+    struct CollapsedGroup: Identifiable {
+        let id: UUID
+        let name: String
+        let color: Color
+        let count: Int
+    }
+
+    var collapsedGroups: [CollapsedGroup] {
+        guard pillView, activeGroup.isAll else { return [] }
+        let live = visibleWindows
+        return groups.filter { !$0.isAll && $0.isCollapsed }.map { group in
+            CollapsedGroup(
+                id: group.id,
+                name: group.name,
+                color: group.displayColor,
+                count: live.filter { group.memberIDs.contains($0.id) }.count
+            )
+        }
     }
 
     /// One entry in the "Group with" menu.
@@ -1274,6 +1329,17 @@ final class AppStore {
     /// were working in a moment ago is the only way to know which group you
     /// meant, and it is why creating windows in Actelligent filed them as
     /// unfiled.
+    // TEMPORARY — remove.
+    nonisolated static func probe(_ line: String) {
+        let path = "/private/tmp/claude-501/-Users-sikaihuang/a209dc7f-46aa-47af-9f16-1c24ddec63cd/scratchpad/capture.log"
+        let text = line + "\n"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile(); h.write(text.data(using: .utf8)!); try? h.close()
+        } else {
+            try? text.data(using: .utf8)!.write(to: URL(fileURLWithPath: path))
+        }
+    }
+
     func captureNewWindows(_ created: Set<CGWindowID>,
                            claimedByRestore: Set<CGWindowID> = [],
                            focusHint: CGWindowID? = nil) {
@@ -1288,6 +1354,8 @@ final class AppStore {
         //
         // The group is recorded per window, so a window opened in Main still
         // joins Main even if the active group changes while it settles.
+        let targets = captureTargets(focusHint: focusHint)
+
         // Which groups a new window should join.
         //
         // Normally the group you are looking at. But in All there is no such
@@ -1296,31 +1364,10 @@ final class AppStore {
         // groups of the window you are actually working in keeps the behaviour
         // meaningful there: open something while in a Study window and it joins
         // Study, which is what you would have wanted anyway.
-        let targets: [UUID]
-        if !activeGroup.isAll {
-            targets = [activeGroupID]
-        } else if let reference = focusHint ?? focusedWindowID {
-            var found = groups.filter { !$0.isAll && $0.memberIDs.contains(reference) }.map(\.id)
-            // A window queued but not yet flushed counts as already belonging.
-            //
-            // Capture is deferred — a new window reaches the window server before
-            // Accessibility can describe it — while focus moves to that window
-            // immediately. So opening several in a row broke after the first few:
-            // by the third, the focused window was one that had been queued for
-            // Study but not yet added to it, so it looked like it belonged to
-            // nothing and the chain stopped.
-            if found.isEmpty, let queued = pendingCaptures[reference] {
-                found = queued.groupIDs
-            }
-            // And if the reference itself was the previous new window, follow it
-            // back one more step: opening several in a row chains through them.
-            if found.isEmpty, let current = focusedWindowID,
-               let queued = pendingCaptures[current] {
-                found = queued.groupIDs
-            }
-            targets = found
-        } else {
-            targets = []
+        if !created.isEmpty {   // TEMPORARY
+            let names = targets.compactMap { id in groups.first { $0.id == id }?.name }
+            let hint = focusHint.flatMap { id in windows.first { $0.id == id } }
+            Self.probe("created=\(created.sorted()) claimed=\(claimedByRestore.sorted()) active=\(activeGroup.name) hint=\(hint?.appName ?? "nil") targets=\(names) autoAdd=\(autoAddNewWindows) grace=\(now >= launchGraceEnds)")
         }
 
         if autoAddNewWindows, !targets.isEmpty, now >= launchGraceEnds {
@@ -1467,6 +1514,23 @@ final class AppStore {
         if changed { saveNow() }
     }
 
+    /// Which groups a newly opened window should join.
+    ///
+    /// The group on screen, or — in All, where there is none, and in pill view
+    /// where All is always what you are looking at — the groups of the window you
+    /// were working in a moment ago. A window takes focus the instant it opens,
+    /// so the *previous* focus is the only thing that says which group you meant.
+    func captureTargets(focusHint: CGWindowID?) -> [UUID] {
+        if !activeGroup.isAll { return [activeGroupID] }
+        guard let reference = focusHint ?? focusedWindowID else { return [] }
+
+        var found = groups.filter { !$0.isAll && $0.memberIDs.contains(reference) }.map(\.id)
+        if found.isEmpty, let queued = pendingCaptures[reference] { found = queued.groupIDs }
+        if found.isEmpty, let current = focusedWindowID,
+           let queued = pendingCaptures[current] { found = queued.groupIDs }
+        return found
+    }
+
     /// Re-attaches a reopened window to the slot its predecessor held.
     ///
     /// Closing a window with the red button and opening it again produces a
@@ -1480,7 +1544,8 @@ final class AppStore {
     /// so a reopened window can only ever claim a slot that is genuinely vacant.
     /// Returns the ids it claimed so they aren't also swept up as brand new.
     @discardableResult
-    func rebindReopenedWindows(_ created: Set<CGWindowID>) -> Set<CGWindowID> {
+    func rebindReopenedWindows(_ created: Set<CGWindowID>,
+                               preferring intended: [UUID] = []) -> Set<CGWindowID> {
         guard !created.isEmpty else { return [] }
         let live = Set(windows.map(\.id))
         var claimed: Set<CGWindowID> = []
@@ -1490,21 +1555,44 @@ final class AppStore {
                   let bundleID = window.bundleID else { continue }
 
             for index in groups.indices {
+                // Where you were working wins over a slot another group is
+                // holding. Without this, opening a Chrome window while in Rooming
+                // was seized by a dead Chrome slot in Main — and because each
+                // seized window then died in Main, it left a fresh slot for the
+                // next one, so the mistake fed itself.
+                if !intended.isEmpty, !groups[index].isAll,
+                   !intended.contains(groups[index].id) { continue }
+
                 if groups[index].isAll {
                     // All has no membership, but it does have an arrangement, so
                     // the returning window should still land where it sat.
                     if let oldID = vacantMemberID(in: groups[index].order,
-                                                  bundleID: bundleID, live: live),
+                                                  for: window, live: live),
                        let slot = groups[index].order.firstIndex(of: "w\(oldID)") {
                         groups[index].order[slot] = "w\(newID)"
                     }
                     continue
                 }
 
-                guard let oldID = groups[index].memberIDs.first(where: {
-                    !live.contains($0) && knownRefs[$0]?.bundleID == bundleID
+                // Application *and* title. Matching on the app alone meant any
+                // new window claimed a vacant slot belonging to that app in any
+                // group — open a Chrome window while working in Rooming and it
+                // was seized by a long-closed Chrome member of Main, and because
+                // a rebound window counts as claimed, auto-capture never saw it.
+                //
+                // A window genuinely returning after a red-button close comes
+                // back with the title it had, so requiring that costs nothing
+                // real and stops one group stealing another's new windows.
+                guard let oldID = groups[index].memberIDs.first(where: { id in
+                    guard !live.contains(id), let ref = knownRefs[id],
+                          ref.bundleID == bundleID,
+                          let seen = lastSeenAt[id],
+                          Date().timeIntervalSince(seen) < Self.rebindWindow
+                    else { return false }
+                    return ref.matches(window) || ref.looselyMatches(window)
                 }) else { continue }
 
+                Self.probe("REBIND \(newID) -> \(groups[index].name) (was \(oldID))")   // TEMPORARY
                 groups[index].memberIDs.remove(oldID)
                 groups[index].memberIDs.insert(newID)
                 if let slot = groups[index].order.firstIndex(of: "w\(oldID)") {
@@ -1519,11 +1607,15 @@ final class AppStore {
         return claimed
     }
 
-    private func vacantMemberID(in order: [String], bundleID: String,
+    private func vacantMemberID(in order: [String], for window: WindowInfo,
                                 live: Set<CGWindowID>) -> CGWindowID? {
         for key in order where key.hasPrefix("w") {
             guard let id = CGWindowID(key.dropFirst()), !live.contains(id),
-                  knownRefs[id]?.bundleID == bundleID else { continue }
+                  let ref = knownRefs[id], ref.bundleID == window.bundleID,
+                  let seen = lastSeenAt[id],
+                  Date().timeIntervalSince(seen) < Self.rebindWindow,
+                  ref.matches(window) || ref.looselyMatches(window)
+            else { continue }
             return id
         }
         return nil
@@ -1559,6 +1651,7 @@ final class AppStore {
                 name: saved.name,
                 colorIndex: saved.colorIndex,
                 customColorHex: saved.customColorHex,
+                isCollapsed: saved.isCollapsed,
                 savedMembers: saved.members,
                 savedOrder: saved.order,
                 clusters: saved.clusters.map(Self.cluster(from:)),
@@ -1685,6 +1778,7 @@ final class AppStore {
                     name: $0.name,
                     colorIndex: $0.colorIndex,
                     customColorHex: $0.customColorHex,
+                    isCollapsed: $0.isCollapsed,
                     members: snapshot(of: $0),
                     order: orderSnapshot(of: $0),
                     clusters: $0.clusters.map(persisted),
@@ -1752,7 +1846,9 @@ final class AppStore {
     /// refresh so a member's description is available even once the window is no
     /// longer visible.
     func noteWindowRefs(_ windows: [WindowInfo]) {
+        let now = Date()
         for window in windows {
+            lastSeenAt[window.id] = now
             guard let bundleID = window.bundleID else { continue }
             knownRefs[window.id] = MemberRef(bundleID: bundleID, title: window.title,
                                              windowID: window.id)

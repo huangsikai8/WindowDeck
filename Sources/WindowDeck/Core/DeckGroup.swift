@@ -91,6 +91,9 @@ struct DeckGroup: Identifiable, Hashable {
     /// still possible. Stored as hex rather than a `Color` because `Color` is
     /// not usefully Codable and the state file has to stay plain JSON.
     var customColorHex: String?
+    /// Folded away in All's pill view: the group keeps its place in the bar as a
+    /// dot in the overflow cluster rather than a full capsule.
+    var isCollapsed: Bool = false
     /// Snapshot for restore. Entries are removed as they are matched, so a
     /// window the user later removes by hand is never silently re-added.
     var savedMembers: [MemberRef]
@@ -126,6 +129,7 @@ struct DeckGroup: Identifiable, Hashable {
         order: [String] = [],
         colorIndex: Int = GroupColor.blue.rawValue,
         customColorHex: String? = nil,
+        isCollapsed: Bool = false,
         savedMembers: [MemberRef] = [],
         savedOrder: [OrderRef] = [],
         clusters: [WindowCluster] = [],
@@ -139,6 +143,7 @@ struct DeckGroup: Identifiable, Hashable {
         self.order = order
         self.colorIndex = colorIndex
         self.customColorHex = customColorHex
+        self.isCollapsed = isCollapsed
         self.savedMembers = savedMembers
         self.savedOrder = savedOrder
         self.clusters = clusters

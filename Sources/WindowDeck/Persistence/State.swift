@@ -43,6 +43,8 @@ struct PersistedGroup: Codable {
     var colorIndex: Int
     /// A colour picked outside the preset palette, as "rrggbb".
     var customColorHex: String?
+    /// Folded into the overflow cluster in All's pill view.
+    var isCollapsed: Bool = false
     var members: [MemberRef]
     /// The manual left-to-right arrangement — windows and pinned apps share it.
     var order: [OrderRef]
@@ -54,6 +56,7 @@ struct PersistedGroup: Codable {
         name: String,
         colorIndex: Int,
         customColorHex: String? = nil,
+        isCollapsed: Bool = false,
         members: [MemberRef],
         order: [OrderRef] = [],
         clusters: [PersistedCluster] = [],
@@ -64,6 +67,7 @@ struct PersistedGroup: Codable {
         self.name = name
         self.colorIndex = colorIndex
         self.customColorHex = customColorHex
+        self.isCollapsed = isCollapsed
         self.members = members
         self.order = order
         self.clusters = clusters
@@ -80,6 +84,7 @@ struct PersistedGroup: Codable {
         colorIndex = container.lenient(Int.self, .colorIndex)
             ?? GroupColor.blue.rawValue
         customColorHex = container.lenient(String.self, .customColorHex)
+        isCollapsed = container.lenient(Bool.self, .isCollapsed) ?? false
         members = container.lenient([MemberRef].self, .members) ?? []
         if let refs = container.lenient([OrderRef].self, .order) {
             order = refs

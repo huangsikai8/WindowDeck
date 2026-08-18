@@ -71,29 +71,75 @@ enum DeckLayout {
 
     /// Width a capsule adds around its contents, per side.
     static let pillInset: CGFloat = 5
+    // The overflow control's geometry, defined once and read by both the layout
+    // and the view. Estimating it here and drawing something else there made the
+    // panel wider than its contents, and the surplus showed as dead space on the
+    // right that the left edge did not have.
+    static let collapsedPadding: CGFloat = 8
+    static let collapsedDotSize: CGFloat = 11
+    /// Each further dot overlaps its neighbour, so folding six groups costs about
+    /// a tile rather than six.
+    static let collapsedDotStep: CGFloat = 7
+    static let collapsedGap: CGFloat = 5
+
+    /// Sized to the digits actually shown rather than reserving room for three.
+    /// A fixed slot left the number floating away from the dots with a gap on
+    /// both sides — the count is the last thing in the control, so any surplus
+    /// reads as the whole thing being badly spaced.
+    static func collapsedCountWidth(_ total: Int) -> CGFloat {
+        CGFloat(String(total).count) * 7 + 2
+    }
+
+    static func collapsedControlWidth(groups: Int, windows: Int) -> CGFloat {
+        collapsedPadding * 2
+            + collapsedDotSize + CGFloat(max(groups - 1, 0)) * collapsedDotStep
+            + collapsedGap + collapsedCountWidth(windows)
+    }
 
     static func compute(
         items: [DeckItem],
         pinnedCount: Int,
         titlesEnabled: Bool,
         maxWidth: CGFloat,
-        pillCount: Int = 0
+        pillCount: Int = 0,
+        collapsedCount: Int = 0,
+        collapsedWindows: Int = 0,
+        sectionCount: Int = 1,
+        dividerCount: Int = 0
     ) -> Result {
 
         let spacing = spacing(forCount: items.count)
+        // Gaps *within* sections. The row draws one between neighbouring items in
+        // the same section and one between sections — counting N-1 of the former
+        // double-counts the joins, and since the row is leading-aligned the
+        // surplus became dead space on the right that the left edge did not have.
+        let sections = max(sectionCount, 1)
+        let interSectionGaps = CGFloat(sections - 1) * spacing
         // The ghost entry is preceded by a separator, which costs width like
         // anything else — unaccounted, it pushes the row past the edge.
         // Each separator costs width like anything else — unaccounted, the row
         // runs past the strip's edge and the last icons clip.
-        var ghostChrome: CGFloat = 0
-        if items.contains(where: \.isGhost) { ghostChrome += DeckMetrics.dividerWidth + spacing }
-        if items.contains(where: \.isUngrouped) { ghostChrome += DeckMetrics.dividerWidth + spacing }
+        var ghostChrome: CGFloat = CGFloat(dividerCount) * (DeckMetrics.dividerWidth + spacing)
+        if dividerCount == 0 {
+            // Flat view: the separators are decided per item rather than per
+            // section.
+            if items.contains(where: \.isGhost) { ghostChrome += DeckMetrics.dividerWidth + spacing }
+            if items.contains(where: \.isUngrouped) { ghostChrome += DeckMetrics.dividerWidth + spacing }
+        }
         // Each capsule costs its own padding on both sides plus the gap to its
         // neighbour. Unaccounted, a bucketed All runs past the strip's edge —
         // the same failure separators caused before they were charged for.
-        let pillChrome = CGFloat(pillCount) * (pillInset * 2 + spacing)
+        // Only the capsules' own padding: the gaps between them are counted once,
+        // above, as inter-section gaps.
+        let pillChrome = CGFloat(pillCount) * (pillInset * 2)
+        // The overflow cluster and the rule before it are chrome like anything
+        // else — uncharged, the row runs past the strip's edge.
+        let overflowChrome = collapsedCount > 0
+            ? collapsedControlWidth(groups: collapsedCount, windows: collapsedWindows)
+                + DeckMetrics.dividerWidth + spacing * 2
+            : 0
         let chrome = chromeWidth(pinnedCount: pinnedCount, spacing: spacing)
-            + ghostChrome + pillChrome
+            + ghostChrome + pillChrome + overflowChrome + interSectionGaps
 
         guard !items.isEmpty else {
             return Result(slots: [], spacing: spacing,
@@ -117,7 +163,7 @@ enum DeckLayout {
         }
         let titledCount = wantsTitle.filter { $0 }.count
 
-        let gaps = CGFloat(items.count - 1) * spacing
+        let gaps = CGFloat(max(items.count - sections, 0)) * spacing
         let available = maxWidth - chrome - gaps
 
         // Total cost in entry-widths, with clusters charged more.

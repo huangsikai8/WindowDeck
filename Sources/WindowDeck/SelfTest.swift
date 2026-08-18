@@ -334,6 +334,66 @@ enum SelfTest {
         check("it inherits the arrangement slot",
               store.order(in: group).first == "w21", "\(store.order(in: group))")
 
+        // A *new* window of the same app must not seize a vacant slot: opening a
+        // browser window while working in one group had it claimed by a
+        // long-closed member of another.
+        let fresh = AppStore()
+        guard fresh.groups.count >= 3 else { return check("two groups exist", false) }
+        let owner = fresh.groups[1].id
+        let old = WindowInfo.testInstance(id: 70, bundleID: "com.browser", title: "Old Tab")
+        fresh.windows = [old]; fresh.noteWindowRefs([old])
+        fresh.add(70, to: owner)
+        fresh.windows = []                       // closed
+        let unrelated = WindowInfo.testInstance(id: 71, bundleID: "com.browser", title: "Something Else")
+        fresh.windows = [unrelated]; fresh.noteWindowRefs([unrelated])
+        check("a differently titled window does not seize the slot",
+              !fresh.rebindReopenedWindows([71]).contains(71))
+        check("and does not join that group", !fresh.isMember(71, of: owner))
+
+        // A slot whose window vanished long ago must not claim a new one, even
+        // when the app and title line up exactly — browsers reuse titles.
+        let stale = AppStore()
+        let staleGroup = stale.groups[1].id
+        let ancient = WindowInfo.testInstance(id: 80, bundleID: "com.browser", title: "New Tab")
+        stale.windows = [ancient]
+        stale.noteWindowRefs([ancient])
+        stale.add(80, to: staleGroup)
+        stale.forgetLastSeenForTesting(80)          // as if it closed long ago
+        stale.windows = []
+        let brandNew = WindowInfo.testInstance(id: 81, bundleID: "com.browser", title: "New Tab")
+        stale.windows = [brandNew]; stale.noteWindowRefs([brandNew])
+        check("a long-dead slot does not claim a new window",
+              !stale.rebindReopenedWindows([81]).contains(81))
+        check("so the new window is free to be captured elsewhere",
+              !stale.isMember(81, of: staleGroup))
+
+        // Where you are working beats a slot another group is holding.
+        let contest = AppStore()
+        let holder = contest.groups[1].id      // the group with a stale slot
+        let intended = contest.groups[2].id    // where you are actually working
+        let dead = WindowInfo.testInstance(id: 90, bundleID: "com.browser", title: "New Tab")
+        contest.windows = [dead]; contest.noteWindowRefs([dead])
+        contest.add(90, to: holder)
+        contest.windows = []
+        let opened = WindowInfo.testInstance(id: 91, bundleID: "com.browser", title: "New Tab")
+        contest.windows = [opened]; contest.noteWindowRefs([opened])
+
+        check("without an intent, the slot is reclaimed as before",
+              contest.rebindReopenedWindows([91]).contains(91))
+
+        let second = AppStore()
+        let holder2 = second.groups[1].id, intended2 = second.groups[2].id
+        let dead2 = WindowInfo.testInstance(id: 92, bundleID: "com.browser", title: "New Tab")
+        second.windows = [dead2]; second.noteWindowRefs([dead2])
+        second.add(92, to: holder2)
+        second.windows = []
+        let opened2 = WindowInfo.testInstance(id: 93, bundleID: "com.browser", title: "New Tab")
+        second.windows = [opened2]; second.noteWindowRefs([opened2])
+        check("a stated intent stops another group claiming it",
+              !second.rebindReopenedWindows([93], preferring: [intended2]).contains(93))
+        check("and it does not join the holding group",
+              !second.isMember(93, of: holder2))
+
         // A window of an unrelated app must not steal the slot.
         let other = AppStore()
         let held = WindowInfo.testInstance(id: 30, bundleID: "com.one", title: "A")

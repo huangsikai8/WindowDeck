@@ -10,6 +10,8 @@ struct DeckView: View {
     let onHover: (WindowInfo, Bool, CGRect) -> Void
     let onActivateAll: ([WindowInfo]) -> Void
     let onRenameCluster: (WindowCluster) -> Void
+    /// Opens the panel showing every group, folded ones included.
+    var onShowAllGroups: () -> Void = {}
 
     @State private var dragging: String?
     /// Which pill the current drag started in, so a drop elsewhere can move the
@@ -109,6 +111,7 @@ struct DeckView: View {
                 }
                 pill(entry.section, slots: entry.slots, spacing: layout.spacing)
             }
+            overflowCluster(spacing: layout.spacing)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay(alignment: .leading) {
@@ -120,6 +123,60 @@ struct DeckView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+        }
+    }
+
+    /// Groups folded away, gathered at the right as coloured dots.
+    ///
+    /// Pressing anywhere on the cluster shows the whole bar above the strip. It
+    /// is one control rather than a dot each: the point is to get several groups
+    /// out of the way, not to open them one at a time.
+    @ViewBuilder
+    private func overflowCluster(spacing: CGFloat) -> some View {
+        let collapsed = store.collapsedGroups
+        let hiddenWindows = collapsed.reduce(0) { $0 + $1.count }
+        if !collapsed.isEmpty {
+            Divider().frame(height: 22)
+            Button {
+                onShowAllGroups()
+            } label: {
+                HStack(spacing: DeckLayout.collapsedGap) {
+                    // Overlapping circles, one per folded group — count them for
+                    // groups, read the number for windows. Each carries a ring in
+                    // the bar's own colour so neighbours stay separable where they
+                    // overlap.
+                    HStack(spacing: -4) {
+                        ForEach(collapsed) { group in
+                            Circle()
+                                .fill(group.color)
+                                .frame(width: DeckLayout.collapsedDotSize,
+                                       height: DeckLayout.collapsedDotSize)
+                                .overlay(
+                                    Circle().strokeBorder(
+                                        Color(nsColor: .windowBackgroundColor), lineWidth: 1.5)
+                                )
+                        }
+                    }
+
+                    Text("\(hiddenWindows)")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        // Exactly as wide as its digits, so the number sits
+                        // against the dots instead of floating in a reserved slot.
+                        .frame(width: DeckLayout.collapsedCountWidth(hiddenWindows),
+                               alignment: .trailing)
+                }
+                .padding(.horizontal, DeckLayout.collapsedPadding)
+                .frame(height: DeckMetrics.tileHeight + 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(.primary.opacity(0.06))
+                )
+            }
+            .buttonStyle(.plain)
+            .help(collapsed.count == 1
+                  ? "\(collapsed[0].name) is collapsed — show all groups"
+                  : "\(collapsed.count) groups collapsed — show all groups")
         }
     }
 
@@ -167,6 +224,12 @@ struct DeckView: View {
         .padding(.horizontal, section.isPill ? DeckLayout.pillInset : 0)
         .frame(height: DeckMetrics.tileHeight + 6)
         .background(pillBackground(section))
+        .contextMenu {
+            if let groupID = section.groupID,
+               let group = store.groups.first(where: { $0.id == groupID }), !group.isAll {
+                Button("Collapse \(group.name)") { store.setCollapsed(true, for: groupID) }
+            }
+        }
     }
 
     @ViewBuilder
@@ -344,7 +407,11 @@ struct DeckView: View {
             pinnedCount: 0,
             titlesEnabled: store.showTitles,
             maxWidth: DeckMetrics.maxWidth(),
-            pillCount: sections.filter(\.isPill).count
+            pillCount: sections.filter(\.isPill).count,
+            collapsedCount: store.collapsedGroups.count,
+            collapsedWindows: store.collapsedGroups.reduce(0) { $0 + $1.count },
+            sectionCount: sections.count,
+            dividerCount: sections.filter(\.dividerBefore).count
         )
     }
 

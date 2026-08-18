@@ -35,6 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onActivateAll: { [weak self] windows in self?.engine.focusAll(windows) },
             onRenameCluster: { [weak self] cluster in self?.promptRenameCluster(cluster) }
         )
+        deck.onActivateWindow = { [weak self] window in self?.engine.focus(window) }
+
         // Clicking the thumbnail is the only hover action that really switches.
         deck.hover.onCommit = { [weak self] window in
             self?.engine.focus(window)
@@ -86,7 +88,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Before auto-capture: a window returning to a group it already
             // belonged to must not be treated as brand new and swept into
             // whichever group happens to be showing.
-            let rebound = self.store.rebindReopenedWindows(snapshot.created)
+            // The capture decision is made first and handed to rebinding, so a
+            // window opened in one group cannot be claimed by another's relic.
+            let intended = self.store.captureTargets(focusHint: previousFocus)
+            let rebound = self.store.rebindReopenedWindows(snapshot.created,
+                                                           preferring: intended)
             self.store.captureNewWindows(snapshot.created,
                                          claimedByRestore: restored.union(rebound),
                                          focusHint: previousFocus)
