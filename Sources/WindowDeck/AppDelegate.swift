@@ -61,8 +61,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.store.sampleRunningApps(windowOwnerPIDs: snapshot.windowOwnerPIDs)
             if windows != self.store.windows {
                 self.store.windows = windows
-                self.store.noteWindowRefs(windows)
             }
+            // Unconditionally, and deliberately outside the equality guard above.
+            // `WindowInfo.==` ignores `frame` — on purpose, since a move or resize
+            // must not redraw the strip — so a window that was only moved never
+            // reached this call and `lastFrameOf` kept the pre-resize rectangle
+            // for ever. Tab matching is by identical frame, so resizing a tabbed
+            // window once was enough to make every later tab switch lose the
+            // group. Every field this touches is @ObservationIgnored, so it costs
+            // dictionary writes and no redraw.
+            self.store.noteWindowRefs(windows)
             // Recorded before focus is updated: a window that has just opened
             // already holds focus, so the group context has to come from what we
             // were in immediately before.
@@ -93,6 +101,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let intended = self.store.captureTargets(focusHint: previousFocus)
             let rebound = self.store.rebindReopenedWindows(snapshot.created,
                                                            preferring: intended)
+            // Windows that merely came into view rather than being created —
+            // which is what a tab switch looks like.
+            self.store.rebindAppearedWindows(excluding: snapshot.created)
             self.store.captureNewWindows(snapshot.created,
                                          claimedByRestore: restored.union(rebound),
                                          focusHint: previousFocus)

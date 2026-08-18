@@ -74,6 +74,7 @@ final class DeckController {
             guard let self else { return }
             self.onActivateWindow?(window)
         }
+        allGroups.model.onClose = onClose
         allGroups.onExpand = { [weak self] groupID in
             self?.store.setCollapsed(false, for: groupID)
         }
@@ -183,16 +184,10 @@ final class DeckController {
     /// each holds, both change constantly.
     private func presentAllGroups() {
         guard !allGroups.isVisible else { return allGroups.hide() }
-        let live = store.visibleWindows
-        allGroups.model.groups = store.groups.filter { !$0.isAll }.map { group in
-            AllGroupsModel.Row(
-                id: group.id,
-                name: group.name,
-                color: group.displayColor,
-                isCollapsed: group.isCollapsed,
-                windows: live.filter { group.memberIDs.contains($0.id) }
-            )
-        }
+        // The model builds its own rows now, so an edit made inside the panel is
+        // reflected without waiting for the next strip layout.
+        allGroups.model.store = store
+        allGroups.model.reload()
         allGroups.show(anchor: panel.frame)
     }
 

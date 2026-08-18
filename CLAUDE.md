@@ -265,6 +265,17 @@ same app. The queue of unmatched `savedMembers` needed deduping too, keyed on **
 than the reference itself** — `MemberRef` is Hashable including its window id, so one reference per
 relaunch compares as many distinct things and survives a naive dedupe.
 
+**Rebinding has two triggers, and they need different rules.** `rebindReopenedWindows` runs on windows
+the server reports as **created** — a red-button close and reopen. `rebindAppearedWindows` runs on
+windows that merely became *visible*, which is what a tab switch is: nothing is created, since every
+tab already exists off screen. A frame-matching fix aimed only at the created path was therefore never
+reached at all.
+
+The two also differ in whether capture intent applies. `preferring:` stops a *new* window being seized
+by another group's stale slot, and must **not** be applied to a window coming into view — a tab switch
+carries no intent about where the window should go, and applying the filter refused the claim whenever
+the intent named a different group, so the arriving tab landed unfiled. Two triggers, one rule each.
+
 **Capture must outrank rebinding.** Opening a window while working in one group had it seized by a
 long-dead slot of the same app in another. Three fixes failed before the cause was measured: matching
 on title as well as app did not help because browsers reuse titles ("New Tab"); a recency guard did
@@ -296,15 +307,92 @@ still ran to completion — twenty tiles meant twenty captures to display one im
 hovering feel heavy. The capture is now a cancellable `Task` that waits 90ms for the pointer to settle,
 so a sweep issues none at all.
 
+**A menu model built per tile, per redraw, is N-squared.** `EntryTile` took `groupWithTargets` as an
+ordinary argument, so the entire "Group with" list — every candidate window, each with an icon — was
+built for *every* tile on *every* redraw, to populate a menu that is open for at most one tile and
+usually none. The icons were the expensive part: `NSImage.menuSized` locks focus on a new bitmap and
+redraws through IconServices on every access, 0.036ms each, and it was called once per candidate per
+tile. With 33 windows that is ~900 rasterisations and 32ms per redraw. A `sample` profile put that one
+expression at 46% of the app's own CPU — the largest single consumer, ahead of the entire 0.5s engine
+tick.
+
+Two things make this hard to see. `IconCache` already memoises the full-size icon and says so in a
+comment, which reads as though icons are handled; the rasterisation happens on the layer *above* that
+cache, so the memoisation is real and defeated at the same time. And the profile blames whatever
+expression the argument sits in, not the menu — the frames appear under `slotView`, with no menu code
+anywhere in the stack, because the menu body genuinely never runs.
+
+Deferring it with a closure is the tempting fix and is not reliable. Measured with a standalone
+SwiftUI app on macOS 26: when a tile's view value is unchanged between renders the `.contextMenu`
+builder is skipped (10 evaluations against 40 of the argument), but when the view value *does* change
+the builder runs every time (90 against 100). A tile whose title or focus changed would therefore pay
+the full cost anyway. Memoising the rasterisation is what actually removes it, and it belongs beside
+the icon cache it was defeating, invalidated by the same `forget(pid:)`.
+
+**Counting samples is not counting stacks.** In that same profile the engine tick looked comparable to
+the redraw — 642 samples against 648. It was not: 478 of the tick's samples were a leaf blocked in
+`mach_msg` waiting on Accessibility and LaunchServices IPC, so only 164 were CPU this process actually
+burned, against 632 for the redraw. `sample` reports wall-clock stacks, and a main thread parked in an
+AX round trip looks exactly like one doing work. Split blocked leaves from running ones before
+believing a ranking, or the cheapest-to-fix item hides behind the noisiest one.
+
 **Animating the panel's frame re-lays out every tile, every frame.** Group changes animate the strip's
 resize, and swiping quickly stacked those animations on top of each other. `AppStore.animateThisChange`
 is false whenever a change interrupts the previous one; both the SwiftUI slide and the panel resize are
 gated on it so they cannot disagree.
 
-**TextEdit and Finder can open tabs rather than windows.** Tabs have no window ID and cannot appear in
-the strip. Not a bug.
+**macOS tabs are separate windows, and this note used to say otherwise.** Each tab of a tabbed window
+is its own `NSWindow` with its own `CGWindowID`; only the front tab is on screen and the rest are
+ordered out. Measured on TextEdit: 24 windows, 3 on screen, 21 off — all exactly 757×559. So switching
+tabs *swaps which id is visible*, and membership keyed by window id follows the tab you filed rather
+than the window you think you filed: the group loses it and the newly shown tab arrives unfiled.
+
+The only signal tying tabs together is that they share a frame **to the pixel**, which is why
+`WindowInfo` carries one and `rebindReopenedWindows` accepts an identical frame alongside a title
+match. A window of the same application at a different size or position is not a tab.
 
 ---
+
+**A tab's frame is live at the moment it appears, and stale at every other moment.** This one cost
+three wrong fixes, in both directions. Enumerating a window's tabs by geometry does **not** work: an
+off-screen tab reports the rectangle the window had when that tab was last shown, so once the window
+is moved or resized its hidden tabs keep the old rect. Measured on a 7-tab TextEdit window — the
+visible tab sat at `280,202 705x393` while thirteen siblings still reported `401,158 757x559`. The
+converse fails too: ids `319` and `15618` shared a rectangle and were *different windows*, one of
+them filed in another group, so bucketing by geometry invents siblings as readily as it misses them.
+A pass that unions membership across same-rect windows was built on this and reverted.
+
+What *does* hold is the switch itself. When a tab comes forward it takes the window's current
+rectangle, which is exactly the frame the departing tab was last seen at — so matching an appeared
+window against a just-vanished slot by frame is sound, and it is all that is needed. Verified from a
+live trace: `336 → 335 → 330 → 326`, each arriving tab claiming Actelligent from the tab that left,
+one hop per switch. Membership migrates rather than accumulating, which is why nothing has to know
+the full sibling set. The lesson is about scope, not about frames: the signal is valid for "did this
+window replace that one, just now", never for "which windows are tabs of each other".
+
+**A vacated slot must be *required*, not merely preferred.** `rebindReopenedWindows` sorted the
+just-vanished slot to the front and then took the first match — so `first(where:)` fell straight
+through to any other dead same-app slot when the vanished one did not match. `sharesFrame` compares
+geometry alone, and two TextEdit windows of equal size are indistinguishable by it, so switching a
+tab in one window handed it to whichever group held a stale slot for the *other*. The group loop has
+no `break`, so it could be claimed by several groups in one pass: measured in the self-test as one
+tab in two groups at once, which is exactly how it was reported ("sometimes it goes to main and
+actelligent"). When `vacatedBy:` names a slot, that slot is now the only candidate. Failing to match
+leaves the tab unfiled, which is the right way round to be wrong.
+
+**`WindowInfo.==` ignores `frame`, so `lastFrameOf` went stale for ever.** The equality guard in
+`AppDelegate.onChange` exists to stop redraws, and excluding the frame from it is correct — a move
+or resize must not redraw the strip. But `noteWindowRefs` sat *inside* that guard, so a window that
+was only moved never updated its recorded frame. Since tab matching is by identical frame, resizing
+a tabbed window once was enough to make every later tab switch lose the group and arrive unfiled
+("sometimes it goes to ungrouped"). `noteWindowRefs` now runs unconditionally; every field it writes
+is `@ObservationIgnored`, so it costs dictionary writes and no redraw.
+
+**A test whose fixture leaves `frame` nil cannot test frame matching.** The first version of
+`appearedExcludesCreated` built its windows with `WindowInfo.testInstance(...)`, whose `frame`
+defaults to nil — so `sharesFrame` was false regardless and the seizure it was meant to catch could
+never have happened. It passed with the fix *reverted*. It now runs the scenario twice and asserts
+the unguarded path really does seize the window before asserting the guarded one does not.
 
 ## Design decisions and why
 
@@ -512,10 +600,14 @@ There are no unit tests. Verification is done by driving the real app and readin
 - **The zoom clamp is reactive.** macOS gives no public way to reserve screen space; the window is
   shortened after being zoomed, so there is a brief moment where it is full height.
 - Middle-click to close a window was planned and never built.
-- **Idle CPU once measured 1%, later 6%, cause never established.** Two hypotheses — window-ID churn
-  forcing full sweeps, and a sweep every tick — were both disproven by direct measurement. The
-  likeliest benign explanation is a warm preview cache (memory rose 77MB → 116MB alongside it), but
-  that was never confirmed. Measure before assuming it is a regression.
+- **Idle CPU: most of the 6% is now accounted for.** Two early hypotheses — window-ID churn forcing
+  full sweeps, and a sweep every tick — were disproven by direct measurement and remain disproven; the
+  tick does a full AX scan only every 6th tick, as designed. Profiling a settled 33-minute-old process
+  measured 5.2% then 6.3% and split it: ~79% of the app's own CPU was the strip redraw, of which the
+  `menuSized` N-squared rasterisation above was the bulk, and only ~1 point was the engine tick's real
+  compute. Fixing the icons should remove roughly half. What is *not* yet explained is why the strip
+  redraws as often as it does — a redraw follows every `refresh()`, and whether every one of those
+  reflects a genuine change has not been checked. Measure before assuming a regression.
 - **No type-to-search in the switcher.** Searchable window switching was an original motivation and is
   the biggest capability still missing.
 - **The engine still polls** at 0.5s rather than using `AXObserver` events. Event-driven would take

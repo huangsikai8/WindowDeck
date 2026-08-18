@@ -43,6 +43,11 @@ enum SelfTest {
         clustering()
         edgeCases()
         runningState()
+        menuIconCaching()
+        capturing()
+        appearedExcludesCreated()
+        tabSwitchKeepsItsOwnSlot()
+        allGroupsRowOrdering()
         pruning()
         restoring()
 
@@ -394,6 +399,70 @@ enum SelfTest {
         check("and it does not join the holding group",
               !second.isMember(93, of: holder2))
 
+        // Switching a macOS tab swaps which window id is on screen. The outgoing
+        // and incoming tabs share a frame to the pixel, which is the only thing
+        // tying them together — titles differ, since each tab is a document.
+        let tabs = AppStore()
+        let tabGroup = tabs.groups[1].id
+        let box = CGRect(x: 100, y: 100, width: 757, height: 559)
+        let firstTab = WindowInfo.testInstance(id: 110, bundleID: "com.apple.TextEdit",
+                                               title: "Notes", frame: box)
+        tabs.windows = [firstTab]; tabs.noteWindowRefs([firstTab])
+        tabs.add(110, to: tabGroup)
+
+        let secondTab = WindowInfo.testInstance(id: 111, bundleID: "com.apple.TextEdit",
+                                                title: "Shopping list", frame: box)
+        tabs.windows = [secondTab]; tabs.noteWindowRefs([secondTab])
+        check("switching tabs keeps the group",
+              tabs.rebindReopenedWindows([111]).contains(111))
+        check("the shown tab is the member now", tabs.isMember(111, of: tabGroup))
+
+        // The path that actually runs on a tab switch: nothing is *created*, a
+        // window simply becomes visible while its sibling stops being visible.
+        let live = AppStore()
+        let liveGroup = live.groups[1].id
+        let tabA = WindowInfo.testInstance(id: 120, bundleID: "com.apple.TextEdit",
+                                           title: "First", frame: box)
+        live.windows = [tabA]; live.noteWindowRefs([tabA])
+        live.add(120, to: liveGroup)
+        live.rebindAppearedWindows()                    // establishes what is on show
+
+        let tabB = WindowInfo.testInstance(id: 121, bundleID: "com.apple.TextEdit",
+                                           title: "Second", frame: box)
+        live.windows = [tabB]; live.noteWindowRefs([tabB])
+        let switched = live.rebindAppearedWindows()
+        check("a tab that comes into view is claimed", switched.contains(121))
+        check("membership follows the visible tab", live.isMember(121, of: liveGroup))
+        check("and leaves the tab that went away", !live.isMember(120, of: liveGroup))
+
+        // A tab switch must not be refused because you were last working in some
+        // other group — that filter is for new windows only.
+        let across = AppStore()
+        let home = across.groups[1].id
+        let box2 = CGRect(x: 10, y: 10, width: 700, height: 500)
+        let t1 = WindowInfo.testInstance(id: 130, bundleID: "com.apple.TextEdit", title: "A", frame: box2)
+        across.windows = [t1]; across.noteWindowRefs([t1])
+        across.add(130, to: home)
+        across.rebindAppearedWindows()
+        let t2 = WindowInfo.testInstance(id: 131, bundleID: "com.apple.TextEdit", title: "B", frame: box2)
+        across.windows = [t2]; across.noteWindowRefs([t2])
+        check("a tab switch is not blocked by where you were working",
+              across.rebindAppearedWindows().contains(131))
+        check("the arriving tab is filed", across.isMember(131, of: home))
+
+        // A different window of the same app, at a different size, is not a tab.
+        let separate = AppStore()
+        let sepGroup = separate.groups[1].id
+        let doc = WindowInfo.testInstance(id: 112, bundleID: "com.apple.TextEdit",
+                                          title: "Doc", frame: box)
+        separate.windows = [doc]; separate.noteWindowRefs([doc])
+        separate.add(112, to: sepGroup)
+        let elsewhere = WindowInfo.testInstance(id: 113, bundleID: "com.apple.TextEdit",
+                                                title: "Other", frame: CGRect(x: 400, y: 80, width: 500, height: 400))
+        separate.windows = [elsewhere]; separate.noteWindowRefs([elsewhere])
+        check("a differently placed window is not treated as a tab",
+              !separate.rebindReopenedWindows([113]).contains(113))
+
         // A window of an unrelated app must not steal the slot.
         let other = AppStore()
         let held = WindowInfo.testInstance(id: 30, bundleID: "com.one", title: "A")
@@ -460,6 +529,214 @@ enum SelfTest {
             check("an app owning a window is marked as having one",
                   store.runningApps.withWindows.contains("com.apple.finder"))
         }
+    }
+
+    // MARK: - Menu icon memoisation
+
+    /// `NSImage.menuSized` rasterises a fresh bitmap every access, and
+    /// `groupWithTargets` asks for one per candidate window per tile per redraw
+    /// — N-squared, and once measured at 46% of the app's idle CPU. The cache is
+    /// what stops that, so assert it actually returns the *same* instance rather
+    /// than merely an equal-looking image.
+    private static func menuIconCaching() {
+        let finder = NSWorkspace.shared.runningApplications
+            .first { $0.bundleIdentifier == "com.apple.finder" }
+        // A green test that asserted nothing has happened here before: without a
+        // real running app there is no icon to cache and every check below would
+        // pass vacuously.
+        guard let pid = finder?.processIdentifier else {
+            return check("Finder is running, so there is an icon to cache", false)
+        }
+        IconCache.forget(pid: pid)
+
+        guard let first = IconCache.menuIcon(pid: pid) else {
+            return check("a running app yields a menu icon", false)
+        }
+        check("menu icon is scaled to 16pt", first.size == NSSize(width: 16, height: 16))
+
+        let second = IconCache.menuIcon(pid: pid)
+        check("menu icon is memoised, not re-rasterised", second === first)
+
+        IconCache.forget(pid: pid)
+        let third = IconCache.menuIcon(pid: pid)
+        check("forgetting a pid drops its menu icon too", third !== first)
+    }
+
+    // MARK: - Where a new window lands
+
+    private static func capturing() {
+        let store = AppStore()
+        guard store.groups.count >= 3 else { return check("two groups exist", false) }
+        let working = store.groups[1].id     // where you are actually working
+        let other = store.groups[2].id       // an app's window living elsewhere
+
+        let mine = WindowInfo.testInstance(id: 100, bundleID: "com.editor", title: "Working here")
+        let theirs = WindowInfo.testInstance(id: 101, bundleID: "com.sheets", title: "Elsewhere")
+        store.windows = [mine, theirs]
+        store.noteWindowRefs([mine, theirs])
+        store.add(100, to: working)
+        store.add(101, to: other)
+
+        // Viewing a named group is unambiguous: it wins outright.
+        store.selectGroup(working)
+        check("a named group on screen decides it",
+              store.captureTargets(focusHint: 101) == [working])
+
+        // In All, focus decides — and focus that only just changed is treated as
+        // the app being activated rather than as where you were working.
+        store.selectGroup(store.groups[0].id)
+        store.focusedWindowID = 100                 // settled: you were here
+        store.settleFocusForTesting(100)
+        store.focusedWindowID = 101                 // just now raised by a launch
+        check("a window that just took focus is not trusted",
+              store.captureTargets(focusHint: 101) == [working],
+              "\(store.captureTargets(focusHint: 101))")
+
+        // But a window you have genuinely been using is.
+        store.settleFocusForTesting(101)
+        check("a settled window is trusted",
+              store.captureTargets(focusHint: 101) == [other])
+
+        // A settled window that belongs to nothing means "no target", not "keep
+        // looking". The walk used to continue past it into `mruOrder`, which
+        // holds the whole session, so a new window was filed by arbitrarily old
+        // history and nothing was ever left unfiled.
+        let loose = WindowInfo.testInstance(id: 102, bundleID: "com.reader", title: "Unfiled")
+        store.windows = [mine, theirs, loose]
+        store.noteWindowRefs([mine, theirs, loose])
+        store.focusedWindowID = 102
+        store.settleFocusForTesting(102)
+        check("a settled but ungrouped window stops the walk",
+              store.captureTargets(focusHint: 102).isEmpty,
+              "\(store.captureTargets(focusHint: 102))")
+    }
+
+    /// A window the server reports as *created* must not be re-claimed by the
+    /// appeared path, which carries no capture intent. The created path refuses
+    /// a foreign group's stale slot; without the exclusion the very next call
+    /// handed the window over anyway.
+    ///
+    /// The frames matter: `sharesFrame` is what makes the claim possible, and an
+    /// earlier version of this test left them nil, so it passed while proving
+    /// nothing — the claim could never have happened either way.
+    private static func appearedExcludesCreated() {
+        let rect = CGRect(x: 100, y: 100, width: 757, height: 559)
+
+        func scenario(excludeCreated: Bool) -> AppStore {
+            let store = AppStore()
+            guard store.groups.count >= 3 else { return store }
+            let relic = store.groups[2].id
+
+            let dead = WindowInfo.testInstance(id: 200, bundleID: "com.browser",
+                                               title: "Old tab", frame: rect)
+            let here = WindowInfo.testInstance(id: 201, bundleID: "com.editor",
+                                               title: "Working here", frame: rect)
+            store.windows = [dead, here]
+            store.noteWindowRefs([dead, here])
+            store.add(200, to: relic)
+
+            store.rebindAppearedWindows()          // baseline of what is visible
+            store.windows = [here]                 // the relic's window closes
+            store.rebindAppearedWindows()
+
+            // A brand-new window of the same app, same size, arrives.
+            let fresh = WindowInfo.testInstance(id: 202, bundleID: "com.browser",
+                                                title: "New tab", frame: rect)
+            store.windows = [here, fresh]
+            store.noteWindowRefs([here, fresh])
+            store.rebindAppearedWindows(excluding: excludeCreated ? [202] : [])
+            return store
+        }
+
+        // The control: without the exclusion the seizure really does happen, so
+        // the assertion below is testing something.
+        let unguarded = scenario(excludeCreated: false)
+        guard unguarded.groups.count >= 3 else { return check("two groups exist", false) }
+        check("the seizure is reachable without the exclusion",
+              unguarded.isMember(202, of: unguarded.groups[2].id))
+
+        let guarded = scenario(excludeCreated: true)
+        check("a created window is not claimed by the appeared path",
+              !guarded.isMember(202, of: guarded.groups[2].id))
+    }
+
+    /// Switching a tab must only ever reclaim the slot that tab *just* vacated.
+    /// Two TextEdit windows of equal size made every other dead same-app slot a
+    /// valid match, because `sharesFrame` compares geometry alone — so a tab
+    /// switch in one window moved it into whichever group held a stale slot for
+    /// the other, sometimes into several groups at once.
+    private static func tabSwitchKeepsItsOwnSlot() {
+        let store = AppStore()
+        guard store.groups.count >= 3 else { return check("two groups exist", false) }
+        let mine = store.groups[1].id      // where the tabbed window lives
+        let other = store.groups[2].id     // holds a stale slot for the *other* window
+
+        // Both TextEdit windows are exactly the same size — the normal case.
+        let rect = CGRect(x: 0, y: 0, width: 757, height: 559)
+        let tabA = WindowInfo.testInstance(id: 300, bundleID: "com.textedit",
+                                           title: "Notes", frame: rect)
+        let windowB = WindowInfo.testInstance(id: 301, bundleID: "com.textedit",
+                                              title: "Draft", frame: rect)
+        store.windows = [tabA, windowB]
+        store.noteWindowRefs([tabA, windowB])
+        store.add(300, to: mine)
+        store.add(301, to: other)
+        store.rebindAppearedWindows()
+
+        // Window B closes, leaving a stale slot in `other`. Then a tab switch in
+        // the first window: 300 goes off screen, 302 comes on at the same rect.
+        store.windows = [tabA]
+        store.rebindAppearedWindows()
+
+        let tabB = WindowInfo.testInstance(id: 302, bundleID: "com.textedit",
+                                           title: "Shopping list", frame: rect)
+        store.windows = [tabB]
+        store.noteWindowRefs([tabB])
+        store.rebindAppearedWindows()
+
+        check("the arriving tab keeps its own group", store.isMember(302, of: mine))
+        check("the arriving tab does not join the other window's group",
+              !store.isMember(302, of: other),
+              "302 is in \(store.groupsContaining(302).count) group(s)")
+    }
+
+    // MARK: - The all-groups panel
+
+    /// The panel lists a group's windows in that group's own arrangement, so a
+    /// drag there means the same thing as a drag in the strip.
+    private static func allGroupsRowOrdering() {
+        let a = WindowInfo.testInstance(id: 1, bundleID: "com.a", title: "A")
+        let b = WindowInfo.testInstance(id: 2, bundleID: "com.b", title: "B")
+        let c = WindowInfo.testInstance(id: 3, bundleID: "com.c", title: "C")
+
+        let arranged = AllGroupsModel.ordered([a, b, c], by: ["w3", "w1", "w2"])
+        check("the group's arrangement decides the row",
+              arranged.map(\.id) == [3, 1, 2],
+              "\(arranged.map(\.id))")
+
+        // A group with no arrangement yet must keep the order it was given.
+        //
+        // Be clear about what this does and does not prove: `sorted(by:)` is not
+        // *documented* as stable, which is why `ordered` carries an index
+        // tiebreak — but the current implementation is stable in practice, at 3
+        // elements and at 40. Deleting the tiebreak does not make this check
+        // fail on this toolchain. It is kept as a guard against a future sort
+        // that honours the documented contract, and this check pins the
+        // behaviour we need rather than the mechanism that provides it.
+        let many = (1...40).map {
+            WindowInfo.testInstance(id: CGWindowID($0), bundleID: "com.many", title: "W\($0)")
+        }
+        let unarranged = AllGroupsModel.ordered(many, by: [])
+        check("no arrangement keeps the input order",
+              unarranged.map(\.id) == many.map(\.id),
+              "\(unarranged.prefix(6).map(\.id))…")
+
+        // A window the arrangement does not mention sorts last, and ties among
+        // such windows keep their relative order.
+        let partial = AllGroupsModel.ordered([a, b, c], by: ["w3"])
+        check("unarranged windows follow, in order",
+              partial.map(\.id) == [3, 1, 2],
+              "\(partial.map(\.id))")
     }
 
     // MARK: - Pruning

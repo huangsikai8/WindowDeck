@@ -186,6 +186,18 @@ final class AppStore {
     @ObservationIgnored private var knownRefs: [CGWindowID: MemberRef] = [:]
     /// When each window was last seen alive, so a slot can be told from a relic.
     @ObservationIgnored private var lastSeenAt: [CGWindowID: Date] = [:]
+    /// When each window last *took* focus, which is how a window you were working
+    /// in is told from one that was pushed in front of you a moment ago.
+    @ObservationIgnored private var focusedAt: [CGWindowID: Date] = [:]
+    /// Last known frame per window, so a tab that has gone off screen can still
+    /// be recognised by the frame it shared with its siblings.
+    @ObservationIgnored private var lastFrameOf: [CGWindowID: CGRect] = [:]
+    /// Which windows were on show last pass, so an arrival can be spotted.
+    @ObservationIgnored private var previouslyVisible: Set<CGWindowID> = []
+
+    /// Focus younger than this is treated as a side effect of whatever is
+    /// opening, not as a statement of where you were working.
+    private static let settledFocus: TimeInterval = 2
 
     /// How recently a member's window must have vanished for a new one to be
     /// treated as it returning.
@@ -598,6 +610,7 @@ final class AppStore {
 
     private func noteFocusForMRU(_ id: CGWindowID?, previous: CGWindowID?) {
         guard let id, id != previous else { return }
+        focusedAt[id] = Date()
         mruOrder.removeAll { $0 == id }
         mruOrder.insert(id, at: 0)
         // Bounded: without this it accumulates every window ever focused.
@@ -867,6 +880,11 @@ final class AppStore {
 
     // MARK: - Pinned apps
 
+    /// Backdates a window's focus so it counts as settled. Self-test only.
+    func settleFocusForTesting(_ windowID: CGWindowID) {
+        focusedAt[windowID] = Date(timeIntervalSinceNow: -60)
+    }
+
     /// Ages a window out of the recency window. Self-test only.
     func forgetLastSeenForTesting(_ windowID: CGWindowID) {
         lastSeenAt[windowID] = Date(timeIntervalSinceNow: -3600)
@@ -989,7 +1007,7 @@ final class AppStore {
                 id: "c\(cluster.id)",
                 name: cluster.customName ?? member.appName,
                 detail: "\(live) windows",
-                icon: member.icon?.menuSized,
+                icon: member.menuIcon,
                 windowID: first,
                 isCluster: true,
                 isSelf: cluster.contains(windowID)
@@ -1006,7 +1024,7 @@ final class AppStore {
                 // Long document titles make every row as wide as the worst one.
                 name: window.displayTitle.truncated(to: 34),
                 detail: window.appName,
-                icon: window.icon?.menuSized,
+                icon: window.menuIcon,
                 windowID: window.id,
                 isCluster: false,
                 isSelf: window.id == windowID
@@ -1329,17 +1347,6 @@ final class AppStore {
     /// were working in a moment ago is the only way to know which group you
     /// meant, and it is why creating windows in Actelligent filed them as
     /// unfiled.
-    // TEMPORARY — remove.
-    nonisolated static func probe(_ line: String) {
-        let path = "/private/tmp/claude-501/-Users-sikaihuang/a209dc7f-46aa-47af-9f16-1c24ddec63cd/scratchpad/capture.log"
-        let text = line + "\n"
-        if let h = FileHandle(forWritingAtPath: path) {
-            h.seekToEndOfFile(); h.write(text.data(using: .utf8)!); try? h.close()
-        } else {
-            try? text.data(using: .utf8)!.write(to: URL(fileURLWithPath: path))
-        }
-    }
-
     func captureNewWindows(_ created: Set<CGWindowID>,
                            claimedByRestore: Set<CGWindowID> = [],
                            focusHint: CGWindowID? = nil) {
@@ -1364,12 +1371,6 @@ final class AppStore {
         // groups of the window you are actually working in keeps the behaviour
         // meaningful there: open something while in a Study window and it joins
         // Study, which is what you would have wanted anyway.
-        if !created.isEmpty {   // TEMPORARY
-            let names = targets.compactMap { id in groups.first { $0.id == id }?.name }
-            let hint = focusHint.flatMap { id in windows.first { $0.id == id } }
-            Self.probe("created=\(created.sorted()) claimed=\(claimedByRestore.sorted()) active=\(activeGroup.name) hint=\(hint?.appName ?? "nil") targets=\(names) autoAdd=\(autoAddNewWindows) grace=\(now >= launchGraceEnds)")
-        }
-
         if autoAddNewWindows, !targets.isEmpty, now >= launchGraceEnds {
             for id in created.subtracting(claimedByRestore) {
                 pendingCaptures[id] = PendingCapture(groupIDs: targets, seen: now)
@@ -1522,13 +1523,121 @@ final class AppStore {
     /// so the *previous* focus is the only thing that says which group you meant.
     func captureTargets(focusHint: CGWindowID?) -> [UUID] {
         if !activeGroup.isAll { return [activeGroupID] }
-        guard let reference = focusHint ?? focusedWindowID else { return [] }
 
+        // Walk back through recent focus until a window that had *settled* is
+        // found.
+        //
+        // Opening a document activates its application, which brings that app's
+        // existing window forward — so a moment later the focused window is the
+        // app's own, not the one you were working in. Opening an Excel file from
+        // Main put the new window in Rooming for exactly this reason: Excel's
+        // Rooming window had been raised by the launch.
+        //
+        // Age is the discriminator rather than the application: pressing ⌘N in a
+        // Chrome window you have been using *should* inherit that window's groups,
+        // and there the focus is seconds old rather than milliseconds.
+        var seen: Set<CGWindowID> = []
+        let candidates = ([focusHint].compactMap { $0 } + mruOrder).filter { seen.insert($0).inserted }
+        let now = Date()
+
+        for id in candidates {
+            if let since = focusedAt[id], now.timeIntervalSince(since) < Self.settledFocus {
+                continue
+            }
+            // The first *settled* candidate is the answer whatever it owns.
+            // Walking past one that owns nothing looked harmless and is not:
+            // `mruOrder` holds up to 200 windows for the whole session, so the
+            // walk almost always finds something grouped eventually, and a new
+            // window gets filed by twenty-minute-old history. Being unfiled is a
+            // legitimate state — All draws those windows deliberately — so an
+            // ungrouped window you have settled in means "no target", not
+            // "keep looking".
+            let owning = groups.filter { !$0.isAll && $0.memberIDs.contains(id) }.map(\.id)
+            if !owning.isEmpty { return owning }
+            if let queued = pendingCaptures[id] { return queued.groupIDs }
+            return []
+        }
+
+        // Nothing settled — fall back to the newest focus rather than nothing, so
+        // a window opened immediately after a switch still lands somewhere.
+        guard let reference = focusHint ?? focusedWindowID else { return [] }
         var found = groups.filter { !$0.isAll && $0.memberIDs.contains(reference) }.map(\.id)
         if found.isEmpty, let queued = pendingCaptures[reference] { found = queued.groupIDs }
-        if found.isEmpty, let current = focusedWindowID,
-           let queued = pendingCaptures[current] { found = queued.groupIDs }
         return found
+    }
+
+    /// Re-attaches a window that has just *become visible* to a slot whose window
+    /// has just stopped being visible.
+    ///
+    /// Separate from `rebindReopenedWindows` because of what triggers it. That one
+    /// runs on windows the window server reports as **created**, and switching a
+    /// macOS tab creates nothing: every tab's window already exists, ordered out
+    /// off screen, and switching merely swaps which one is on screen. So a tab
+    /// switch never reached the rebinding path at all, and a filed tab left its
+    /// group the moment you moved off it.
+    /// Deliberately takes no capture intent.
+    ///
+    /// `preferring:` exists so that opening a *new* window in one group is not
+    /// seized by another group's stale slot. A window merely coming into view is
+    /// not a new window and carries no such intent — applying the filter here
+    /// meant that whenever the intent named a different group, a tab switch was
+    /// refused and the tab arrived unfiled. Which is precisely the reported bug:
+    /// `APPEARED 334[in=[]] VANISHED 333[in=["Actelligent"]] intended=["Main"]`.
+    ///
+    /// `excluding` must be the ids the window server reported as *created* this
+    /// pass. A created window is also, by construction, one that "appeared" —
+    /// nothing in the set arithmetic distinguishes them. Without this the created
+    /// path's whole point is undone a line later: `captureTargets(focusHint:)`
+    /// computes the intent, `rebindReopenedWindows(_:preferring:)` refuses a
+    /// foreign group's stale slot, and then this function re-runs the same
+    /// matcher over the same window with **no intent filter at all** and the
+    /// claim succeeds. Measured shape of the bug: pressing ⌘N while working in
+    /// one group filed the window into a different group that held a same-app
+    /// slot closed moments earlier. A tab switch never coincides with a create
+    /// for the same id, so excluding them costs this feature nothing.
+    /// Re-attaches a window that has just *become visible* to a slot whose window
+    /// has just stopped being visible.
+    ///
+    /// Separate from `rebindReopenedWindows` because of what triggers it. That one
+    /// runs on windows the window server reports as **created**, and switching a
+    /// macOS tab creates nothing: every tab's window already exists, ordered out
+    /// off screen, and switching merely swaps which one is on screen. So a tab
+    /// switch never reached the rebinding path at all, and a filed tab left its
+    /// group the moment you moved off it.
+    /// Deliberately takes no capture intent.
+    ///
+    /// `preferring:` exists so that opening a *new* window in one group is not
+    /// seized by another group's stale slot. A window merely coming into view is
+    /// not a new window and carries no such intent — applying the filter here
+    /// meant that whenever the intent named a different group, a tab switch was
+    /// refused and the tab arrived unfiled. Which is precisely the reported bug:
+    /// `APPEARED 334[in=[]] VANISHED 333[in=["Actelligent"]] intended=["Main"]`.
+    ///
+    /// `excluding` must be the ids the window server reported as *created* this
+    /// pass. A created window is also, by construction, one that "appeared" —
+    /// nothing in the set arithmetic distinguishes them. Without this the created
+    /// path's whole point is undone a line later: `captureTargets(focusHint:)`
+    /// computes the intent, `rebindReopenedWindows(_:preferring:)` refuses a
+    /// foreign group's stale slot, and then this function re-runs the same
+    /// matcher over the same window with **no intent filter at all** and the
+    /// claim succeeds. Measured shape of the bug: pressing ⌘N while working in
+    /// one group filed the window into a different group that held a same-app
+    /// slot closed moments earlier. A tab switch never coincides with a create
+    /// for the same id, so excluding them costs this feature nothing.
+    @discardableResult
+    func rebindAppearedWindows(excluding created: Set<CGWindowID> = []) -> Set<CGWindowID> {
+        let visible = Set(windows.map(\.id))
+        defer { previouslyVisible = visible }
+        // Nothing to compare against on the first pass; everything would look new.
+        guard !previouslyVisible.isEmpty else { return [] }
+
+        let appeared = visible.subtracting(previouslyVisible).subtracting(created)
+        let vanished = previouslyVisible.subtracting(visible)
+
+        guard !appeared.isEmpty else { return [] }
+        // The slot that just went away is the one to take, so membership does not
+        // wander to some other same-frame sibling.
+        return rebindReopenedWindows(appeared, preferring: [], vacatedBy: vanished)
     }
 
     /// Re-attaches a reopened window to the slot its predecessor held.
@@ -1545,7 +1654,8 @@ final class AppStore {
     /// Returns the ids it claimed so they aren't also swept up as brand new.
     @discardableResult
     func rebindReopenedWindows(_ created: Set<CGWindowID>,
-                               preferring intended: [UUID] = []) -> Set<CGWindowID> {
+                               preferring intended: [UUID] = [],
+                               vacatedBy vanished: Set<CGWindowID> = []) -> Set<CGWindowID> {
         guard !created.isEmpty else { return [] }
         let live = Set(windows.map(\.id))
         var claimed: Set<CGWindowID> = []
@@ -1583,16 +1693,39 @@ final class AppStore {
                 // A window genuinely returning after a red-button close comes
                 // back with the title it had, so requiring that costs nothing
                 // real and stops one group stealing another's new windows.
-                guard let oldID = groups[index].memberIDs.first(where: { id in
+                // Prefer a slot whose window has *just* gone, when one is named.
+                // When a slot is named as *just vacated* this is a tab switch,
+                // and only that slot may be claimed. Merely sorting it to the
+                // front was not enough: `first(where:)` still fell through to any
+                // other dead same-app slot, and `sharesFrame` matches on geometry
+                // alone — so with two TextEdit windows of equal size, switching a
+                // tab in one handed it to whatever group held a stale slot for
+                // the other. It could be claimed by several groups in one pass,
+                // which is how one tab ended up in two groups at once.
+                //
+                // Failing to match now means the tab arrives unfiled, which is
+                // the right way round to be wrong: a window missing from a group
+                // is recoverable, a window silently moved into someone else's is
+                // how hand-built groups rot.
+                let candidates = vanished.isEmpty
+                    ? Array(groups[index].memberIDs)
+                    : groups[index].memberIDs.filter { vanished.contains($0) }
+                guard let oldID = candidates.first(where: { id in
                     guard !live.contains(id), let ref = knownRefs[id],
                           ref.bundleID == bundleID,
                           let seen = lastSeenAt[id],
                           Date().timeIntervalSince(seen) < Self.rebindWindow
                     else { return false }
+                    // Title, or an identical frame. The frame is what identifies
+                    // a macOS tab: switching tabs swaps which window id is on
+                    // screen, and the outgoing and incoming tabs of one window
+                    // occupy exactly the same rectangle. Without this, filing a
+                    // TextEdit tab into a group lost it the moment you switched
+                    // tabs, and the newly shown tab arrived unfiled.
                     return ref.matches(window) || ref.looselyMatches(window)
+                        || sharesFrame(id, with: window)
                 }) else { continue }
 
-                Self.probe("REBIND \(newID) -> \(groups[index].name) (was \(oldID))")   // TEMPORARY
                 groups[index].memberIDs.remove(oldID)
                 groups[index].memberIDs.insert(newID)
                 if let slot = groups[index].order.firstIndex(of: "w\(oldID)") {
@@ -1607,6 +1740,14 @@ final class AppStore {
         return claimed
     }
 
+    /// Same rectangle to the pixel, which for two windows of one application
+    /// means they are tabs of the same window.
+    private func sharesFrame(_ id: CGWindowID, with window: WindowInfo) -> Bool {
+        guard let a = lastFrameOf[id], let b = window.frame,
+              a.width > 1, a.height > 1 else { return false }
+        return a == b
+    }
+
     private func vacantMemberID(in order: [String], for window: WindowInfo,
                                 live: Set<CGWindowID>) -> CGWindowID? {
         for key in order where key.hasPrefix("w") {
@@ -1615,6 +1756,7 @@ final class AppStore {
                   let seen = lastSeenAt[id],
                   Date().timeIntervalSince(seen) < Self.rebindWindow,
                   ref.matches(window) || ref.looselyMatches(window)
+                    || sharesFrame(id, with: window)
             else { continue }
             return id
         }
@@ -1849,6 +1991,7 @@ final class AppStore {
         let now = Date()
         for window in windows {
             lastSeenAt[window.id] = now
+            if let frame = window.frame { lastFrameOf[window.id] = frame }
             guard let bundleID = window.bundleID else { continue }
             knownRefs[window.id] = MemberRef(bundleID: bundleID, title: window.title,
                                              windowID: window.id)

@@ -478,9 +478,13 @@ final class WindowEngine {
         }
 
         // Zero-size and tiny windows are offscreen scratch windows some apps keep.
-        if !isMinimized, let size = AX.size(element),
+        let size = AX.size(element)
+        if !isMinimized, let size,
            size.width < minimumWindowSide || size.height < minimumWindowSide {
             return nil
+        }
+        let frame = size.flatMap { size in
+            AX.position(element).map { CGRect(origin: $0, size: size) }
         }
 
         return WindowInfo(
@@ -490,6 +494,7 @@ final class WindowEngine {
             appName: appName,
             title: title,
             isMinimized: isMinimized,
+            frame: frame,
             element: element
         )
     }
