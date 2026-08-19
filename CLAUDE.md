@@ -667,12 +667,31 @@ departures from it. The rule: ask before tearing down, and hold for exactly as l
 drawn. `release` can now only ever *extend* a linger, never cut one short, so a panel that was never
 shown cannot take warmth from one that was; `chill()` is the deliberate way to go cold.
 
-**The stack's list uses the switcher's tile, and one row that scrolls.** These are windows of a single
-application, so titles routinely fail to distinguish them — "New Tab" three times — and the content is
-the only discriminator; a 92×24 strip of a 16:10 window showed a horizontal slice of nothing. It wraps
-to no second row on purpose: a second row pushes the first one upward as the panel grows, so the tile
-being reached for moves while it is being reached for. Scrolling sideways leaves every tile where it
-was.
+**The stack's list uses the switcher's tile geometry and the hover preview's skin.** These are windows
+of a single application, so titles routinely fail to distinguish them — "New Tab" three times — and the
+content is the only discriminator; a 92×24 strip of a 16:10 window showed a horizontal slice of nothing,
+which is why the tile is the switcher's 158×122. It wraps to no second row on purpose: a second row
+pushes the first one upward as the panel grows, so the tile being reached for moves while it is being
+reached for. Scrolling sideways leaves every tile where it was.
+
+The *appearance* is the window preview's, though, and taking the switcher's whole look was a mistake
+worth naming. Hovering a window and hovering a stacked app are the same gesture a few pixels apart on
+the same bar, so they came up in two different skins — the preview's `.popover` plate beside the
+switcher's dark HUD ground — and it read as two apps rather than as one strip. The switcher is the odd
+one out **on purpose**: it is a keyboard mode that takes over the screen, and a dark ground is what says
+the rest is suspended. Nothing is suspended when you hover. Two things the borrowed skin had hidden in
+it: the tiles cropped to `.fill` because a fixed grid has to be full, where a list of near-identical
+windows needs the real proportions (`.fit` in a faint plate, exactly as the preview draws its
+thumbnail); and every highlight was hardcoded **white**, which is invisible on a popover in light
+appearance. Anything drawn on this panel goes in `.primary`, since it no longer supplies its own ground.
+
+**A row peeks, like the preview does.** Resting on a window in the list draws it full size at its real
+screen rect through the same `PeekOverlayController` contract — a captured image, nothing raised or
+reordered, only the click commits. It is the escalation the list needed most: a stacked app's windows
+are precisely the ones a thumbnail serves worst. Its own overlay instance rather than
+`HoverController`'s, since the two panels are never up together and sharing one would mean owning the
+other's teardown. The row hover carries the same enter-before-exit ordering guard the tiles do, keyed on
+the window id: without it, sliding along the list cancelled each peek with the previous row's exit.
 
 **A hover guard must recognise its subject from the moment the pointer arrives, not from the moment
 the panel appears.** `AppStackPanel`'s exit path identified its own stack by `model.bundleID`, which is
@@ -794,7 +813,7 @@ something that fits on a screen.
 WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
 ```
 
-~218 checks, about a second, covering persistence (legacy files, a changed field type degrading rather
+~223 checks, about a second, covering persistence (legacy files, a changed field type degrading rather
 than wiping the file, round-trips), ordering, restore matching, membership moves, pruning, clustering,
 app stacks, switcher candidate ordering and scope, section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never
 touch the real state file — destructive persistence tests once left fabricated groups in the running

@@ -111,6 +111,7 @@ final class DeckController {
             // full delay while a thumbnail was still visibly up. Nothing left
             // the bar; this is a handover, not a departure. Both run in one
             // turn, so the preview never draws a frame alongside the list.
+            self.stackPanel.mode = self.store.previewMode
             self.stackPanel.hover(
                 bundleID: bundleID,
                 name: name,

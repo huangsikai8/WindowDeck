@@ -44,6 +44,25 @@ final class AppStackPanel {
     /// warmth is given up and it has no timings of its own.
     private var warmWindow: TimeInterval = HoverTimings.defaults.warmWindow
 
+    /// Stage two, exactly as the window preview has it: resting on a row draws
+    /// that window full size where it really sits.
+    ///
+    /// A stacked app's windows are the ones a thumbnail serves worst — several
+    /// windows of one application, often with the same title — so the escalation
+    /// this list was missing is the one it needs most. Its own overlay
+    /// controller rather than `HoverController`'s: the two panels are never up
+    /// together, and sharing one would mean either owning the other's teardown
+    /// or leaving an image behind when the wrong one hides.
+    private let peek = PeekOverlayController()
+    private var peekWork: DispatchWorkItem?
+    /// The row the pointer is on, so a capture that lands late can tell whether
+    /// it is still wanted.
+    private var peekWindowID: CGWindowID?
+    private var timings: HoverTimings = .defaults
+    /// Whether the peek stage is enabled at all. Set from the store on every
+    /// hover, like the timings, so Settings applies without a restart.
+    var mode: PreviewMode = .thumbnailAndPeek
+
     /// Same tile as the switcher's grid, deliberately. These are windows of one
     /// application, so the *content* is what tells them apart — Chrome titles are
     /// routinely identical — and the switcher already sizes a window preview
@@ -91,6 +110,13 @@ final class AppStackPanel {
             guard let self else { return }
             isOverPanel = hovering
             if hovering { hideWork?.cancel() } else { scheduleHide() }
+            // Leaving the plate altogether ends the peek, whatever the rows
+            // reported. Sliding off the edge of the list can deliver the panel's
+            // exit without the tile's.
+            if !hovering { endPeek() }
+        }
+        model.onHoverWindow = { [weak self] window, hovering in
+            self?.rowHover(window, entering: hovering)
         }
     }
 
@@ -102,6 +128,18 @@ final class AppStackPanel {
     var hasPendingShowForTesting: Bool {
         guard let showWork else { return false }
         return !showWork.isCancelled
+    }
+
+    /// Whether a peek is still scheduled for a row, on the same terms and for
+    /// the same reason as `hasPendingShowForTesting`.
+    var hasPendingPeekForTesting: Bool {
+        guard let peekWork else { return false }
+        return !peekWork.isCancelled
+    }
+
+    /// Drives one row's hover from the self-test, which has no pointer.
+    func rowHoverForTesting(_ window: WindowInfo, entering: Bool) {
+        rowHover(window, entering: entering)
     }
 
     // MARK: - Hover
@@ -135,6 +173,7 @@ final class AppStackPanel {
             return
         }
 
+        self.timings = timings
         warmWindow = timings.warmWindow
         hideWork?.cancel()
         showWork?.cancel()
@@ -207,6 +246,11 @@ final class AppStackPanel {
         guard model.images[window.id] == nil,
               !pendingCaptures.contains(window.id) else { return }
         pendingCaptures.insert(window.id)
+        // Mirrored into the model so a row can show that its image is on the
+        // way rather than standing in with an icon. The distinction matters:
+        // an icon that never becomes a thumbnail is what Screen Recording being
+        // refused looks like, and it should not be what waiting looks like too.
+        model.loading.insert(window.id)
 
         Task { [weak self] in
             guard let self else { return }
@@ -216,9 +260,60 @@ final class AppStackPanel {
                 maxAge: PreviewService.switcherMaxAge
             )
             pendingCaptures.remove(window.id)
+            model.loading.remove(window.id)
             guard panel.isVisible, let image else { return }
             model.images[window.id] = image
         }
+    }
+
+    // MARK: - Peek
+
+    /// Resting on a row draws that window full size where it really sits.
+    ///
+    /// Same contract as the window preview's: nothing is raised, activated or
+    /// reordered — only a captured image over the window's own rect — so a
+    /// mis-hover costs nothing and needs no undo. Only the click commits.
+    private func rowHover(_ window: WindowInfo, entering: Bool) {
+        guard entering else {
+            // The pointer is somewhere else on the list now, so a stale exit
+            // from the row it just left must not take down the peek that row
+            // has already scheduled. Same guard, same reason, as the tile hover
+            // above: SwiftUI delivers the new row's enter first.
+            guard peekWindowID == window.id else { return }
+            endPeek()
+            return
+        }
+
+        peekWork?.cancel()
+        peekWindowID = window.id
+        // A minimised window has nothing on screen to draw over, so there is no
+        // rect the illusion could work at.
+        guard mode.wantsPeek, !window.isMinimized else {
+            peek.hide()
+            return
+        }
+
+        let work = DispatchWorkItem { [weak self] in self?.presentPeek(window) }
+        peekWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + timings.peekDelay, execute: work)
+    }
+
+    private func presentPeek(_ window: WindowInfo) {
+        Task { [weak self] in
+            guard let self else { return }
+            guard let capture = await PreviewService.shared.fullSizeCapture(for: window) else { return }
+            // The capture is asynchronous and the pointer keeps moving; by the
+            // time it lands the row may have changed or the list may be gone.
+            guard self.peekWindowID == window.id, self.panel.isVisible else { return }
+            self.peek.show(image: capture.image, at: capture.screenRect)
+        }
+    }
+
+    private func endPeek() {
+        peekWork?.cancel()
+        peekWork = nil
+        peekWindowID = nil
+        peek.hide()
     }
 
     private func scheduleHide() {
@@ -243,6 +338,7 @@ final class AppStackPanel {
     }
 
     func hide() {
+        endPeek()
         // The linger is only earned by a panel that was actually up. Crossing a
         // stacked icon without pausing comes through here too, and granting it
         // warmth would let a pointer merely sweeping the bar make the next tile
@@ -256,6 +352,7 @@ final class AppStackPanel {
         isOverPanel = false
         current = nil
         pendingCaptures.removeAll()
+        model.loading.removeAll()
         model.bundleID = nil
         panel.orderOut(nil)
     }
@@ -291,9 +388,13 @@ final class AppStackModel {
     var appName: String = ""
     var windows: [WindowInfo] = []
     var images: [CGWindowID: NSImage] = [:]
+    /// Rows with a capture in flight.
+    var loading: Set<CGWindowID> = []
 
     @ObservationIgnored var onSelect: ((WindowInfo) -> Void)?
     @ObservationIgnored var onHoverPanel: ((Bool) -> Void)?
+    /// One row entered or left, for the peek.
+    @ObservationIgnored var onHoverWindow: ((WindowInfo, Bool) -> Void)?
     /// Asked to capture a window with no image yet.
     @ObservationIgnored var onNeedsImage: ((WindowInfo) -> Void)?
 
@@ -323,9 +424,12 @@ private struct AppStackContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // The window preview's caption, in the same size and weight. It sits
+            // above the rows rather than below them because there are several
+            // of them and it names the set, not one window.
             Text("\(model.appName) — \(model.windows.count) windows")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.75))
+                .font(.system(size: 11.5, weight: .medium))
+                .lineLimit(1)
                 .frame(height: AppStackModel.headerHeight, alignment: .leading)
 
             // One row, scrolling sideways when it overflows.
@@ -337,10 +441,14 @@ private struct AppStackContent: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: AppStackPanel.tileSpacing) {
                     ForEach(model.windows) { window in
-                        AppStackTileView(window: window, image: model.images[window.id]) {
-                            model.onSelect?(window)
-                        }
-                        .onAppear { 
+                        AppStackTileView(
+                            window: window,
+                            image: model.images[window.id],
+                            isLoading: model.loading.contains(window.id),
+                            onHover: { model.onHoverWindow?(window, $0) },
+                            onSelect: { model.onSelect?(window) }
+                        )
+                        .onAppear {
                             if model.images[window.id] == nil { model.onNeedsImage?(window) }
                         }
                     }
@@ -349,19 +457,18 @@ private struct AppStackContent: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        // The switcher's ground, for the same reason it has one: a definite dark
-        // backing rather than whatever is behind the panel, so thumbnails read
-        // consistently instead of taking their contrast from the desktop.
-        .background {
-            ZStack {
-                VisualEffectBackground(material: .hudWindow)
-                Color.black.opacity(0.34)
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        // The window preview's plate, deliberately, and *not* the switcher's
+        // dark HUD any more. These two panels answer the same gesture a few
+        // pixels apart on the same bar — hover a window, hover a stacked app —
+        // so arriving at a stacked icon should look like arriving anywhere else
+        // on the strip. The switcher is the odd one out on purpose: it is a
+        // keyboard mode that takes over the screen, where a dark ground is what
+        // says the rest is suspended. Nothing is suspended here.
+        .background(VisualEffectBackground(material: .popover))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(.white.opacity(0.16), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
         )
         .onHover { model.onHoverPanel?($0) }
     }
@@ -371,9 +478,20 @@ private struct AppStackContent: View {
 ///
 /// The title is under *every* tile rather than only the hovered one, so the
 /// whole set can be read without sweeping the pointer along it.
+///
+/// Drawn like the window preview's thumbnail rather than the switcher's:
+/// `.fit` inside a faint plate, so the image is the window's real proportions.
+/// The switcher crops to `.fill` because its grid is fixed and every cell has to
+/// be full; here a cropped 16:10 window shown 136pt wide was a horizontal slice
+/// of somebody's content, which is the opposite of what a list of near-identical
+/// windows needs.
 private struct AppStackTileView: View {
     let window: WindowInfo
     let image: NSImage?
+    /// A capture is on its way. Distinguished from having none so that waiting
+    /// and refused-permission do not look the same.
+    let isLoading: Bool
+    let onHover: (Bool) -> Void
     let onSelect: () -> Void
 
     @State private var isHovering = false
@@ -385,29 +503,34 @@ private struct AppStackTileView: View {
         Button(action: onSelect) {
             VStack(spacing: 6) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(.white.opacity(0.06))
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(.primary.opacity(0.06))
 
                     if let image {
                         Image(nsImage: image)
                             .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: thumbWidth, height: thumbHeight)
-                            .clipped()
+                            .aspectRatio(contentMode: .fit)
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    } else if isLoading {
+                        ProgressView().controlSize(.small)
                     } else if let icon = window.icon {
-                        // No capture yet, or Screen Recording refused. The icon
-                        // stands in rather than the panel refusing to open.
+                        // No capture and none coming — Screen Recording refused,
+                        // or the window vanished. The icon stands in rather than
+                        // the row sitting empty.
                         Image(nsImage: icon)
                             .resizable()
                             .frame(width: 32, height: 32)
                     }
                 }
                 .frame(width: thumbWidth, height: thumbHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                // Fades rather than pops as the capture arrives, exactly as the
+                // window preview does.
+                .opacity(image == nil ? 0.55 : 1)
+                .animation(.easeOut(duration: 0.12), value: image != nil)
 
                 Text(window.displayTitle.truncated(to: 30))
                     .font(.system(size: 10.5))
-                    .foregroundStyle(.white.opacity(isHovering ? 1 : 0.72))
+                    .foregroundStyle(.primary.opacity(isHovering ? 1 : 0.7))
                     .lineLimit(1)
                     // Middle, not tail: two Chrome windows on the same site share
                     // a prefix, so the tail is what tells them apart.
@@ -416,17 +539,24 @@ private struct AppStackTileView: View {
             }
             .padding(7)
             .frame(width: AppStackPanel.tileWidth, height: AppStackPanel.tileHeight)
+            // Selection drawn in `.primary`, not white. On the popover material
+            // this panel now uses, a white plate and a white ring are invisible
+            // in light appearance — the switcher can hardcode white because it
+            // supplies its own dark ground and this no longer does.
             .background(
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(.white.opacity(isHovering ? 0.16 : 0))
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(.primary.opacity(isHovering ? 0.10 : 0))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .strokeBorder(.white.opacity(isHovering ? 0.9 : 0), lineWidth: 1.5)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(.primary.opacity(isHovering ? 0.45 : 0), lineWidth: 1.5)
             )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
+        .onHover {
+            isHovering = $0
+            onHover($0)
+        }
     }
 }

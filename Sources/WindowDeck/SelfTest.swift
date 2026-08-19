@@ -1330,6 +1330,40 @@ enum SelfTest {
         panel.hide()
         check("warmth ends with the panel when nothing lingers",
               !StripWarmth.shared.isWarm)
+
+        // Resting on a row peeks that window full size, which is the stage the
+        // list was missing: a stacked app's windows are the ones a thumbnail
+        // serves worst, since they share an application and often a title.
+        let b = WindowInfo.testInstance(id: 2, bundleID: "com.a", title: "B")
+        let hidden = WindowInfo.testInstance(id: 3, bundleID: "com.a", title: "C",
+                                             isMinimized: true)
+        panel.mode = .thumbnailAndPeek
+        panel.rowHoverForTesting(a, entering: true)
+        check("resting on a row schedules a peek", panel.hasPendingPeekForTesting)
+
+        // Sliding to the next row: SwiftUI delivers the new row's enter first,
+        // so the stale exit must leave the newer row's peek alone — the same
+        // ordering that governs the tiles on the strip.
+        panel.rowHoverForTesting(b, entering: true)
+        panel.rowHoverForTesting(a, entering: false)
+        check("a stale row exit leaves the newer row's peek scheduled",
+              panel.hasPendingPeekForTesting)
+        panel.rowHoverForTesting(b, entering: false)
+        check("leaving the row it was scheduled for cancels the peek",
+              !panel.hasPendingPeekForTesting)
+
+        // A minimised window has no rectangle on screen to draw over, so there
+        // is nothing the illusion could be placed at.
+        panel.rowHoverForTesting(hidden, entering: true)
+        check("a minimised row schedules nothing", !panel.hasPendingPeekForTesting)
+
+        // Off means off: the peek stage is a permission-hungry escalation and
+        // the setting has to reach this panel too, not just the window preview.
+        panel.mode = .thumbnail
+        panel.rowHoverForTesting(a, entering: true)
+        check("the peek stage honours the preview mode", !panel.hasPendingPeekForTesting)
+        panel.mode = .thumbnailAndPeek
+        panel.hide()
     }
 
     // MARK: - Diagnostics log

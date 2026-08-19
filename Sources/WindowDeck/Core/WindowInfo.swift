@@ -96,14 +96,15 @@ extension WindowInfo {
     ///   application and any test of that scoping vacuous. Set it whenever the
     ///   thing under test distinguishes applications.
     static func testInstance(id: CGWindowID, bundleID: String, title: String,
-                             frame: CGRect? = nil, pid: pid_t = 0) -> WindowInfo {
+                             frame: CGRect? = nil, pid: pid_t = 0,
+                             isMinimized: Bool = false) -> WindowInfo {
         WindowInfo(
             id: id,
             pid: pid,
             bundleID: bundleID,
             appName: bundleID,
             title: title,
-            isMinimized: false,
+            isMinimized: isMinimized,
             frame: frame,
             element: AXUIElementCreateApplication(0)
         )
