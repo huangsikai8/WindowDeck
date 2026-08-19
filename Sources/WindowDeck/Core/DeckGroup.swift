@@ -116,18 +116,25 @@ struct DeckGroup: Identifiable, Hashable {
     /// window ids to go stale, nothing to prune, and nothing for
     /// `rebindReopenedWindows` to repair.
     var stackedAppBundleIDs: Set<String> = []
-    /// The built-in "All" group: shows every window, can't be renamed, deleted,
-    /// or moved out of first position, and is the only group with pinned apps.
-    let isAll: Bool
+    /// The fallback group — "Main".
+    ///
+    /// Every window that no other group claims is drawn in it, so its membership
+    /// is *implicit*: `memberIDs` stays empty and the strip computes the
+    /// complement. That is what makes "if it isn't filed, it goes to Main" free
+    /// — a newly opened window needs no capture, no rebind and no bookkeeping to
+    /// land somewhere sensible. It cannot be deleted and always sorts first;
+    /// unlike the retired "All" group it is otherwise ordinary, with its own
+    /// name, colour, launchers, clusters and arrangement.
+    let isMain: Bool
 
     var color: GroupColor {
-        isAll ? .neutral : GroupColor.from(index: colorIndex)
+        GroupColor.from(index: colorIndex)
     }
 
     /// What the strip actually draws: the custom colour if one was picked,
     /// otherwise the preset. Everything user-facing goes through this.
     var displayColor: Color {
-        if !isAll, let hex = customColorHex, let custom = Color(hex: hex) { return custom }
+        if let hex = customColorHex, let custom = Color(hex: hex) { return custom }
         return color.color
     }
 
@@ -144,7 +151,7 @@ struct DeckGroup: Identifiable, Hashable {
         clusters: [WindowCluster] = [],
         pinnedApps: [PinnedApp] = [],
         stackedAppBundleIDs: Set<String> = [],
-        isAll: Bool = false
+        isMain: Bool = false
     ) {
         self.pinnedApps = pinnedApps
         self.stackedAppBundleIDs = stackedAppBundleIDs
@@ -158,28 +165,7 @@ struct DeckGroup: Identifiable, Hashable {
         self.savedMembers = savedMembers
         self.savedOrder = savedOrder
         self.clusters = clusters
-        self.isAll = isAll
-    }
-
-    /// The built-in group keeps a fixed id across launches so the active-group
-    /// setting can name it.
-    static let allGroupID = UUID(uuidString: "00000000-0000-0000-0000-0000574E4441")!
-
-    static func allGroup(order: [String] = [], savedOrder: [OrderRef] = [],
-                         clusters: [WindowCluster] = [],
-                         pinnedApps: [PinnedApp] = [],
-                         stackedAppBundleIDs: Set<String> = []) -> DeckGroup {
-        DeckGroup(
-            id: allGroupID,
-            name: "All",
-            order: order,
-            colorIndex: GroupColor.neutral.rawValue,
-            savedOrder: savedOrder,
-            clusters: clusters,
-            pinnedApps: pinnedApps,
-            stackedAppBundleIDs: stackedAppBundleIDs,
-            isAll: true
-        )
+        self.isMain = isMain
     }
 
     /// Clusters whose membership has fallen below two windows are meaningless

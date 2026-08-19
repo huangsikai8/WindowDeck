@@ -21,13 +21,13 @@ enum DeckLayout {
         let width: CGFloat
         let showsTitle: Bool
         let iconSize: CGFloat
-        /// Which pill this slot was drawn for, or nil outside pill view.
+        /// Which capsule this slot was drawn for.
         var sectionID: String?
-        /// The section takes part in the identity because pill view draws the
-        /// same window once per group it belongs to. Without it those copies
-        /// share one id, and SwiftUI cannot reconcile two views claiming to be
-        /// the same thing — which is what rendered the switcher rotated with two
-        /// highlights the last time it happened.
+        /// The section takes part in the identity because a launcher can be
+        /// pinned in more than one capsule, so the same item id genuinely
+        /// appears twice in the row. Two views sharing one identity is what
+        /// rendered the switcher rotated with two highlights the last time it
+        /// happened, so this stays even though windows are now drawn once.
         var id: String { sectionID.map { "\($0)/\(item.id)" } ?? item.id }
     }
 
@@ -119,13 +119,7 @@ enum DeckLayout {
         // anything else — unaccounted, it pushes the row past the edge.
         // Each separator costs width like anything else — unaccounted, the row
         // runs past the strip's edge and the last icons clip.
-        var ghostChrome: CGFloat = CGFloat(dividerCount) * (DeckMetrics.dividerWidth + spacing)
-        if dividerCount == 0 {
-            // Flat view: the separators are decided per item rather than per
-            // section.
-            if items.contains(where: \.isGhost) { ghostChrome += DeckMetrics.dividerWidth + spacing }
-            if items.contains(where: \.isUngrouped) { ghostChrome += DeckMetrics.dividerWidth + spacing }
-        }
+        let dividerChrome = CGFloat(dividerCount) * (DeckMetrics.dividerWidth + spacing)
         // Each capsule costs its own padding on both sides plus the gap to its
         // neighbour. Unaccounted, a bucketed All runs past the strip's edge —
         // the same failure separators caused before they were charged for.
@@ -139,7 +133,7 @@ enum DeckLayout {
                 + DeckMetrics.dividerWidth + spacing * 2
             : 0
         let chrome = chromeWidth(pinnedCount: pinnedCount, spacing: spacing)
-            + ghostChrome + pillChrome + overflowChrome + interSectionGaps
+            + dividerChrome + pillChrome + overflowChrome + interSectionGaps
 
         guard !items.isEmpty else {
             return Result(slots: [], spacing: spacing,

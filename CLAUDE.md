@@ -1,11 +1,22 @@
 # WindowDeck
 
 A macOS Dock replacement that groups **individual windows** rather than apps. One horizontal strip at
-the bottom of the screen, with a drop-up selector switching between named arrangements ("All", "Work",
-"Study"…). Two windows of the same app can live in different groups — that requirement is the reason
-the whole thing is window-level rather than app-level, and it rules out most simpler designs.
+the bottom of the screen showing **every window at once, bucketed into a capsule per group** — Main,
+Work, Study — each tinted with its group's colour. Two windows of the same app can live in different
+capsules; that requirement is the reason the whole thing is window-level rather than app-level, and it
+rules out most simpler designs.
 
 Built to avoid macOS Spaces entirely: one Desktop, logical groups instead of virtual ones.
+
+**A window is drawn in exactly one capsule.** Anything no group claims belongs to **Main**, the
+fallback — so Main's membership is never written down, it is the complement of everyone else's. That
+is what makes "if it isn't filed, it goes to Main" free: a newly opened window needs no bookkeeping to
+land somewhere sensible.
+
+**There is no switching.** The strip does not have a current group, because every group is on it.
+There *is* an active group, but it is derived and never chosen: the one holding the focused window. It
+decides exactly one thing — which capsule a newly opened window joins — and the strip rings that
+capsule so you can see where the next window will go.
 
 ---
 
@@ -47,8 +58,10 @@ The app cannot be shared: self-signed and un-notarised, so another Mac would blo
 | Permission | Needed for | Notes |
 |---|---|---|
 | **Accessibility** | Everything. Window titles, raising a specific window, global hotkeys | Without it the app is inert |
-| **Screen Recording** | Hover thumbnails and the switcher previews only | Optional — `previewMode = .off` never requests it |
-| **Input Monitoring** | Swipe-anywhere group switching only | Optional and off by default; the broadest of the three |
+| **Screen Recording** | Hover thumbnails, the stack list and the peek only | Optional — `previewMode = .off` never requests it |
+
+Input Monitoring is no longer asked for. It powered swipe-anywhere group switching, and there is
+nothing to switch between now — see "Removed, and why".
 
 Window titles are read through the **Accessibility API, never `kCGWindowName`**. That is deliberate:
 `kCGWindowName` requires Screen Recording, so reading titles through AX keeps the core app working on
@@ -67,12 +80,11 @@ Sources/WindowDeck/
 │   ├── AppStore.swift        @Observable single source of truth; groups, ordering, persistence
 │   ├── AXBridge.swift        AXUIElement helpers + the private _AXUIElementGetWindow shim
 │   ├── WindowInfo.swift      one window; id is CGWindowID
-│   ├── DeckGroup.swift       a group; membership, order, clusters, pins  + OrderRef
-│   ├── DeckItem.swift        what the strip draws: window | cluster | ghost | ungrouped | pinned
+│   ├── DeckGroup.swift       a capsule; membership, order, clusters, pins  + OrderRef
+│   ├── DeckItem.swift        what the strip draws: window | cluster | appStack | pinned | running
 │   ├── WindowCluster.swift   several windows behind one icon
 │   ├── PreviewService.swift  ScreenCaptureKit captures, per-caller freshness, LRU caps
 │   ├── SwitcherController.swift  the hold-and-tap window switcher state machine
-│   ├── GroupSwitcherController.swift  the same shape, applied to groups (⌘↑/⌘↓)
 │   ├── HotKeyManager.swift   Carbon global hotkeys, keyed by action
 │   ├── Shortcut.swift        keycode + Carbon modifiers, display strings
 │   ├── CycleOrder.swift      switcher order: most-recently-used or strip order
@@ -83,13 +95,14 @@ Sources/WindowDeck/
 │   ├── DeckController.swift  panel lifecycle, sizing, fullscreen hide, edge reveal
 │   ├── DeckView.swift        strip contents + DeckMetrics
 │   ├── DeckLayout.swift      the sizing algorithm — read this before touching widths
-│   ├── EntryTile / ClusterTile / PinnedTile / GroupSelector
+│   ├── EntryTile / ClusterTile / PinnedTile / GroupSelector (the groups menu)
 │   ├── AppStackTile.swift    one app's windows behind its own icon, with a count
 │   ├── AppStackPanel.swift   the hover list of a stacked app's windows
+│   ├── AllGroupsPanel.swift  every capsule, folded ones included, above the strip
 │   ├── PreviewPanel.swift    HoverController: title bar → thumbnail → peek escalation
 │   ├── PeekOverlay.swift     full-size captured image drawn at the window's real rect
+│   ├── StripWarmth.swift     "is the pointer already scanning the strip", shared by both panels
 │   ├── SwitcherPanel.swift   the ⌃`/⌘` switcher grid
-│   ├── GroupSwitcherPanel.swift  the ⌘↑/⌘↓ group list, drawn like the drop-up menu
 │   ├── SettingsWindow / SettingsView / ShortcutRecorder / MainMenu
 └── Persistence/State.swift   the JSON state file and its migrations
 
@@ -172,9 +185,24 @@ Seeding it on every launch is not the fix either: a binding the user cleared is 
 key, indistinguishable from one that never existed, so it would keep coming back. `shortcutSeedVersion`
 makes each batch a one-time offer. Anything else added with defaults needs the same treatment.
 
+**Migration is part of the contract, not a one-off.** `PersistedState.migrate` brings any file up to
+the one-capsule-per-window model, and three rules in it are decisions rather than mechanics:
+
+* **Exactly one group is Main.** A file written before Main existed names none, so the group already
+  *called* "Main" is adopted — a user who built one means that one — and only failing that does the
+  leading group get the job. Main then sorts first, and cannot be deleted or folded away.
+* **Main loses every tie.** A window filed in both Main and Work is a Work window. Main is the
+  catch-all, so taking "first group in strip order" — which Main is — would empty every specific
+  capsule into it. Among two *specific* groups the first in strip order wins.
+* **The adopted group keeps its members on disk.** They are inert (nothing reads Main's list) and the
+  first save drops them. Deleting them during migration instead would throw away the membership of a
+  group that was adopted *as* Main precisely because the file named none — quiet loss of exactly the
+  kind this contract exists to prevent.
+
 **When changing anything persisted:** seed an old-format `state.json`, launch, and confirm the groups
 and settings survive. Adding a field is safe; changing a field's *type* is what breaks, and it breaks
-silently. Never run these tests against the live state file — copy it aside first.
+silently. Never run these tests against the live state file — copy it aside first, point
+`WINDOWDECK_STATE_DIR` at the copy, and diff the result group by group.
 
 ---
 
@@ -186,13 +214,6 @@ Each of these cost real debugging. They are not hypothetical.
 windows interleaves other Spaces, so "first entry" stops meaning "frontmost" — it latched onto a
 window on another Space and the focus highlight froze there permanently. `queryWindowServer()`
 deliberately makes two queries for this reason.
-
-**Global monitoring of scroll and gesture events needs Input Monitoring, not Accessibility.**
-`NSEvent.addGlobalMonitorForEvents` returns a perfectly valid monitor for `.swipe`, `.gesture` and
-`.scrollWheel` with only Accessibility granted — and then delivers *nothing*. Measured across dozens of
-three- and four-finger swipes plus an ordinary two-finger scroll used as a control: zero events, no
-error, no refusal. A silent monitor is indistinguishable from a quiet trackpad, so this must be
-checked with `IOHIDCheckAccess` rather than inferred from a non-nil monitor.
 
 **`kAXFullScreen` is the only way to tell a zoomed window from a fullscreen one.** They are the same
 shape, and they need opposite behaviour: a zoomed window gets shortened to sit above the strip; a
@@ -213,14 +234,15 @@ modifier release — so the following press advanced the open switcher session i
 new switch. `scheduleRefresh(full:)` defers and coalesces; `full: false` skips the AX pass entirely
 because raising a window changes nothing about what windows exist.
 
-**An observation tracker fires on any mutation, not on the value you read.** `trackGroupCount`
-observes `store.groups.count` to re-register the hotkeys when groups are added or removed — but
+**An observation tracker fires on any mutation, not on the value you read.** A tracker on
+`store.groups.count` re-registered the hotkeys when groups were added or removed — but
 `withObservationTracking` fires for any write to `groups`, and `groups` is rewritten on every refresh
 that touches membership or ordering. `HotKeyManager.register` unregisters everything first, so all
 eleven Carbon hotkeys were being torn down and rebuilt roughly every three seconds, indefinitely,
-each time leaving a window in which no shortcut was bound at all. `syncHotKeys` now returns early
-when the effective set is unchanged. Found by reading the diagnostics log eight seconds after it
-first existed, which is the argument for having one.
+each time leaving a window in which no shortcut was bound at all. Found by reading the diagnostics
+log eight seconds after it first existed, which is the argument for having one. The tracker went with
+the per-group shortcuts; `syncHotKeys` still returns early when the effective set is unchanged,
+because the cost of getting this wrong is silence.
 
 **`@Observable` fires on assignment regardless of equality.** Assigning an identical `windows` array
 redraws the whole strip. Guard every store assignment with a change check.
@@ -256,17 +278,14 @@ also reads live `NSEvent.modifierFlags`.
 
 **A shortcut with no modifier swallows that key system-wide.** `ShortcutRecorder` refuses bare keys.
 
-**macOS owns `⌘\`` (symbolic hotkey id 27) and `⌘⇧\``.** `⌃\`` is free. `⌃1`–`⌃9` belong to
-"Switch to Desktop" whenever multiple Spaces exist, and macOS wins — which is why registration
-failures are surfaced in Settings rather than left as dead keys.
-
 **Clamping a width *up* to a floor causes overflow.** The strip once computed a fair share of 23pt
 then clamped to a 24pt minimum, producing 1275pt of content in a 1240pt bar. Widths may only ever be
 clamped *down*.
 
-**Early returns must run the same post-processing.** `visibleItems` returning early for groups with no
-clusters skipped the ghost logic, so the off-group signal never appeared for most groups. It happened
-twice — once for the ghost, once for the ungrouped split.
+**Early returns must run the same post-processing.** An early return for groups with no clusters
+skipped the rest of the pipeline, so a signal that was supposed to appear never did — twice, for two
+different signals. `items(in:)` is now one straight line of folds with no early exit, which is the
+shape that makes this unrepresentable rather than merely fixed.
 
 **"Off screen" is not the same question as "on another Space".** A window leaves the on-screen list when
 it is minimised, when its application is hidden with ⌘H, *and* when it lives on another Space. The
@@ -336,17 +355,19 @@ one, so the mistake fed itself. The fix is precedence — `captureTargets(focusH
 first and passed to `rebindReopenedWindows(_:preferring:)`, which will not claim a window for a group
 the decision did not name. Note also that opening one Chrome window creates **six** window ids.
 
-**"The group on screen" is not "the group being acted on".** Pill view broke that assumption
-everywhere it was encoded. `combine`, `dissolveCluster`, `renameCluster` and `removeFromCluster` all
-wrote to `activeGroupID`, which in pill view is always All — so clustering four windows inside
-Actelligent's capsule built the cluster in All, where nothing looks for it. Cluster operations now
-find the owning group. Ordering had the same fault: a capsule honours *its own* group's arrangement,
-so `moveItem` takes the group being reordered.
+**"The group on screen" is not "the group being acted on".** Four operations encoded that assumption
+and all four were wrong: `combine`, `dissolveCluster`, `renameCluster` and `removeFromCluster` wrote
+to a stored "current group", so clustering four windows inside Actelligent's capsule built the cluster
+somewhere nothing looks for it. Ordering had the same fault. Every capsule operation now takes the
+group it is acting on as an argument, and the stored current group is gone entirely — `activeGroup` is
+derived from the focused window and decides one thing only (where a *new* window lands), so there is
+no longer a value that can drift from what is on screen.
 
-**Item building bypassed the shared rules three times.** Pill view constructed each section's items
-directly instead of going through `pins(alongside:)`, so a pinned app drew a launcher beside the very
-window it would have opened — first for All's leading launchers, then again inside group capsules.
-Unifying the *rendering* pipeline did not fix this, because the duplication was in item building.
+**Item building bypassed the shared rules three times.** Sections were once constructed directly
+instead of going through `pins(alongside:)`, so a pinned app drew a launcher beside the very window it
+would have opened — in two different places, twice over. Unifying the *rendering* pipeline did not fix
+it, because the duplication was in item building. There is now exactly one builder, `items(in:)`, and
+every capsule including Main goes through it.
 
 **Count the gaps the row actually draws.** `contentWidth` assumed `N-1` gaps between items, but with
 sections the real count is `N - sectionCount`, and the joins between sections are charged separately.
@@ -388,10 +409,11 @@ burned, against 632 for the redraw. `sample` reports wall-clock stacks, and a ma
 AX round trip looks exactly like one doing work. Split blocked leaves from running ones before
 believing a ranking, or the cheapest-to-fix item hides behind the noisiest one.
 
-**Animating the panel's frame re-lays out every tile, every frame.** Group changes animate the strip's
-resize, and swiping quickly stacked those animations on top of each other. `AppStore.animateThisChange`
-is false whenever a change interrupts the previous one; both the SwiftUI slide and the panel resize are
-gated on it so they cannot disagree.
+**Animating the panel's frame re-lays out every tile, every frame.** Resizing a 1240pt panel with an
+animation re-lays out the whole hosting view on every frame, and fast group switching stacked those
+animations on top of each other. The strip no longer animates at all: the one event that justified it
+— a group change — does not exist, and `layout()` otherwise runs on every window open and close, which
+left the bar permanently breathing.
 
 **macOS tabs are separate windows, and this note used to say otherwise.** Each tab of a tabbed window
 is its own `NSWindow` with its own `CGWindowID`; only the front tab is on screen and the rest are
@@ -488,6 +510,12 @@ to title changes, which matters because browsers rewrite their title on every ta
 [MemberRef]` (bundle id + title) is the only thing that survives a relaunch. Either representation
 alone fails: IDs don't persist, titles don't stay still.
 
+**Main holds neither.** Its windows are the complement of every other capsule's, computed on each
+redraw, so there is nothing to save, nothing to restore, nothing to prune and nothing to rebind. That
+is not an optimisation — it is what makes "if nothing claims it, it goes to Main" true by construction
+rather than by a rule that could disagree with itself. `add(_:to:)` is the single place a window's
+capsule changes, and clearing every other membership *is* the operation, not a tidy-up after it.
+
 **Restore runs on every refresh, not once at launch.** After a reboot, apps reopen over tens of
 seconds. A matched reference is *consumed* so a window deliberately removed is never re-added.
 
@@ -537,29 +565,30 @@ in, so a 3-second tolerance would mean no images at all.
 **Pinned launchers are ordinary items in the row.** They were once a separate section with its own
 fixed tile width, which meant they held 40pt while windows compressed to ~24pt around them — the pins
 looked absurdly spaced because they were not taking part in the layout. They are `DeckItem.pinned`
-now, sized by the same pass, draggable among windows, and **scoped per group** rather than All-only.
+now, sized by the same pass, draggable among windows, and **scoped per capsule**.
 
-**A launcher hides while its app has a window in the group.** Showing both put two identical icons
+**A launcher hides while its app has a window in the capsule.** Showing both put two identical icons
 side by side with nothing to tell them apart — the launcher and the window it launched. Since the
 pin's only job is "open this", the window entry takes over that job and the pin steps aside, returning
 to its place in the manual arrangement once the last such window closes or leaves. Compared against
-the pre-ghost item list on purpose: a ghost is the focused window when it is explicitly *not* a
-member, so an app present only as a ghost still deserves its launcher. `moveItem` seeds a fresh
-arrangement with the hidden pins included, or the first drag in a group would condemn them to the end
-of the row when they came back.
+the *folded* item list, so a stacked app hides its launcher for the same reason a loose window does.
+`moveItem` seeds a fresh arrangement with the hidden pins included, or the first drag in a capsule
+would condemn them to the end of the row when they came back.
+
+Main defers to the other capsules over running-app launchers: an app already drawn as a launcher in
+Work does not appear again in Main. Main is where things go when nothing else has them, and that
+applies to launchers as much as to windows.
 
 **A launcher for a closed app is unlit.** The filled plate is what says "this exists right now", so a
 pin whose app isn't running gets no plate and a half-strength icon; it lights on hover to stay
 obviously clickable. Full strength claimed the app was already open, which is the one thing a launcher
 must not say. A pin that *is* lit therefore means "running, but with no window in this group".
 
-**The All group separates ungrouped windows.** Windows belonging to no group are moved to the right of
-a divider, at full brightness on a slightly lighter bed — being unfiled is a fact, not a fault, so it
-must not look like the red off-group warning. Clusters count as grouped: a cluster is a deliberate
-arrangement.
-
-**The off-group window is red**, deliberately outside the group palette. Tinting it with the active
-group's colour said "belongs here", the opposite of what it means.
+**Main is a capsule, not a leftovers bin.** Windows nothing else claims are drawn in Main's own
+capsule, with its own name, colour, launchers, clusters and arrangement — because being unfiled is not
+a fault and should not look like one. It differs from the others in exactly two ways: its membership is
+implicit (the complement), and it cannot be deleted or folded away, since its windows would then have
+nowhere to be drawn.
 
 **Layout never scrolls and never overflows.** `DeckLayout` charges every separator to chrome, sizes
 titled entries from the leftover width, collapses to icon-only when titles would be useless (Chrome's
@@ -584,11 +613,8 @@ candidates inside `withTransaction(Transaction(animation: nil))` — per-view `.
 cannot suppress a `ForEach` reorder, which is what produced the "two apps swapping positions"
 animation. Selection is a ring that jumps; nothing scales, slides or fades.
 
-**App-scoped cycling resolves the current window against *all* windows**, not the active group's. Doing
-it within the group made the shortcut a silent no-op whenever the focused window was not a member —
-which is most of the time once groups exist. It restricts to the group only when you are actually in
-it. Note that a single-window app legitimately has nothing to cycle: a quick tap does nothing, holding
-still shows the panel.
+**A single-window app legitimately has nothing to cycle**: a quick tap does nothing, holding still
+shows the panel. Worth knowing before treating it as a bug report.
 
 **Cycling order is most-recently-used by default**, with the current window placed at index 0
 *explicitly* rather than trusting it to be `mruOrder[0]`.
@@ -611,30 +637,12 @@ literal `1` with a comment explaining that index 0 is the window you are already
 false for strip order, and nothing connected the two. `cycleStartIndex(_:reversed:)` now answers it
 per mode — the neighbour of where you stand, wrapping, when the order is fixed.
 
-**App cycling is group-scoped whenever you are standing in the group; `appCycleStaysInGroup` decides
-the rest.** The original fix for "it is a silent no-op outside the group" widened the scope to every
-window of the app, which removed the choice rather than offering it. With the setting on (the default)
-being outside the group cycles the group's windows of that app anyway, walking you *into* it — the
-answer to a no-op is to offer something, not to leave the group.
-
-**"The group on screen" is not the scope you are working in, once pill view exists.** In All the
-active group is All, so cycling offered every window on the bar — but pill view buckets them into
-capsules and only one of those is the one being worked in. `cycleWithinPill` scopes both cycling
-shortcuts to the capsule holding the focused window. This is the same class of mistake as the cluster
-operations that wrote to `activeGroupID`: in pill view the group on screen and the group being acted
-on are different things, and there is now a third case — the group being *cycled*.
-
-Three details it forced:
-
-* **A window in several groups is drawn in several capsules**, so there is no single pill to read off
-  the screen. The first in strip order wins — deterministic, and visible in the bar rather than hidden
-  state. Reordering groups therefore changes it, which the self-test asserts, because that is the only
-  control the tie-break rests on.
-* **The capsule's own arrangement has to travel with the scope.** Each capsule honours its own group's
-  order, so `.stripOrder` must sort by *that* group rather than All's — otherwise the switcher lists
-  the pill's windows in All's order and the two disagree about a row you can see.
-* **A folded group still scopes.** Its capsule is not drawn, but it still owns its windows; skipping it
-  would silently widen the cycle to everything the moment a group was collapsed.
+**Cycling is scoped to the capsule you are standing in, and that is no longer a question.** A window
+is drawn in exactly one capsule, so "which capsule am I in" has one answer, taken from the focused
+window. What is left for `appCycleStaysInGroup` to decide is the single case where the capsule holds
+only *one* window of the focused app: stay put and do nothing, or widen to every window that app has
+open anywhere on the strip. A folded capsule still scopes — it still owns its windows even though it
+is not drawn, and widening the cycle the moment a group is collapsed would be a surprise.
 
 **A stack must be ordered from the members it is drawing, not re-derived from its bundle id.**
 `stackWindowsByRecency` took a bundle id and filtered `windows` — *every* window of that application,
@@ -714,96 +722,47 @@ hit-testing is its own rectangle whatever decoration is added later. Worth check
 grows a badge, a dot or a marker: `offset` is the tempting way to place one and it silently widens the
 hover area.
 
-**Self-test cases inherit persisted state from each other.** Every `AppStore()` reads the state file
-the previous case saved, so `pillView` — set by `clustering()` — leaked forward into the cycling
-cases. Pill scoping only applies in pill view, so `cyclingAcrossTwoGroups` was silently measuring
-capsule scope while claiming to measure group scope, and failed the moment the feature landed. It bit
-a second time immediately: a new stack case left Chrome stacked in the same group `appStackOrdering`
-uses, and `stackApp` returns early when the rule is already there, so that case stopped seeding the
-arrangement it exists to test. Any case whose behaviour depends on a persisted setting must set it
-explicitly and **assert the precondition** rather than inherit it.
+**Self-test cases used to inherit persisted state from each other.** Every `AppStore()` reads the
+state file the previous case saved, so a setting written by one case leaked forward into the next —
+twice with real consequences: a case silently measured a different scope than it claimed, and another
+stopped seeding the arrangement it exists to test because `stackApp` returns early when the rule is
+already there. `freshStore()` now deletes the file and rebuilds Main plus two capsules per case, which
+removes the whole class. It also seeds `bootTime`, because restore only trusts a saved window id when
+the file was written during the same boot — a store built from *nothing* cannot exercise id matching
+at all, and the test for it would pass with the matcher deleted. Assert the precondition anyway: a
+pin test once passed while pinning nothing.
 
 **A fixture that leaves every window at `pid: 0` cannot test app scoping.** `WindowInfo.testInstance`
 hardcoded it, and app cycling filters on `pid` — so every fabricated window was the same application
 and any test of the scoping would have passed no matter what the code did. The same shape as the
 `frame`-nil fixture that made the tab-seizure test vacuous. `testInstance` now takes a `pid`.
 
-**The strip slides when the group changes, and the panel resizes with it.** Direction comes from the
-change itself: the cycling and swiping paths pass it explicitly, because comparing group indices gets
-the wrap backwards — stepping forward from the last group to the first looks like a jump back, and the
-bar would slide the wrong way at the moment the movement is least obvious. Picking from the menu has
-no direction, so it falls back to position. The outgoing and incoming rows are stacked in a `ZStack`
-rather than sitting in the `HStack`: during a transition both exist, and side by side they shove the
-layout around. Only a *group* change animates — `layout()` also runs on every window open and close,
-and animating those left the bar permanently breathing.
+**The strip is a row of capsules, and sizing runs on the flattened list.** Every tile in the row is
+measured in one pass and each capsule's padding is charged to the width budget, exactly as separators
+are. A capsule with its own budget pushes the row past the strip's edge. Identity has to include the
+section too: a launcher can be pinned in two capsules, and two views sharing one id is what rendered
+the switcher rotated with two highlights.
 
-**Two independent swipe paths, because they cost different things.** A horizontal swipe *over the
-strip* is free — the events arrive because the pointer is on our own window, not because the app asked
-to watch input — so it is on by default. Swiping *anywhere* needs an event tap and Input Monitoring,
-so it is opt-in and either path runs without the other. The tap is `.listenOnly` at `.cghidEventTap`:
-swallowing gesture events would take pinch-to-zoom and Mission Control with them, so macOS still acts
-on the swipe too, and "Swipe between full-screen applications" has to be turned off by hand.
-
-**The global gesture tracks raw touches, not `.swipe` events.** A `.swipe` event only exists when the
-trackpad's "swipe between pages" setting produces one; three- and four-finger horizontal swipes are
-normally bound to Mission Control, where macOS acts on them without ever synthesising one. The
-underlying touches are reported on gesture events regardless, so averaging their travel works under
-any trackpad configuration.
-
-**Pill view buckets All by group.** Off by default. Each group's windows and launchers are drawn inside
-a capsule tinted with its colour; a window in several groups appears in each of them; unfiled windows
-get a neutral capsule last, behind a divider; empty groups are omitted. Two things it forced:
-
-* **Identity has to include the section.** The same window drawn in three pills is three views, and
-  they cannot share an id — the same fault that once rendered the switcher rotated with two highlights.
-  `DeckLayout.Slot.id` is `"\(sectionID)/\(item.id)"`.
-* **Sizing runs on the flattened list.** Every tile in the row is measured in one pass and each
-  capsule's padding is charged to the width budget, exactly as separators are. A capsule with its own
-  budget pushes the row past the strip's edge.
-
-Dragging between capsules *moves* a window: it joins the target group and leaves the source. Within a
-capsule it reorders. Live reordering is suppressed across capsules, since the row's order there comes
-from the grouping and would snap back.
+Dragging a window between capsules *moves* it — it joins the target and leaves the source, because it
+can only be in one. Within a capsule it reorders. Live reordering is suppressed across capsules, since
+the row's order there comes from the grouping and would snap back.
 
 **A build that never finishes is usually the type-checker.** One deeply nested SwiftUI expression in
-the pill renderer type-checked for minutes without completing, which is indistinguishable from a hung
-build. Splitting it into small functions with explicit return types took it to seven seconds. Suspect
-this before suspecting the toolchain.
+the capsule renderer type-checked for minutes without completing, which is indistinguishable from a
+hung build. Splitting it into small functions with explicit return types took it to seven seconds.
+Suspect this before suspecting the toolchain.
 
-**Folded groups.** A group can be collapsed out of All's pill view (right-click its capsule). It
-leaves the row and joins an overflow control on the right — one overlapping dot per folded group, and
+**Folded groups.** A group can be collapsed out of the strip (right-click its capsule, or the groups
+menu). It leaves the row and joins an overflow control on the right — one overlapping dot per folded group, and
 the number of *windows* hidden. Dots answer "which groups", the number answers "how much"; capping the
 dots while the number counted something else produced "three dots, four" and answered neither.
 Pressing the control opens `AllGroupsPanel` above the strip, listing every group. Its width is
 computed from the same constants the view draws with, or the plate stops hugging its contents.
 
-**Menu counts use `NSMenuItemBadge`.** The drop-up is a real `NSMenu`, and macOS 14 provides the same
+**Menu counts use `NSMenuItemBadge`.** The groups menu is a real `NSMenu`, and macOS 14 provides the same
 right-aligned pill Apple uses for unread counts — it aligns and dims itself, unlike hand-built tab
 stops. Build it with `NSMenuItemBadge(string:)`, not `(count:)`: the count form suppresses a zero, and
 an empty group showing nothing looks like a badge that failed to render.
-
-**Groups cycle in strip order, not MRU.** ⌘↑/⌘↓ move through the arrangements with the same
-hold-and-tap shape as the window switcher — tap to step one, hold to open the list and keep tapping,
-release to switch. Strip order rather than most-recently-used because the arrows have to *mean*
-something: with MRU the list reorders itself and ↑ stops corresponding to any fixed place. It wraps at
-both ends.
-
-**The group list is a copy of the drop-up menu, not the menu itself.** `NSMenu.popUp` runs a modal
-tracking loop that consumes the event stream, so the `flagsChanged` monitor never sees the modifier
-released and Carbon hotkeys stop firing while it is open — a hold-and-release interaction is simply
-impossible through NSMenu. `GroupSwitcherPanel` therefore reproduces its appearance and its exact
-placement instead: same rows, same swatches, same checkmark on the active group, and an origin
-computed to land flush on the strip's top edge, which is where `popUp` puts the real menu. Verified by
-measurement — panel at x=30/w=168/h=156 with its bottom edge exactly on the strip's top at y=768.
-
-**⌘↑/⌘↓ are not free keys.** Finder uses them for enclosing-folder and open; text editors for start
-and end of document. Registering them globally takes them from every app. They are the default anyway
-because they were asked for, they do register (unlike ⌃1–⌃9), and Settings can rebind them.
-
-**`GroupSwitcherController` deliberately duplicates `SwitcherController`'s state machine.** The two
-differ in what they cycle, what they draw, where it appears and what committing means, and the window
-switcher's timing is the most hard-earned code here. Generalising would risk the working one to save
-something that fits on a screen.
 
 ---
 
@@ -813,9 +772,10 @@ something that fits on a screen.
 WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
 ```
 
-~223 checks, about a second, covering persistence (legacy files, a changed field type degrading rather
-than wiping the file, round-trips), ordering, restore matching, membership moves, pruning, clustering,
-app stacks, switcher candidate ordering and scope, section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never
+~235 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
+field type degrading rather than wiping the file, round-trips), ordering, restore matching, membership
+moves, capture of new windows, pruning, clustering, app stacks, switcher candidate ordering and scope,
+section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never
 touch the real state file — destructive persistence tests once left fabricated groups in the running
 app.
 
@@ -827,7 +787,7 @@ Two things it taught, both worth keeping in mind:
 * **A green test can assert nothing.** `pinApp` silently does nothing for a bundle id with no
   application on disk, so a pin test passed while never pinning anything. Assert the precondition.
 
-It cannot test gestures, drags or appearance. Add a case for every bug fixed that it *can* reach.
+It cannot test drags or appearance. Add a case for every bug fixed that it *can* reach.
 
 ## Verification
 
@@ -878,12 +838,57 @@ responsible application and whether WindowDeck was running, and samples any help
 
 ---
 
+## Removed, and why
+
+The app was cut back to one capsule strip. These features are gone; what each one *taught* is kept
+here, because the measurements cost real time and the temptation to rebuild them will recur.
+
+**Group switching — the drop-up selector, ⌘↑/⌘↓, and swipes.** Every group is on the bar at once, so
+there is nothing to switch to. `GroupSwitcherController`, `GroupSwitcherPanel` and `GestureMonitor`
+went with it, along with `activeGroupID` as a stored selection. Retained facts:
+
+* **Global monitoring of scroll and gesture events needs Input Monitoring, not Accessibility.**
+  `NSEvent.addGlobalMonitorForEvents` returns a perfectly valid monitor for `.swipe`, `.gesture` and
+  `.scrollWheel` with only Accessibility granted — and then delivers *nothing*. Measured across dozens
+  of three- and four-finger swipes plus an ordinary two-finger scroll as a control: zero events, no
+  error, no refusal. A silent monitor is indistinguishable from a quiet trackpad, so this has to be
+  checked with `IOHIDCheckAccess` rather than inferred from a non-nil monitor.
+* **A `.swipe` event only exists when the trackpad's "swipe between pages" setting produces one.**
+  Three- and four-finger horizontal swipes are normally bound to Mission Control, where macOS acts on
+  them without synthesising one. The underlying touches are reported on gesture events regardless, so
+  averaging their travel worked under any configuration.
+* **`NSMenu.popUp` runs a modal tracking loop that consumes the event stream**, so a `flagsChanged`
+  monitor never sees the modifier released and Carbon hotkeys stop firing while it is open. A
+  hold-and-release interaction is simply impossible through NSMenu — which is why the group list was a
+  hand-drawn copy of the menu rather than the menu itself.
+* **⌘↑/⌘↓ are not free keys** (Finder's enclosing-folder and open; start and end of document in text
+  editors), and **macOS owns ⌃1–⌃9** for "Switch to Desktop" whenever multiple Spaces exist — it wins,
+  which is why registration failures are surfaced in Settings rather than left as dead keys. `⌃\`` is
+  free; macOS owns `⌘\`` (symbolic hotkey id 27) and `⌘⇧\``.
+
+**The flat row.** The strip had two rendering pipelines, flat and bucketed, and every rule about
+ordering and dragging existed twice. Most of the pill-view bug run came from the two drifting apart.
+One shape, one set of rules.
+
+**The off-group ghost and the unfiled section.** A red tile for the focused window when it was not a
+member, and a divider separating windows belonging to no group. Both were answers to questions the
+model no longer asks: every window is in a capsule, and the capsule you are in is where you are.
+
+**Sliding the strip on a group change.** Direction had to be passed explicitly — comparing group
+indices gets the wrap backwards, so stepping from the last group to the first slid the wrong way at
+the moment the movement was least obvious. Nothing animates now.
+
+---
+
 ## Known limitations
 
 - **Strip is main-display only.** It follows the focused app between screens rather than appearing on
   both.
 - **Cross-Space windows are hidden** by default (`currentSpaceOnly`). Turning it off lists everything
   but a busy session has ~80 windows, which no single bar reads well.
+- **A window can only be in one capsule.** Filing it somewhere else moves it. The previous model
+  allowed several and drew the window once per group; that is what the tie-break rules, the duplicate
+  identities and a run of "it went to two groups at once" bugs were all about.
 - **Restore matches titles exactly.** A document reopened under a different name will not rejoin its
   group — deliberate, since a wrong window in a group is worse than a missing one.
 - **The zoom clamp is reactive.** macOS gives no public way to reserve screen space; the window is

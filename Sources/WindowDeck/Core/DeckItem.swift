@@ -6,12 +6,6 @@ import SwiftUI
 enum DeckItem: Identifiable {
     case window(WindowInfo)
     case cluster(WindowCluster, [WindowInfo])
-    /// The focused window when it isn't a member of the group on show — drawn
-    /// faded after a separator, so the strip can still say what you're in.
-    case ghost(WindowInfo)
-    /// A window belonging to no group at all. Shown in All, after a separator,
-    /// so it is obvious at a glance what still needs filing.
-    case ungrouped(WindowInfo)
     /// A pinned launcher. An ordinary item in the row rather than a section of
     /// its own — which is also what makes it shrink alongside everything else
     /// instead of holding a fixed width while windows compress around it.
@@ -42,8 +36,6 @@ enum DeckItem: Identifiable {
         switch self {
         case .window(let window): "w\(window.id)"
         case .cluster(let cluster, _): "c\(cluster.id.uuidString)"
-        case .ghost(let window): "g\(window.id)"
-        case .ungrouped(let window): "u\(window.id)"
         case .pinned(let app): "p\(app.bundleID)"
         case .running(let app, _): "r\(app.bundleID)"
         case .appStack(let bundleID, _): "s\(bundleID)"
@@ -54,7 +46,7 @@ enum DeckItem: Identifiable {
     /// one ordering, so both need a key in the same namespace.
     var orderKey: String {
         switch self {
-        case .window(let window), .ghost(let window), .ungrouped(let window): "w\(window.id)"
+        case .window(let window): "w\(window.id)"
         case .cluster(_, let members): members.first.map { "w\($0.id)" } ?? id
         case .pinned(let app): "p\(app.bundleID)"
         // The closed window's own key, so the slot keeps the position it held in
@@ -66,6 +58,15 @@ enum DeckItem: Identifiable {
         // window closes; a stack's identity *is* the app, so this key is good
         // for the stack's whole life however its windows come and go.
         case .appStack(let bundleID, _): "s\(bundleID)"
+        }
+    }
+
+    /// The application a launcher stands for, if this item is one. Main defers
+    /// to the other capsules over these, so it has to be able to ask.
+    var launcherBundleID: String? {
+        switch self {
+        case .pinned(let app), .running(let app, _): app.bundleID
+        default: nil
         }
     }
 
@@ -86,24 +87,12 @@ enum DeckItem: Identifiable {
         return false
     }
 
-    var isGhost: Bool {
-        if case .ghost = self { return true }
-        return false
-    }
-
-    var isUngrouped: Bool {
-        if case .ungrouped = self { return true }
-        return false
-    }
-
     /// Windows this item stands for — one for a plain entry, several for a
     /// cluster.
     var windows: [WindowInfo] {
         switch self {
         case .window(let window): [window]
         case .cluster(_, let members): members
-        case .ghost(let window): [window]
-        case .ungrouped(let window): [window]
         case .pinned, .running: []
         // Reporting these is what keeps `pins(alongside:)` hiding the launcher
         // for a stacked app: the rule there is "an app with a window here does
@@ -118,12 +107,12 @@ enum DeckItem: Identifiable {
     }
 }
 
-/// A run of items drawn together in pill view.
+/// One capsule's worth of items.
 ///
-/// Sections exist only for the bucketed view of All. A window can belong to
-/// several groups and therefore appear in several sections, which is why the
-/// section id has to take part in each slot's identity — two views sharing one
-/// identity is what corrupted the switcher's rendering once already.
+/// The strip is a row of these, one per group, Main first. The section id takes
+/// part in each slot's identity even though a window is only drawn once: a
+/// pinned launcher genuinely can appear in two capsules, and two views sharing
+/// one identity is what corrupted the switcher's rendering once already.
 struct DeckSection: Identifiable {
     let id: String
     /// Whose arrangement this section uses, and what a drop into it joins. Nil

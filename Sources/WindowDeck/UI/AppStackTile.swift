@@ -20,9 +20,10 @@ struct AppStackTile: View {
     let width: CGFloat
     let iconSize: CGFloat
     let isDragging: Bool
+    /// One of this stack's windows is frontmost.
     let isFocused: Bool
-    let memberColors: [Color]
-    let focusTint: Color
+    /// Its capsule's colour, for the plate and the dot.
+    let tint: Color
     /// Windows in most-recently-used order, for the menu.
     let windows: [WindowInfo]
     let onActivate: () -> Void
@@ -38,7 +39,8 @@ struct AppStackTile: View {
             iconLayer
                 .frame(width: width, height: DeckMetrics.tileHeight)
                 .overlay(alignment: .topTrailing) { badge }
-                .overlay(alignment: .bottom) { dots }
+                // One dot, not one per window: the badge already says how many.
+                .overlay(alignment: .bottom) { StatusDot(tint: tint, isFocused: isFocused) }
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(plateFill)
@@ -85,9 +87,8 @@ struct AppStackTile: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Top-trailing, not bottom-trailing like the cluster's. The bottom of every
-    /// tile is where the group dots live, and a badge there would sit on top of
-    /// them — a stacked window still belongs to groups and still has to show it.
+    /// Top-trailing, not bottom-trailing like the cluster's, which keeps the
+    /// bottom edge of every tile in the row clear.
     ///
     /// Drawn as an `overlay` on the tile frame with inset padding rather than
     /// offset out of a `ZStack`. An offset puts it outside the tile, and a view
@@ -105,23 +106,8 @@ struct AppStackTile: View {
             .padding(.trailing, 1)
     }
 
-    @ViewBuilder
-    private var dots: some View {
-        if !memberColors.isEmpty {
-            HStack(spacing: 2.5) {
-                ForEach(Array(memberColors.enumerated()), id: \.offset) { _, color in
-                    Circle()
-                        .fill(color)
-                        .frame(width: DeckMetrics.statusDotSize,
-                               height: DeckMetrics.statusDotSize)
-                }
-            }
-            .padding(.bottom, DeckMetrics.statusDotInset)
-        }
-    }
-
     private var plateFill: Color {
-        if isFocused { return focusTint }
+        if isFocused { return tint }
         return .primary.opacity(isHovering ? 0.16 : 0.09)
     }
 

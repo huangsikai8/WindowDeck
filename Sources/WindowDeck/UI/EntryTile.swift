@@ -11,19 +11,17 @@ struct EntryTile: View {
     let showsTitle: Bool
     let iconSize: CGFloat
     let groups: [DeckGroup]
-    let memberships: Set<UUID>
-    /// Colours of the groups this window belongs to, in group order.
-    let memberColors: [Color]
+    /// The one capsule this window is in. A window is drawn once, in one place,
+    /// so this is a single group and not a set — the checkmark in the menu marks
+    /// where it is, and picking another moves it.
+    let memberGroupID: UUID
     let isDragging: Bool
 
     /// This window is frontmost — the one you're actually in.
     let isFocused: Bool
-    /// Focused but not a member of the group on show.
-    let isGhost: Bool
-    /// Belongs to no group at all — shown in All after the separator.
-    let isUngrouped: Bool
-    /// The active group's colour, used to fill the focused tile.
-    let focusTint: Color
+    /// Its capsule's colour. Fills the tile when focused, and tints the dot
+    /// underneath it always.
+    let tint: Color
     let onActivate: () -> Void
     let onToggleGroup: (UUID) -> Void
     let onClose: () -> Void
@@ -84,35 +82,15 @@ struct EntryTile: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(
-                        (isGhost || isFocused) ? markTint.opacity(0.8) : .clear,
-                        lineWidth: isGhost ? 1.5 : 1
-                    )
+                    .strokeBorder(isFocused ? tint.opacity(0.8) : .clear, lineWidth: 1)
             )
-            .overlay(alignment: .topTrailing) {
-                if isGhost {
-                    Image(systemName: "exclamationmark")
-                        .font(.system(size: 7, weight: .black))
-                        .foregroundStyle(.white)
-                        .frame(width: 11, height: 11)
-                        .background(Circle().fill(Self.offGroupTint))
-                        .offset(x: 3, y: -3)
-                }
-            }
-            // Which groups this window belongs to, readable at a glance from
-            // inside All without opening anything.
+            // The Dock's running dot. Every tile in the row is an open window,
+            // so this is not saying "running" — it is what makes the row read as
+            // a Dock rather than as a strip of buttons, and it gives the icons a
+            // baseline to sit on. A minimised window keeps it: minimised is not
+            // closed, which is exactly the distinction the Dock draws too.
             .overlay(alignment: .bottom) {
-                if !memberColors.isEmpty {
-                    HStack(spacing: 2.5) {
-                        ForEach(Array(memberColors.enumerated()), id: \.offset) { _, color in
-                            Circle()
-                                .fill(color)
-                                .frame(width: DeckMetrics.statusDotSize,
-                                       height: DeckMetrics.statusDotSize)
-                        }
-                    }
-                    .padding(.bottom, DeckMetrics.statusDotInset)
-                }
+                StatusDot(tint: tint, isFocused: isFocused)
             }
             .background(frameReader)
         }
@@ -141,30 +119,11 @@ struct EntryTile: View {
         }
     }
 
-    /// Red, deliberately outside the group palette. Tinting the off-group window
-    /// with the active group's colour said "belongs here", which is the opposite
-    /// of what it means.
-    private static let offGroupTint = Color(red: 0.90, green: 0.30, blue: 0.30)
-
-    private var markTint: Color {
-        isGhost ? Self.offGroupTint : focusTint
-    }
-
     /// The focused tile is filled solidly enough to spot instantly in a row of
     /// thirty near-identical icons — that is the entire point of it.
     private var tileFill: some ShapeStyle {
-        if isGhost {
-            return AnyShapeStyle(Self.offGroupTint.opacity(isHovering ? 0.46 : 0.34))
-        }
         if isFocused {
-            return AnyShapeStyle(focusTint.opacity(isHovering ? 0.62 : 0.50))
-        }
-        // Ungrouped windows sit at full brightness — being unfiled isn't a
-        // fault, unlike the off-group warning — but on a slightly lighter bed,
-        // so adjacent ones read as one band rather than needing a container
-        // behind a slice of the row.
-        if isUngrouped {
-            return AnyShapeStyle(.primary.opacity(isHovering ? 0.20 : 0.13))
+            return AnyShapeStyle(tint.opacity(isHovering ? 0.62 : 0.50))
         }
         return AnyShapeStyle(.primary.opacity(isHovering ? 0.14 : 0.06))
     }
@@ -177,13 +136,9 @@ struct EntryTile: View {
         }
     }
 
-    /// The primary way windows get copied from "All" into another arrangement.
+    /// The primary way a window is filed into another capsule.
     @ViewBuilder
     private var contextMenu: some View {
-        if isGhost {
-            Text("Not in this group")
-            Divider()
-        }
         if groups.isEmpty {
             Text("No groups yet")
         } else {
@@ -193,7 +148,10 @@ struct EntryTile: View {
                 } label: {
                     // A checkmark reads better than "Add to"/"Remove from": one
                     // stable menu whose state you can see at a glance.
-                    Label(group.name, systemImage: memberships.contains(group.id) ? "checkmark" : "")
+                    // A window lives in one capsule, so exactly one of these
+                    // is ticked and picking another *moves* it rather than
+                    // adding a second home.
+                    Label(group.name, systemImage: group.id == memberGroupID ? "checkmark" : "")
                 }
             }
         }
@@ -270,26 +228,22 @@ struct EntryDropDelegate: DropDelegate {
     let target: String
     /// Only windows can be combined into a cluster; a pin has none.
     let targetWindowID: CGWindowID?
-    /// Which section this target is in, and which the drag began in. Sections
-    /// rather than groups decide reorder-versus-move: two sections can both have
-    /// no group — unfiled windows and All's leading launchers — and comparing
-    /// group ids alone would mistake a move between them for a reorder.
-    var targetSectionID: String?
-    var sourceSectionID: String?
+    /// Which capsule this target is in, and which the drag began in. Every
+    /// section has a group now — Main included — so the group ids answer
+    /// reorder-versus-move on their own.
     var targetGroupID: UUID?
     var sourceGroupID: UUID?
     @Binding var dragging: String?
     let move: (String, String) -> Void
-    /// Key, source group, target group. Either group may be nil: dropping into
-    /// the unfiled capsule removes the source membership without adding one.
-    var moveBetweenGroups: ((String, UUID?, UUID?) -> Void)?
+    /// Key, source group, target group.
+    var moveBetweenGroups: ((String, UUID, UUID) -> Void)?
 
     func dropEntered(info: DropInfo) {
         guard let dragging, dragging != target else { return }
-        // Reordering live as the drag passes only makes sense within one pill.
-        // Across pills the row's order comes from the grouping, so a live
+        // Reordering live as the drag passes only makes sense within one capsule.
+        // Across capsules the row's order comes from the grouping, so a live
         // reorder would fight the layout and snap back.
-        guard targetSectionID == sourceSectionID else { return }
+        guard targetGroupID == sourceGroupID else { return }
         move(dragging, target)
     }
 
@@ -298,11 +252,12 @@ struct EntryDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        // A drop in a different pill moves the window between groups rather than
-        // reordering: it joins the pill it was dropped in and leaves the one it
-        // came from, the way dragging a file between folders behaves.
-        if let dragging, targetSectionID != sourceSectionID {
-            moveBetweenGroups?(dragging, sourceGroupID, targetGroupID)
+        // A drop in a different capsule moves the window between groups rather
+        // than reordering: it joins the capsule it was dropped in and leaves the
+        // one it came from, the way dragging a file between folders behaves.
+        if let dragging, let source = sourceGroupID, let target = targetGroupID,
+           source != target {
+            moveBetweenGroups?(dragging, source, target)
             self.dragging = nil
             return true
         }

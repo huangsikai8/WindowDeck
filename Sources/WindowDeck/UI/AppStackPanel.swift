@@ -55,6 +55,12 @@ final class AppStackPanel {
     /// or leaving an image behind when the wrong one hides.
     private let peek = PeekOverlayController()
     private var peekWork: DispatchWorkItem?
+    /// The capture in flight, so it can be abandoned the moment the pointer
+    /// moves on. A full-size capture is the most expensive thing this app asks
+    /// for, and a discarded result is not a cancelled one — sliding along the
+    /// list fired one per row and let every one of them run to completion, which
+    /// is the same mistake the hover thumbnail's settle delay exists to prevent.
+    private var peekTask: Task<Void, Never>?
     /// The row the pointer is on, so a capture that lands late can tell whether
     /// it is still wanted.
     private var peekWindowID: CGWindowID?
@@ -285,6 +291,9 @@ final class AppStackPanel {
         }
 
         peekWork?.cancel()
+        // The previous row's capture is no longer wanted the instant the pointer
+        // reaches this one.
+        peekTask?.cancel()
         peekWindowID = window.id
         // A minimised window has nothing on screen to draw over, so there is no
         // rect the illusion could work at.
@@ -299,12 +308,22 @@ final class AppStackPanel {
     }
 
     private func presentPeek(_ window: WindowInfo) {
-        Task { [weak self] in
+        peekTask?.cancel()
+        peekTask = Task { [weak self] in
             guard let self else { return }
+            // Settle first, and deliberately regardless of `peekDelay` — that
+            // setting is legitimately zero, and at zero a sweep across five rows
+            // issued five full-size captures before the pointer had stopped
+            // anywhere. This is the same 90ms the thumbnail path waits, for the
+            // same reason: a sweep should issue none at all.
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            guard !Task.isCancelled, self.peekWindowID == window.id else { return }
+
             guard let capture = await PreviewService.shared.fullSizeCapture(for: window) else { return }
             // The capture is asynchronous and the pointer keeps moving; by the
             // time it lands the row may have changed or the list may be gone.
-            guard self.peekWindowID == window.id, self.panel.isVisible else { return }
+            guard !Task.isCancelled, self.peekWindowID == window.id, self.panel.isVisible
+            else { return }
             self.peek.show(image: capture.image, at: capture.screenRect)
         }
     }
@@ -312,6 +331,8 @@ final class AppStackPanel {
     private func endPeek() {
         peekWork?.cancel()
         peekWork = nil
+        peekTask?.cancel()
+        peekTask = nil
         peekWindowID = nil
         peek.hide()
     }

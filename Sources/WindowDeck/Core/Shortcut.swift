@@ -1,46 +1,31 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// Which way a group cycle moves through the strip order. Two keys rather than
-/// one key plus Shift, because up and down are the whole point — the list is in
-/// a fixed order and the arrow says where you are going in it.
-enum GroupCycleDirection: String, Hashable, Codable {
-    case previous, next
-
-    var step: Int { self == .previous ? -1 : 1 }
-}
-
 /// Something a shortcut can trigger.
+///
+/// Two actions, and both of them cycle windows. The group shortcuts — step to
+/// the next group, jump to group N — went with group switching itself: every
+/// group is on screen at once now, so there is nothing to switch to. Their
+/// storage keys are simply no longer recognised, which is how they drop out of
+/// an existing state file without any migration.
 enum ShortcutAction: Hashable, Codable {
-    /// Cycle windows within the active group.
+    /// Cycle windows within the capsule you are working in.
     case cycleGroupWindows
-    /// Cycle windows of the frontmost app, within the active group.
+    /// Cycle windows of the frontmost app, within that capsule.
     case cycleAppWindows
-    /// Move through the groups themselves, in strip order.
-    case cycleGroups(GroupCycleDirection)
-    /// Jump to the group at this 1-based position.
-    case selectGroup(Int)
 
     var storageKey: String {
         switch self {
         case .cycleGroupWindows: "cycleGroupWindows"
         case .cycleAppWindows: "cycleAppWindows"
-        case .cycleGroups(let direction): "cycleGroups\(direction.rawValue.capitalized)"
-        case .selectGroup(let position): "selectGroup\(position)"
         }
     }
 
     static func from(storageKey: String) -> ShortcutAction? {
         switch storageKey {
-        case "cycleGroupWindows": return .cycleGroupWindows
-        case "cycleAppWindows": return .cycleAppWindows
-        case "cycleGroupsPrevious": return .cycleGroups(.previous)
-        case "cycleGroupsNext": return .cycleGroups(.next)
-        default:
-            guard storageKey.hasPrefix("selectGroup"),
-                  let position = Int(storageKey.dropFirst("selectGroup".count))
-            else { return nil }
-            return .selectGroup(position)
+        case "cycleGroupWindows": .cycleGroupWindows
+        case "cycleAppWindows": .cycleAppWindows
+        default: nil
         }
     }
 
@@ -48,9 +33,6 @@ enum ShortcutAction: Hashable, Codable {
         switch self {
         case .cycleGroupWindows: "Cycle windows in group"
         case .cycleAppWindows: "Cycle windows of current app"
-        case .cycleGroups(.previous): "Previous group"
-        case .cycleGroups(.next): "Next group"
-        case .selectGroup(let position): "Switch to group \(position)"
         }
     }
 }
@@ -158,19 +140,4 @@ struct Shortcut: Codable, Equatable, Hashable {
     /// to open, and text editors use them for start and end of document. A
     /// global hotkey takes them from every app, which is why they are worth
     /// rebinding if that bites — Settings will accept anything.
-    static func defaultGroupsCycle(_ direction: GroupCycleDirection) -> Shortcut {
-        Shortcut(
-            keyCode: UInt16(direction == .previous ? kVK_UpArrow : kVK_DownArrow),
-            carbonModifiers: UInt32(cmdKey)
-        )
-    }
-
-    static func groupSelect(position: Int) -> Shortcut? {
-        let codes = [
-            kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5,
-            kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9
-        ]
-        guard position >= 1, position <= codes.count else { return nil }
-        return Shortcut(keyCode: UInt16(codes[position - 1]), carbonModifiers: UInt32(controlKey))
-    }
 }

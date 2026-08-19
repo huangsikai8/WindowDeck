@@ -1,49 +1,14 @@
 import AppKit
 import ApplicationServices
-import IOKit.hid
 
 /// Accessibility is the one permission WindowDeck *needs*. Without it there are
 /// no window titles and no way to raise a specific window, so the app is inert.
 ///
-/// Input Monitoring is optional and only powers trackpad gestures. It is kept
-/// separate and off by default because it is the more invasive of the two: it
-/// covers all keyboard and pointer input, not just window metadata.
+/// Screen Recording is optional and powers hover thumbnails and the switcher's
+/// previews only. Input Monitoring is no longer asked for at all: it existed for
+/// the trackpad gestures that switched groups, and there are no groups to switch
+/// between now.
 enum Permissions {
-
-    // MARK: - Input Monitoring
-
-    /// Measured, not assumed: `NSEvent.addGlobalMonitorForEvents` happily returns
-    /// a monitor for scroll and gesture events with only Accessibility granted,
-    /// and then delivers nothing at all — not one event, not even a two-finger
-    /// scroll. Observing those event types genuinely requires this permission.
-    static var canMonitorInput: Bool {
-        IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
-    }
-
-    /// Shows the system prompt. Like Accessibility, the answer arrives out of
-    /// process, so a `false` means "not yet" rather than "denied".
-    @discardableResult
-    static func requestInputMonitoring() -> Bool {
-        IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
-    }
-
-    /// Same shape as `pollUntilTrusted`: the grant happens out of process, so
-    /// polling is the only way to notice the switch being flipped.
-    static func pollUntilInputMonitoring(interval: TimeInterval = 1.0,
-                                         onGranted: @escaping () -> Void) {
-        guard !canMonitorInput else { onGranted(); return }
-        Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
-            guard canMonitorInput else { return }
-            timer.invalidate()
-            onGranted()
-        }
-    }
-
-    static func openInputMonitoringPane() {
-        let url = URL(string:
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!
-        NSWorkspace.shared.open(url)
-    }
 
     // MARK: - Accessibility
 

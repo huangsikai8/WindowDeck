@@ -14,18 +14,14 @@ struct PinnedTile: View {
     /// looks identical — the distinction is what the context menu offers, since
     /// there is nothing to unpin.
     var isPinned: Bool = true
-    /// Groups this app's closed window belongs to. Non-empty only for a member
-    /// whose window was closed — it shows the same dots the window showed, so
-    /// closing a window changes nothing about how the tile reads.
-    var memberColors: [Color] = []
     /// Passed in from the store's sampled snapshot. Asking
     /// `NSRunningApplication` here meant a lookup per launcher per redraw.
     let isRunning: Bool
     let onOpen: () -> Void
-    /// Toggles the pin in a group; nil means All.
+    /// Toggles the pin in a capsule; nil means Main.
     var onTogglePin: ((UUID?) -> Void)?
     var isPinnedIn: ((UUID?) -> Bool)?
-    /// Groups offered alongside All.
+    /// Capsules offered in the pin submenu.
     var pinTargets: [DeckGroup] = []
     let onUnpin: () -> Void
 
@@ -53,26 +49,10 @@ struct PinnedTile: View {
             // put it 2.5pt higher than its neighbours and half a point smaller —
             // a whole row of dots that visibly failed to line up.
             .overlay(alignment: .bottom) {
-                if !memberColors.isEmpty {
-                    // A member whose window is closed keeps its group dots. The
-                    // grey running dot would say "this is a launcher now", and
-                    // it isn't — it is the same member it was a moment ago.
-                    HStack(spacing: 2.5) {
-                        ForEach(Array(memberColors.enumerated()), id: \.offset) { _, color in
-                            Circle()
-                                .fill(color)
-                                .frame(width: DeckMetrics.statusDotSize,
-                                       height: DeckMetrics.statusDotSize)
-                        }
-                    }
-                    .padding(.bottom, DeckMetrics.statusDotInset)
-                } else if isRunning {
-                    Circle()
-                        .fill(.primary.opacity(0.65))
-                        .frame(width: DeckMetrics.statusDotSize,
-                               height: DeckMetrics.statusDotSize)
-                        .padding(.bottom, DeckMetrics.statusDotInset)
-                }
+                // Neutral, not the capsule's colour: this app is running but has
+                // no window in this capsule, which is a different state from the
+                // open windows either side of it and must not look the same.
+                if isRunning { StatusDot() }
             }
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)

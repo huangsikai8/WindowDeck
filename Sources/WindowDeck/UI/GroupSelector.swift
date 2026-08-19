@@ -7,13 +7,19 @@ import SwiftUI
 @MainActor
 final class SelectorMenuController: NSObject {
     weak var anchorView: NSView?
-    var onSelect: ((UUID) -> Void)?
+    var onToggleCollapsed: ((UUID) -> Void)?
+    var onDelete: ((UUID) -> Void)?
     var onNewGroup: (() -> Void)?
     var onEditGroups: (() -> Void)?
 
-    @objc func selectGroup(_ sender: NSMenuItem) {
+    @objc func toggleCollapsed(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? UUID else { return }
-        onSelect?(id)
+        onToggleCollapsed?(id)
+    }
+
+    @objc func deleteGroup(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        onDelete?(id)
     }
 
     @objc func newGroup() { onNewGroup?() }
@@ -32,7 +38,12 @@ private struct MenuAnchorView: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
-/// The drop-up group selector pinned at the left of the strip.
+/// The groups control at the left of the strip.
+///
+/// It no longer *switches* anything — every group is on the bar at once — so it
+/// is a menu for managing them rather than a selector with a current value. That
+/// is also why it is narrow now: the row it used to label is the whole strip,
+/// and the space is better spent on windows.
 ///
 /// An `NSMenu` is used rather than SwiftUI's `Menu`: the strip lives in a
 /// `.nonactivatingPanel`, where SwiftUI's menu presentation drops events.
@@ -46,41 +57,23 @@ struct GroupSelector: View {
     @State private var isHovering = false
 
     var body: some View {
-        HStack(spacing: 6) {
-            if !store.activeGroup.isAll {
-                Circle()
-                    .fill(store.activeGroup.displayColor)
-                    .frame(width: 7, height: 7)
-            }
-            Text(store.activeGroup.name)
-                .font(.system(size: 12, weight: .semibold))
-                .lineLimit(1)
-            Image(systemName: "chevron.up")
-                .font(.system(size: 8, weight: .bold))
-                .foregroundStyle(.secondary)
-        }
-        .padding(.horizontal, 10)
-        .frame(width: DeckMetrics.selectorWidth, height: DeckMetrics.tileHeight)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(tint)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(
-                    store.activeGroup.isAll ? .clear : store.activeGroup.displayColor.opacity(0.55),
-                    lineWidth: 1
-                )
-        )
-        .background(MenuAnchorView(controller: controller))
-        .contentShape(Rectangle())
-        .onHover { isHovering = $0 }
-        .onTapGesture { showMenu() }
-        .help("Switch arrangement")
+        Image(systemName: "rectangle.3.group")
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(.secondary)
+            .frame(width: DeckMetrics.selectorWidth, height: DeckMetrics.tileHeight)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(.primary.opacity(isHovering ? 0.18 : 0.10))
+            )
+            .background(MenuAnchorView(controller: controller))
+            .contentShape(Rectangle())
+            .onHover { isHovering = $0 }
+            .onTapGesture { showMenu() }
+            .help("Groups")
     }
 
-    /// A small colour dot for the drop-up menu. NSMenu takes an NSImage, so the
-    /// swatch is drawn rather than expressed in SwiftUI.
+    /// A small colour dot for the menu. NSMenu takes an NSImage, so the swatch is
+    /// drawn rather than expressed in SwiftUI.
     private static func swatch(_ color: Color) -> NSImage {
         let size = NSSize(width: 10, height: 10)
         let image = NSImage(size: size)
@@ -91,31 +84,21 @@ struct GroupSelector: View {
         return image
     }
 
-    /// The active group's colour, kept faint so the strip stays calm — it is a
-    /// background tint, not a highlight.
-    private var tint: Color {
-        let group = store.activeGroup
-        guard !group.isAll else { return .primary.opacity(isHovering ? 0.18 : 0.10) }
-        return group.displayColor.opacity(isHovering ? 0.32 : 0.20)
-    }
-
     private func showMenu() {
         guard let anchor = controller.anchorView else { return }
 
-        controller.onSelect = { store.selectGroup($0) }
+        controller.onToggleCollapsed = { id in
+            guard let group = store.groups.first(where: { $0.id == id }) else { return }
+            store.setCollapsed(!group.isCollapsed, for: id)
+        }
+        controller.onDelete = { store.deleteGroup($0) }
         controller.onNewGroup = onNewGroup
         controller.onEditGroups = onEditGroups
 
         let menu = NSMenu()
         for group in store.groups {
-            let item = NSMenuItem(
-                title: group.name,
-                action: #selector(SelectorMenuController.selectGroup(_:)),
-                keyEquivalent: ""
-            )
-            item.target = controller
-            item.representedObject = group.id
-            item.state = (group.id == store.activeGroupID) ? .on : .off
+            let item = NSMenuItem(title: group.name, action: nil, keyEquivalent: "")
+            item.image = Self.swatch(group.displayColor)
             // The native badge, the same right-aligned pill Apple uses for unread
             // counts. It aligns and dims itself, which hand-built tab stops in an
             // attributed title do not.
@@ -123,8 +106,33 @@ struct GroupSelector: View {
             // suppresses a zero, and an empty group showing nothing is
             // indistinguishable from a group whose badge failed to appear.
             item.badge = NSMenuItemBadge(string: "\(store.windowCount(of: group))")
-            if !group.isAll {
-                item.image = Self.swatch(group.displayColor)
+
+            // Main is the fallback: it cannot be folded away or deleted, because
+            // every window nothing else claims is drawn in it.
+            if !group.isMain {
+                let submenu = NSMenu()
+
+                let fold = NSMenuItem(
+                    title: group.isCollapsed ? "Expand" : "Collapse",
+                    action: #selector(SelectorMenuController.toggleCollapsed(_:)),
+                    keyEquivalent: ""
+                )
+                fold.target = controller
+                fold.representedObject = group.id
+                submenu.addItem(fold)
+
+                submenu.addItem(.separator())
+
+                let remove = NSMenuItem(
+                    title: "Delete Group",
+                    action: #selector(SelectorMenuController.deleteGroup(_:)),
+                    keyEquivalent: ""
+                )
+                remove.target = controller
+                remove.representedObject = group.id
+                submenu.addItem(remove)
+
+                item.submenu = submenu
             }
             menu.addItem(item)
         }

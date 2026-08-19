@@ -227,87 +227,35 @@ final class DeckController {
         allGroups.show(anchor: panel.frame)
     }
 
-    /// Horizontal swipes made while the pointer is over the strip. Needs no
-    /// permission — these events come to us because the pointer is here.
-    var onStripSwipe: ((GroupCycleDirection) -> Void)? {
-        get { panel.onHorizontalSwipe }
-        set { panel.onHorizontalSwipe = newValue }
-    }
-
-    /// Re-read from the store rather than cached, so moving the slider takes
-    /// effect on the next swipe instead of the next launch.
-    func syncSwipeSensitivity() {
-        panel.threshold = store.stripSwipeThreshold
-    }
-
-    /// Screen rect of the drop-up selector chip. The keyboard group switcher
-    /// rises from here, so it appears exactly where clicking the chip would have
-    /// opened the menu.
-    var selectorFrame: NSRect {
-        let frame = panel.frame
-        return NSRect(
-            x: frame.minX + DeckMetrics.padding,
-            y: frame.minY + (frame.height - DeckMetrics.tileHeight) / 2,
-            width: DeckMetrics.selectorWidth,
-            height: DeckMetrics.tileHeight
-        )
-    }
-
     /// The strip is exactly as wide as its contents need, capped at the display.
     /// `DeckLayout` decides the per-entry widths so nothing ever has to scroll.
     func layout() {
         guard let screen = NSScreen.main else { return }
 
+        // Measured on the flattened section list, exactly as `DeckView` does:
+        // the whole row is sized in one pass, capsule padding included, or the
+        // panel and its contents disagree about how wide the strip is.
+        let sections = store.sections
         let width: CGFloat = store.isTrusted
             ? DeckLayout.compute(
-                items: store.visibleItems,
-                pinnedCount: store.visiblePinnedApps.count,
+                items: sections.flatMap(\.items),
+                pinnedCount: 0,
                 titlesEnabled: store.showTitles,
-                maxWidth: DeckMetrics.maxWidth(screen: screen)
+                maxWidth: DeckMetrics.maxWidth(screen: screen),
+                pillCount: sections.filter(\.isPill).count,
+                collapsedCount: store.collapsedGroups.count,
+                collapsedWindows: store.collapsedGroups.reduce(0) { $0 + $1.count },
+                sectionCount: sections.count,
+                dividerCount: sections.filter(\.dividerBefore).count
               ).totalWidth
             : 420
 
-        // Only a group change animates. layout() also runs whenever a window
-        // opens or closes, and animating those would leave the bar permanently
-        // breathing in the corner of your eye.
-        let changedGroup = lastLaidOutGroupID != store.activeGroupID
-        lastLaidOutGroupID = store.activeGroupID
-
-        // Animating a resize of a 1240pt panel re-lays out every tile in the
-        // hosting view on each frame, so overlapping animations from fast
-        // swiping stack that cost up. `animateThisChange` is false once a switch
-        // interrupts the previous one, and the strip's own slide is gated on the
-        // same flag so the two never disagree.
-        guard changedGroup, store.animateThisChange, store.animateGroupChanges,
-              panel.isVisible else {
-            panel.setContentSize(NSSize(width: width, height: DeckMetrics.height))
-            reposition()
-            return
-        }
-
-        // Frame rather than size then origin: the strip is centred, so a resize
-        // moves it too, and animating those separately reads as two motions.
-        // Matched to the content transition's 0.22s so the bar and its contents
-        // arrive together.
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.22
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().setFrame(centredFrame(width: width, screen: screen), display: true)
-        }
-    }
-
-    /// Where the strip sits for a given content width.
-    private func centredFrame(width: CGFloat, screen: NSScreen) -> NSRect {
-        // Full frame, not visibleFrame — see `reposition()`.
-        let screenFrame = screen.frame
-        let size = panel.frameRect(forContentRect:
-            NSRect(x: 0, y: 0, width: width, height: DeckMetrics.height)).size
-        return NSRect(
-            x: screenFrame.midX - size.width / 2,
-            y: screenFrame.minY + DeckMetrics.edgeInset,
-            width: size.width,
-            height: size.height
-        )
+        // Never animated. The resize used to follow a group change, which is the
+        // one event that no longer exists; `layout()` otherwise runs on every
+        // window open and close, and animating a 1240pt panel re-lays out every
+        // tile in the hosting view on each frame.
+        panel.setContentSize(NSSize(width: width, height: DeckMetrics.height))
+        reposition()
     }
 
     /// SwiftUI redraws itself when the store changes, but the panel is AppKit —
@@ -316,8 +264,8 @@ final class DeckController {
         withObservationTracking {
             // The whole array, not just its count: which app each window belongs
             // to decides whether it gets a title, which changes the width.
-            _ = store.visibleItems
-            _ = store.visiblePinnedApps.count
+            _ = store.sections
+            _ = store.collapsedGroups.count
             _ = store.isTrusted
             _ = store.showTitles
         } onChange: { [weak self] in
@@ -328,8 +276,6 @@ final class DeckController {
             }
         }
     }
-
-    private var lastLaidOutGroupID: UUID?
 
     private func reposition() {
         // Full frame, not visibleFrame: the real Dock is hidden by the user, and

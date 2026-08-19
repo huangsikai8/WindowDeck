@@ -133,14 +133,15 @@ final class AllGroupsModel {
         // in (⌘↓ is a Carbon hotkey, so the dismissal monitor never sees it).
         // Each row filters by its own `memberIDs` a line below; the active group
         // has no business in that intersection.
-        let live = store.windows
-        groups = store.groups.filter { !$0.isAll }.map { group in
+        groups = store.groups.map { group in
             Row(id: group.id,
                 name: group.name,
                 color: group.displayColor,
                 isCollapsed: group.isCollapsed,
-                windows: Self.ordered(live.filter { group.memberIDs.contains($0.id) },
-                                      by: store.order(in: group.id)))
+                // Through the store, so Main's implicit membership — everything
+                // no other capsule claims — is answered the same way here as on
+                // the strip rather than being worked out a second time.
+                windows: Self.ordered(store.windows(in: group), by: store.order(in: group.id)))
         }
     }
 
@@ -298,19 +299,13 @@ private struct AllGroupsContent: View {
     @ViewBuilder
     private func menu(for window: WindowInfo, in row: AllGroupsModel.Row) -> some View {
         if let store = model.store {
-            let memberships = store.groupsContaining(window.id)
-            let named = store.groups.filter { !$0.isAll }
-            if named.isEmpty {
-                Text("No groups yet")
-            } else {
-                ForEach(named) { group in
-                    Button {
-                        store.toggle(window.id, in: group.id)
-                        model.reload()
-                    } label: {
-                        Label(group.name,
-                              systemImage: memberships.contains(group.id) ? "checkmark" : "")
-                    }
+            let home = store.group(of: window.id).id
+            ForEach(store.groups) { group in
+                Button {
+                    store.add(window.id, to: group.id)
+                    model.reload()
+                } label: {
+                    Label(group.name, systemImage: group.id == home ? "checkmark" : "")
                 }
             }
 
@@ -337,10 +332,7 @@ private struct AllGroupsContent: View {
 
             if let bundleID = window.bundleID {
                 Menu("Pin \(window.appName) to") {
-                    pinItem("All", bundleID: bundleID, groupID: nil, store: store)
-                    let pinnable = store.pinTargets(for: window.id)
-                    if !pinnable.isEmpty { Divider() }
-                    ForEach(pinnable) { group in
+                    ForEach(store.groups) { group in
                         pinItem(group.name, bundleID: bundleID, groupID: group.id, store: store)
                     }
                 }

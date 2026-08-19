@@ -43,8 +43,13 @@ struct PersistedGroup: Codable {
     var colorIndex: Int
     /// A colour picked outside the preset palette, as "rrggbb".
     var customColorHex: String?
-    /// Folded into the overflow cluster in All's pill view.
+    /// Folded out of the strip into the overflow control.
     var isCollapsed: Bool = false
+    /// The fallback group. Exactly one group carries this, it always sorts
+    /// first, and it cannot be deleted — every window no other group claims is
+    /// drawn in it. Persisted rather than derived from position so that
+    /// reordering the strip can never change which group is the fallback.
+    var isMain: Bool = false
     var members: [MemberRef]
     /// The manual left-to-right arrangement — windows and pinned apps share it.
     var order: [OrderRef]
@@ -64,6 +69,7 @@ struct PersistedGroup: Codable {
         colorIndex: Int,
         customColorHex: String? = nil,
         isCollapsed: Bool = false,
+        isMain: Bool = false,
         members: [MemberRef],
         order: [OrderRef] = [],
         clusters: [PersistedCluster] = [],
@@ -77,6 +83,7 @@ struct PersistedGroup: Codable {
         self.colorIndex = colorIndex
         self.customColorHex = customColorHex
         self.isCollapsed = isCollapsed
+        self.isMain = isMain
         self.members = members
         self.order = order
         self.clusters = clusters
@@ -94,6 +101,7 @@ struct PersistedGroup: Codable {
             ?? GroupColor.blue.rawValue
         customColorHex = container.lenient(String.self, .customColorHex)
         isCollapsed = container.lenient(Bool.self, .isCollapsed) ?? false
+        isMain = container.lenient(Bool.self, .isMain) ?? false
         members = container.lenient([MemberRef].self, .members) ?? []
         if let refs = container.lenient([OrderRef].self, .order) {
             order = refs
@@ -112,54 +120,25 @@ struct PersistedGroup: Codable {
 /// What survives a relaunch.
 struct PersistedState: Codable {
     var groups: [PersistedGroup] = [
-        PersistedGroup(id: UUID().uuidString, name: "Work",
-                       colorIndex: GroupColor.blue.rawValue, members: []),
-        PersistedGroup(id: UUID().uuidString, name: "Study",
-                       colorIndex: GroupColor.green.rawValue, members: [])
+        PersistedGroup(id: UUID().uuidString, name: "Main",
+                       colorIndex: GroupColor.blue.rawValue, isMain: true, members: [])
     ]
-    /// Arrangement and clusters for the built-in All group, which has no entry
-    /// in `groups`.
-    var allGroupOrder: [OrderRef] = []
-    var allGroupClusters: [PersistedCluster] = []
-    /// The built-in All group has no entry in `groups`, so its launchers live
-    /// here — same shape as its order and clusters.
-    var allGroupPinnedBundleIDs: [String] = []
-    /// All's stacked applications, for the same reason as the line above.
-    var allGroupStackedBundleIDs: [String] = []
-    var activeGroupID: String?
-    var pinnedAppBundleIDs: [String] = []
     var currentSpaceOnly: Bool = true
     var showTitles: Bool = true
     var previewMode: PreviewMode = .thumbnailAndPeek
     var hoverTimings: HoverTimings = .defaults
+    /// A newly opened window joins the group holding the focused window.
     var autoAddNewWindows: Bool = true
-    var showOffGroupWindow: Bool = true
-    var showUngroupedSeparately: Bool = true
     var clampZoomedWindows: Bool = true
     var hideInFullscreen: Bool = true
     var switcherHoldDelay: TimeInterval = 0.18
     /// What order the window switcher lists candidates in.
     var cycleOrder: CycleOrder = .recentlyUsed
-    /// Keep app cycling inside the active group even when the focused window is
-    /// not a member of it.
+    /// Keep app cycling inside the capsule the focused window is in, even when
+    /// the app has other windows elsewhere on the strip.
     var appCycleStaysInGroup: Bool = true
-    /// In All's pill view, scope cycling to the capsule the focused window is in.
-    var cycleWithinPill: Bool = true
-    /// Horizontal swipe over the strip switches groups. Free — the events reach
-    /// our own window without any permission.
-    var swipeOverStrip: Bool = true
-    /// Trackpad swipe anywhere switches groups. Off by default: it needs Input
-    /// Monitoring, which is more invasive than anything else the app asks for.
-    var globalSwipeGesture: Bool = false
-    /// Finger counts the global gesture accepts.
-    var swipeFingerCounts: [Int] = [3, 4]
-    /// 0 = long deliberate sweep, 1 = light flick.
     /// Keep an entry for a running app after its last window closes.
     var showRunningApps: Bool = true
-    /// In All, bucket windows into a capsule per group instead of one flat row.
-    var pillView: Bool = false
-    var swipeSensitivity: Double = 0.5
-    var animateGroupChanges: Bool = true
     /// Keyed by `ShortcutAction.storageKey`, since the action isn't a plain
     /// string and JSON keys must be.
     var shortcuts: [String: Shortcut] = [:]
@@ -184,61 +163,31 @@ struct PersistedState: Codable {
     // Declaring init(from:) suppresses the synthesised memberwise initialiser.
     init(
         groups: [PersistedGroup],
-        allGroupOrder: [OrderRef],
-        allGroupClusters: [PersistedCluster],
-        allGroupPinnedBundleIDs: [String],
-        allGroupStackedBundleIDs: [String] = [],
-        activeGroupID: String?,
-        pinnedAppBundleIDs: [String],
         currentSpaceOnly: Bool,
         showTitles: Bool,
         previewMode: PreviewMode,
         hoverTimings: HoverTimings,
         autoAddNewWindows: Bool,
-        showOffGroupWindow: Bool,
-        showUngroupedSeparately: Bool,
         clampZoomedWindows: Bool,
         hideInFullscreen: Bool,
         switcherHoldDelay: TimeInterval,
         cycleOrder: CycleOrder = .recentlyUsed,
         appCycleStaysInGroup: Bool = true,
-        cycleWithinPill: Bool = true,
         shortcuts: [String: Shortcut],
         shortcutSeedVersion: Int,
-        swipeOverStrip: Bool,
-        globalSwipeGesture: Bool,
-        swipeFingerCounts: [Int],
         showRunningApps: Bool,
-        pillView: Bool,
-        swipeSensitivity: Double,
-        animateGroupChanges: Bool,
         bootTime: Double
     ) {
         self.showRunningApps = showRunningApps
-        self.pillView = pillView
         self.bootTime = bootTime
-        self.swipeSensitivity = swipeSensitivity
-        self.animateGroupChanges = animateGroupChanges
-        self.swipeOverStrip = swipeOverStrip
-        self.globalSwipeGesture = globalSwipeGesture
-        self.swipeFingerCounts = swipeFingerCounts
         self.switcherHoldDelay = switcherHoldDelay
         self.cycleOrder = cycleOrder
         self.appCycleStaysInGroup = appCycleStaysInGroup
-        self.cycleWithinPill = cycleWithinPill
-        self.showOffGroupWindow = showOffGroupWindow
-        self.showUngroupedSeparately = showUngroupedSeparately
         self.clampZoomedWindows = clampZoomedWindows
         self.hideInFullscreen = hideInFullscreen
         self.shortcuts = shortcuts
         self.shortcutSeedVersion = shortcutSeedVersion
         self.groups = groups
-        self.allGroupOrder = allGroupOrder
-        self.allGroupClusters = allGroupClusters
-        self.allGroupPinnedBundleIDs = allGroupPinnedBundleIDs
-        self.allGroupStackedBundleIDs = allGroupStackedBundleIDs
-        self.activeGroupID = activeGroupID
-        self.pinnedAppBundleIDs = pinnedAppBundleIDs
         self.currentSpaceOnly = currentSpaceOnly
         self.showTitles = showTitles
         self.previewMode = previewMode
@@ -253,12 +202,13 @@ struct PersistedState: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let fallback = PersistedState()
 
-        if let groups = container.lenient([PersistedGroup].self, .groups) {
-            self.groups = groups
+        var groups: [PersistedGroup]
+        if let decoded = container.lenient([PersistedGroup].self, .groups) {
+            groups = decoded
         } else if let names = container.lenient([String].self, .userGroupNames) {
             // Oldest format stored bare names. Migrate rather than discard, and
             // hand out distinct colours on the way through.
-            self.groups = names.enumerated().map { index, name in
+            groups = names.enumerated().map { index, name in
                 PersistedGroup(
                     id: UUID().uuidString,
                     name: name,
@@ -267,26 +217,33 @@ struct PersistedState: Codable {
                 )
             }
         } else {
-            self.groups = fallback.groups
+            groups = fallback.groups
         }
 
+        // The retired built-in "All" group, which had no entry in `groups` and
+        // kept its arrangement, launchers, clusters and stacks out here. Its
+        // contents belong to Main now: All held the whole strip, and the strip
+        // is Main plus the other capsules.
+        var legacyOrder: [OrderRef] = []
         if let refs = container.lenient([OrderRef].self, .allGroupOrder) {
-            allGroupOrder = refs
+            legacyOrder = refs
         } else if let legacy = container.lenient([MemberRef].self, .allGroupOrder) {
-            allGroupOrder = legacy.map { OrderRef.window($0) }
-        } else {
-            allGroupOrder = []
+            legacyOrder = legacy.map { OrderRef.window($0) }
         }
-        allGroupClusters = container.lenient([PersistedCluster].self, .allGroupClusters) ?? []
-        // Migration: pins used to be a single global list, which conceptually
-        // belonged to All. Read it when the new key is absent, or every existing
-        // pin would silently disappear on upgrade.
-        allGroupPinnedBundleIDs = container.lenient([String].self, .allGroupPinnedBundleIDs)
+        let legacyClusters = container.lenient([PersistedCluster].self, .allGroupClusters) ?? []
+        // Pins were a single global list before they belonged to All, so both
+        // retired keys are read — either one skipped means every pin silently
+        // disappears on upgrade.
+        let legacyPins = container.lenient([String].self, .allGroupPinnedBundleIDs)
             ?? (container.lenient([String].self, .pinnedAppBundleIDs) ?? [])
-        allGroupStackedBundleIDs = container.lenient([String].self, .allGroupStackedBundleIDs) ?? []
-        activeGroupID = container.lenient(String.self, .activeGroupID)
-        pinnedAppBundleIDs = container.lenient([String].self, .pinnedAppBundleIDs)
-            ?? fallback.pinnedAppBundleIDs
+        let legacyStacks = container.lenient([String].self, .allGroupStackedBundleIDs) ?? []
+
+        self.groups = Self.migrate(groups,
+                                   legacyOrder: legacyOrder,
+                                   legacyClusters: legacyClusters,
+                                   legacyPins: legacyPins,
+                                   legacyStacks: legacyStacks)
+
         currentSpaceOnly = container.lenient(Bool.self, .currentSpaceOnly)
             ?? fallback.currentSpaceOnly
         showTitles = container.lenient(Bool.self, .showTitles)
@@ -297,10 +254,6 @@ struct PersistedState: Codable {
             ?? fallback.hoverTimings
         autoAddNewWindows = container.lenient(Bool.self, .autoAddNewWindows)
             ?? fallback.autoAddNewWindows
-        showOffGroupWindow = container.lenient(Bool.self, .showOffGroupWindow)
-            ?? fallback.showOffGroupWindow
-        showUngroupedSeparately = container.lenient(Bool.self, .showUngroupedSeparately)
-            ?? fallback.showUngroupedSeparately
         clampZoomedWindows = container.lenient(Bool.self, .clampZoomedWindows)
             ?? fallback.clampZoomedWindows
         hideInFullscreen = container.lenient(Bool.self, .hideInFullscreen)
@@ -312,75 +265,111 @@ struct PersistedState: Codable {
         cycleOrder = container.lenient(CycleOrder.self, .cycleOrder) ?? fallback.cycleOrder
         appCycleStaysInGroup = container.lenient(Bool.self, .appCycleStaysInGroup)
             ?? fallback.appCycleStaysInGroup
-        cycleWithinPill = container.lenient(Bool.self, .cycleWithinPill)
-            ?? fallback.cycleWithinPill
         shortcutSeedVersion = container.lenient(Int.self, .shortcutSeedVersion)
             ?? fallback.shortcutSeedVersion
-        swipeOverStrip = container.lenient(Bool.self, .swipeOverStrip)
-            ?? fallback.swipeOverStrip
-        globalSwipeGesture = container.lenient(Bool.self, .globalSwipeGesture)
-            ?? fallback.globalSwipeGesture
-        swipeFingerCounts = container.lenient([Int].self, .swipeFingerCounts)
-            ?? fallback.swipeFingerCounts
         showRunningApps = container.lenient(Bool.self, .showRunningApps)
             ?? fallback.showRunningApps
-        pillView = container.lenient(Bool.self, .pillView) ?? fallback.pillView
-        swipeSensitivity = container.lenient(Double.self, .swipeSensitivity)
-            ?? fallback.swipeSensitivity
-        animateGroupChanges = container.lenient(Bool.self, .animateGroupChanges)
-            ?? fallback.animateGroupChanges
         bootTime = container.lenient(Double.self, .bootTime) ?? 0
+    }
+
+    /// Brings any file up to the one-capsule-per-window model.
+    ///
+    /// Three things have to hold afterwards, and each of them is a decision:
+    ///
+    /// - **Exactly one group is Main.** A file written before Main existed names
+    ///   none, so the first group *called* "Main" is adopted — a user who
+    ///   already built one means that one — and only failing that does the
+    ///   leading group get the job. Main then sorts first.
+    /// - **Main loses every tie.** A window filed in both Main and Work is a
+    ///   Work window: Main is the catch-all, so taking the first group in strip
+    ///   order (which Main is) would empty every specific capsule into it. Among
+    ///   two *specific* groups the first in strip order wins, which is the same
+    ///   deterministic rule the retired pill cycling used.
+    /// - **Main's membership is left alone**, not deleted. It is inert — a window
+    ///   is in Main precisely when nothing else claims it, and nothing reads
+    ///   Main's list — and the first save drops it. Deleting it here instead
+    ///   would throw away the membership of a group that was adopted *as* Main
+    ///   because the file had none, which is exactly the kind of quiet loss the
+    ///   persistence contract exists to prevent.
+    private static func migrate(_ groups: [PersistedGroup],
+                                legacyOrder: [OrderRef],
+                                legacyClusters: [PersistedCluster],
+                                legacyPins: [String],
+                                legacyStacks: [String]) -> [PersistedGroup] {
+        var groups = groups
+        guard !groups.isEmpty else {
+            return [PersistedGroup(id: UUID().uuidString, name: "Main",
+                                   colorIndex: GroupColor.blue.rawValue,
+                                   isMain: true, members: [],
+                                   order: legacyOrder, clusters: legacyClusters,
+                                   pinnedAppBundleIDs: legacyPins,
+                                   stackedAppBundleIDs: legacyStacks)]
+        }
+
+        var mainIndex = groups.firstIndex { $0.isMain }
+            ?? groups.firstIndex { $0.name.lowercased() == "main" }
+            ?? 0
+        groups[mainIndex].isMain = true
+        for index in groups.indices where index != mainIndex { groups[index].isMain = false }
+        if mainIndex != 0 {
+            let main = groups.remove(at: mainIndex)
+            groups.insert(main, at: 0)
+            mainIndex = 0
+        }
+
+        // All's leftovers join Main, appended rather than prepended: Main's own
+        // arrangement is the one that was drawn in its capsule, and All's held
+        // the launchers and the unfiled tail that now belong there too.
+        groups[mainIndex].order += legacyOrder.filter { !groups[mainIndex].order.contains($0) }
+        groups[mainIndex].clusters += legacyClusters
+        groups[mainIndex].pinnedAppBundleIDs += legacyPins
+            .filter { !groups[mainIndex].pinnedAppBundleIDs.contains($0) }
+        groups[mainIndex].stackedAppBundleIDs += legacyStacks
+            .filter { !groups[mainIndex].stackedAppBundleIDs.contains($0) }
+
+        var claimed: Set<MemberRef> = []
+        for index in groups.indices where index != mainIndex {
+            groups[index].members = groups[index].members.filter { claimed.insert($0).inserted }
+        }
+        return groups
     }
 
     /// Written explicitly because `userGroupNames` is read-only legacy — it has
     /// no stored property, which blocks synthesised encoding, and it must not be
-    /// written back out.
+    /// written back out. The retired All-group keys are in the same position:
+    /// read for migration, never written again.
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(groups, forKey: .groups)
-        try container.encode(allGroupOrder, forKey: .allGroupOrder)
-        try container.encode(allGroupClusters, forKey: .allGroupClusters)
-        try container.encode(allGroupPinnedBundleIDs, forKey: .allGroupPinnedBundleIDs)
-        try container.encode(allGroupStackedBundleIDs, forKey: .allGroupStackedBundleIDs)
-        try container.encodeIfPresent(activeGroupID, forKey: .activeGroupID)
-        try container.encode(pinnedAppBundleIDs, forKey: .pinnedAppBundleIDs)
         try container.encode(currentSpaceOnly, forKey: .currentSpaceOnly)
         try container.encode(showTitles, forKey: .showTitles)
         try container.encode(previewMode, forKey: .previewMode)
         try container.encode(hoverTimings, forKey: .hoverTimings)
         try container.encode(autoAddNewWindows, forKey: .autoAddNewWindows)
-        try container.encode(showOffGroupWindow, forKey: .showOffGroupWindow)
-        try container.encode(showUngroupedSeparately, forKey: .showUngroupedSeparately)
         try container.encode(clampZoomedWindows, forKey: .clampZoomedWindows)
         try container.encode(hideInFullscreen, forKey: .hideInFullscreen)
         try container.encode(shortcuts, forKey: .shortcuts)
         try container.encode(switcherHoldDelay, forKey: .switcherHoldDelay)
         try container.encode(cycleOrder, forKey: .cycleOrder)
         try container.encode(appCycleStaysInGroup, forKey: .appCycleStaysInGroup)
-        try container.encode(cycleWithinPill, forKey: .cycleWithinPill)
         try container.encode(shortcutSeedVersion, forKey: .shortcutSeedVersion)
-        try container.encode(swipeOverStrip, forKey: .swipeOverStrip)
-        try container.encode(globalSwipeGesture, forKey: .globalSwipeGesture)
-        try container.encode(swipeFingerCounts, forKey: .swipeFingerCounts)
         try container.encode(showRunningApps, forKey: .showRunningApps)
-        try container.encode(pillView, forKey: .pillView)
-        try container.encode(swipeSensitivity, forKey: .swipeSensitivity)
-        try container.encode(animateGroupChanges, forKey: .animateGroupChanges)
         try container.encode(bootTime, forKey: .bootTime)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case groups, allGroupOrder, allGroupClusters, allGroupPinnedBundleIDs
-        case allGroupStackedBundleIDs, activeGroupID
-        case pinnedAppBundleIDs, currentSpaceOnly, showTitles, previewMode, hoverTimings
-        case autoAddNewWindows, showOffGroupWindow, showUngroupedSeparately
-        case clampZoomedWindows, hideInFullscreen
+        case groups
+        case currentSpaceOnly, showTitles, previewMode, hoverTimings
+        case autoAddNewWindows, clampZoomedWindows, hideInFullscreen
         case shortcuts, switcherHoldDelay, shortcutSeedVersion
-        case cycleOrder, appCycleStaysInGroup, cycleWithinPill
-        case swipeOverStrip, globalSwipeGesture, swipeFingerCounts
-        case swipeSensitivity, animateGroupChanges, bootTime, showRunningApps, pillView
+        case cycleOrder, appCycleStaysInGroup
+        case bootTime, showRunningApps
         /// Retired in favour of `groups`; still read so existing files migrate.
         case userGroupNames
+        /// The retired built-in All group. Read once, folded into Main, never
+        /// written again — see `migrate`.
+        case allGroupOrder, allGroupClusters, allGroupPinnedBundleIDs
+        case allGroupStackedBundleIDs, pinnedAppBundleIDs
     }
 }
 

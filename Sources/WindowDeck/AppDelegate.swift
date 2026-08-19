@@ -7,8 +7,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let engine = WindowEngine()
     private let hotKeys = HotKeyManager()
     private var switcher: SwitcherController!
-    private var groupSwitcher: GroupSwitcherController!
-    private let gestures = GestureMonitor()
     private var blurCaptureWork: [CGWindowID: DispatchWorkItem] = [:]
     /// Until this moment, trust the focus we asked for over what the window
     /// server reports — it has not caught up yet.
@@ -93,15 +91,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.deck.setFullscreen(snapshot.isFullscreen, enabled: self.store.hideInFullscreen)
             // Groups rebuild themselves here, not at launch: after a reboot the
             // windows arrive gradually as applications reopen.
-            // Restore first: a window that belongs to a saved group should rejoin
-            // it rather than be captured by whichever group is active.
+            //
+            // The order of these four is the whole of "which capsule does this
+            // window belong to", and each step exists because of a bug:
+            // restore first, so a window returning to a saved group is not
+            // treated as new; then the capture decision, computed *before*
+            // rebinding and handed to it, so a window opened while working in
+            // one capsule cannot be claimed by another's long-dead slot; then
+            // the appeared path for tab switches, which create nothing.
             let restored = self.store.restorePass(against: windows)
-            // Before auto-capture: a window returning to a group it already
-            // belonged to must not be treated as brand new and swept into
-            // whichever group happens to be showing.
-            // The capture decision is made first and handed to rebinding, so a
-            // window opened in one group cannot be claimed by another's relic.
-            let intended = self.store.captureTargets(focusHint: previousFocus)
+            let intended = self.store.captureTarget(focusHint: previousFocus)
             let rebound = self.store.rebindReopenedWindows(snapshot.created,
                                                            preferring: intended)
             // Windows that merely came into view rather than being created —
@@ -135,22 +134,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switcher = SwitcherController(store: store)
         switcher.onCommit = { [weak self] window in self?.engine.focus(window) }
 
-        groupSwitcher = GroupSwitcherController(store: store)
-        // Read live rather than captured: the strip resizes constantly as
-        // windows open and close, so a rect taken once would soon be wrong.
-        groupSwitcher.anchorProvider = { [weak self] in self?.deck.selectorFrame ?? .zero }
-
-        // Two independent paths to the same action. The strip swipe is free;
-        // the global one costs Input Monitoring, so it is opt-in and either can
-        // run without the other.
-        gestures.onSwipe = { [weak self] direction in self?.stepGroup(direction) }
-        deck.onStripSwipe = { [weak self] direction in
-            guard let self, self.store.swipeOverStrip else { return }
-            self.stepGroup(direction)
-        }
-        store.onGestureSettingsChanged = { [weak self] in self?.syncGestures() }
-        syncGestures()
-
         store.onWindowLostFocus = { [weak self] window in
             self?.scheduleBlurCapture(window)
         }
@@ -158,31 +141,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 
         hotKeys.onTrigger = { [weak self] action, reversed in
-            guard let self else { return }
-            switch action {
-            case .selectGroup(let position):
-                self.store.selectGroup(atPosition: position)
-            case .cycleGroupWindows, .cycleAppWindows:
-                guard let shortcut = self.store.shortcuts[action] else { return }
-                self.switcher.handle(action: action, reversed: reversed, shortcut: shortcut)
-            case .cycleGroups(let direction):
-                guard let shortcut = self.store.shortcuts[action] else { return }
-                self.groupSwitcher.handle(direction: direction, shortcut: shortcut)
-            }
+            guard let self, let shortcut = self.store.shortcuts[action] else { return }
+            self.switcher.handle(action: action, reversed: reversed, shortcut: shortcut)
         }
         store.onShortcutsChanged = { [weak self] in self?.syncHotKeys() }
         syncHotKeys()
-        trackGroupCount()
 
         NSLog("WindowDeck: launched — accessibility trusted = %@", Permissions.isTrusted ? "YES" : "NO")
 
         // Permission state first, because it explains most "it does nothing"
-        // reports on its own: without Accessibility the app is inert, and the
-        // other two silently disable one feature each.
-        Trace.log(.system, "permissions — accessibility \(Permissions.isTrusted ? "granted" : "DENIED"), "
-            + "input monitoring \(Permissions.canMonitorInput ? "granted" : "denied")")
+        // reports on its own: without Accessibility the app is inert, and
+        // without Screen Recording the previews silently show nothing.
+        Trace.log(.system, "permissions — accessibility \(Permissions.isTrusted ? "granted" : "DENIED")")
         Trace.log(.system, "settings — \(store.groups.count) groups, preview \(store.previewMode), "
-            + "currentSpaceOnly \(store.currentSpaceOnly), pillView \(store.pillView), "
+            + "currentSpaceOnly \(store.currentSpaceOnly), "
             + "\(store.shortcuts.count) shortcuts bound")
         startHeartbeat()
 
@@ -237,22 +209,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// keeping them in one place is what stops the Settings list showing a
     /// working shortcut as unavailable after groups change.
     private func syncHotKeys() {
-        // Only offer group shortcuts for groups that exist, or a stale binding
-        // would occupy a combination nothing can reach.
-        let usable = store.shortcuts.filter { action, _ in
-            if case .selectGroup(let position) = action {
-                return position <= store.groups.count
-            }
-            return true
-        }
+        let usable = store.shortcuts
 
         // `register` unregisters everything first, so repeating it with an
         // identical set is not merely wasted work — it leaves a window in which
-        // no shortcut is bound at all. The tracker below fires on *any* mutation
-        // of `groups`, not only on a change to its count, and `groups` is
-        // rewritten on every refresh that touches membership or ordering: the
-        // diagnostics log showed all eleven hotkeys being torn down and rebuilt
-        // roughly every three seconds, indefinitely.
+        // no shortcut is bound at all. This used to be driven by an observation
+        // tracker on `groups`, which fires on *any* mutation and not only on a
+        // change of count: the diagnostics log showed every hotkey being torn
+        // down and rebuilt roughly every three seconds, indefinitely. The
+        // tracker is gone with the group shortcuts it existed for, and this
+        // guard stays, because the cost of getting it wrong is silence.
         guard usable != registeredShortcuts else { return }
         registeredShortcuts = usable
         hotKeys.register(usable)
@@ -270,20 +236,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("WindowDeck: system refused %@", refused
                 .map { "\($0.storageKey)=\(store.shortcuts[$0]?.displayString ?? "?")" }
                 .sorted().joined(separator: ", "))
-        }
-    }
-
-    /// Adding, deleting or reordering groups changes which position each
-    /// shortcut maps to, so the registrations are rebuilt.
-    private func trackGroupCount() {
-        withObservationTracking {
-            _ = store.groups.count
-        } onChange: { [weak self] in
-            Task { @MainActor in
-                guard let self else { return }
-                self.syncHotKeys()
-                self.trackGroupCount()
-            }
         }
     }
 
@@ -381,7 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        store.selectGroup(store.addGroup(named: name).id)
+        store.addGroup(named: name)
     }
 
     private func promptRenameCluster(_ cluster: WindowCluster) {
@@ -404,38 +356,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         settings.show()
-    }
-
-    /// One step through the groups, the same move a tap of ⌘↑/⌘↓ makes. A swipe
-    /// is a discrete gesture with no held modifier, so it commits immediately
-    /// rather than opening the list.
-    private func stepGroup(_ direction: GroupCycleDirection) {
-        let index = store.groupIndex(steppedBy: direction.step, from: store.activeGroupIndex)
-        guard store.groups.indices.contains(index) else { return }
-        // Direction passed explicitly so the slide follows the swipe even when
-        // the step wraps round the end of the list.
-        store.selectGroup(store.groups[index].id, direction: direction)
-    }
-
-    /// Starts, stops or reconfigures the global tap to match the settings.
-    private func syncGestures() {
-        gestures.fingerCounts = store.swipeFingerCounts
-        gestures.travelThreshold = store.globalSwipeTravel
-        deck.syncSwipeSensitivity()
-
-        guard store.globalSwipeGesture else {
-            gestures.stop()
-            return
-        }
-        guard !gestures.isRunning else { return }
-        if !gestures.start() {
-            // Not yet granted. Prompt once; the toggle stays on so it starts by
-            // itself as soon as the permission lands.
-            Permissions.requestInputMonitoring()
-            Permissions.pollUntilInputMonitoring { [weak self] in
-                _ = self?.gestures.start()
-            }
-        }
     }
 
     @objc private func quit() {

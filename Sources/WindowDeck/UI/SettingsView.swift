@@ -69,20 +69,17 @@ struct GroupsSettingsView: View {
                         Circle()
                             .fill(group.displayColor)
                             .frame(width: 9, height: 9)
-                            .opacity(group.isAll ? 0.35 : 1)
                         Text(group.name)
-                        Spacer()
-                        // Position drives the shortcut, so it's shown here rather
-                        // than left as a hidden binding.
-                        if let shortcut = store.shortcutLabel(for: group.id) {
-                            Text(shortcut)
+                        if group.isMain {
+                            Text("fallback")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                                .strikethrough(!store.shortcutWorks(for: group.id))
-                                .help(store.shortcutWorks(for: group.id)
-                                      ? "Switches to this group"
-                                      : "Unavailable — macOS uses this for Switch to Desktop")
+                                .help("Windows no other group claims are drawn here")
                         }
+                        Spacer()
+                        Text("\(store.windowCount(of: group))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     .tag(group.id)
                 }
@@ -95,7 +92,7 @@ struct GroupsSettingsView: View {
                 Button { addGroup() } label: { Image(systemName: "plus") }
                     .help("New group")
                 Button { requestDelete() } label: { Image(systemName: "minus") }
-                    .disabled(selectedGroup == nil || selectedGroup?.isAll == true)
+                    .disabled(selectedGroup == nil || selectedGroup?.isMain == true)
                     .help("Delete group")
                 Spacer()
             }
@@ -107,11 +104,7 @@ struct GroupsSettingsView: View {
     @ViewBuilder
     private var detail: some View {
         if let group = selectedGroup {
-            if group.isAll {
-                allGroupDetail
-            } else {
-                groupDetail(group)
-            }
+            groupDetail(group)
         } else {
             Text("Select a group")
                 .foregroundStyle(.secondary)
@@ -195,11 +188,18 @@ struct GroupsSettingsView: View {
 
             // A checkbox list rather than an available/selected shuttle: every
             // window's membership is visible at once and assigning is one click.
+            //
+            // Ticking one *moves* the window here, since it can only be in one
+            // capsule; unticking sends it back to Main. The badge on the right
+            // says where it is now, so a window leaving another group is visible
+            // rather than silent.
             List {
                 ForEach(filteredWindows) { window in
                     Toggle(isOn: Binding(
                         get: { store.isMember(window.id, of: group.id) },
-                        set: { _ in store.toggle(window.id, in: group.id) }
+                        set: { wanted in
+                            store.add(window.id, to: wanted ? group.id : store.main.id)
+                        }
                     )) {
                         HStack(spacing: 8) {
                             if let icon = window.icon {
@@ -210,11 +210,7 @@ struct GroupsSettingsView: View {
                             Text(window.appName)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            // Every group this window is already in, so you can
-                            // see overlaps while assigning.
-                            ForEach(store.memberGroups(of: window.id)) { member in
-                                GroupBadge(group: member)
-                            }
+                            GroupBadge(group: store.group(of: window.id))
                         }
                     }
                 }
@@ -230,7 +226,7 @@ struct GroupsSettingsView: View {
             .frame(height: 260)
 
             Text("Pinned apps").font(.headline)
-            Text("Launchers shown while this group is active. Each group keeps its own.")
+            Text("Launchers drawn inside this capsule. Each group keeps its own.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             PinnedAppsEditor(store: store, groupID: group.id)
@@ -248,30 +244,6 @@ struct GroupsSettingsView: View {
         .padding(16)
     }
 
-    private var allGroupDetail: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Text("Name")
-                Text("All").fontWeight(.medium)
-                Text("(built-in)").foregroundStyle(.secondary)
-            }
-            Text("Every open window is listed automatically.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-
-            Divider()
-
-            Text("Pinned apps").font(.headline)
-            Text("Launchers shown in All. They stay put whether or not the app is running.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            PinnedAppsEditor(store: store, groupID: DeckGroup.allGroupID)
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
     private var filteredWindows: [WindowInfo] {
         guard !filter.isEmpty else { return store.windows }
         return store.windows.filter {
@@ -281,7 +253,7 @@ struct GroupsSettingsView: View {
     }
 
     private func memberCount(_ group: DeckGroup) -> Int {
-        store.windows.filter { group.memberIDs.contains($0.id) }.count
+        store.windowCount(of: group)
     }
 
     private func addGroup() {
@@ -296,7 +268,7 @@ struct GroupsSettingsView: View {
     }
 
     private func requestDelete() {
-        guard let group = selectedGroup, !group.isAll else { return }
+        guard let group = selectedGroup, !group.isMain else { return }
         // Only interrupt when there's something to lose.
         if memberCount(group) == 0 {
             store.deleteGroup(group.id)
@@ -415,56 +387,6 @@ struct BehaviorSettingsView: View {
 
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
     @State private var loginError: String?
-    /// Re-read on appear rather than stored: the grant is flipped outside the
-    /// app, so a cached value goes stale the moment the user visits Settings.
-    @State private var canMonitorInput = Permissions.canMonitorInput
-
-    private var fingerCountPicker: some View {
-        HStack {
-            Text("Fingers")
-            Spacer()
-            ForEach([3, 4], id: \.self) { count in
-                Toggle("\(count)", isOn: Binding(
-                    get: { store.swipeFingerCounts.contains(count) },
-                    set: { on in
-                        var counts = store.swipeFingerCounts
-                        if on { counts.insert(count) } else { counts.remove(count) }
-                        // Clearing both would leave the tap running and deaf.
-                        if counts.isEmpty { counts.insert(count) }
-                        store.swipeFingerCounts = counts
-                    }
-                ))
-                .toggleStyle(.checkbox)
-            }
-        }
-    }
-
-    private var sensitivityLabel: String {
-        switch store.swipeSensitivity {
-        case ..<0.25: "Sweep"
-        case ..<0.5: "Firm"
-        case ..<0.75: "Light"
-        default: "Flick"
-        }
-    }
-
-    @ViewBuilder
-    private var inputMonitoringStatus: some View {
-        HStack(spacing: 8) {
-            Image(systemName: canMonitorInput ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(canMonitorInput ? .green : .orange)
-            Text(canMonitorInput
-                 ? "Input Monitoring granted"
-                 : "Input Monitoring needed — swipes anywhere won't work until it's granted")
-                .font(.caption)
-            Spacer()
-            if !canMonitorInput {
-                Button("Open Settings…") { Permissions.openInputMonitoringPane() }
-            }
-        }
-        .onAppear { canMonitorInput = Permissions.canMonitorInput }
-    }
-
     var body: some View {
         Form {
             Section {
@@ -489,88 +411,23 @@ struct BehaviorSettingsView: View {
                 you actually quit it. Only apps the Dock itself would show are included, so \
                 menu-bar utilities and background helpers stay out.
 
-                In All this covers every running app. Inside a group it covers only apps that had \
-                a window in that group.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-
-            Section {
-                Toggle("Group windows by arrangement in All", isOn: $store.pillView)
-                Text("""
-                All draws each group's windows inside a capsule tinted with that group's colour, \
-                rather than one flat row. A window in several groups appears in each of them, and \
-                unfiled windows sit in a plain capsule at the end.
-
-                Dragging a window from one capsule to another moves it between those groups.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-
-            Section("Trackpad") {
-                Toggle("Swipe over the strip to switch groups", isOn: $store.swipeOverStrip)
-                Text("""
-                A horizontal swipe while the pointer is over the bar moves one group along. \
-                This needs no permission at all — the events reach the strip because you are \
-                pointing at it, not because the app is watching your input.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                Toggle("Swipe anywhere to switch groups", isOn: $store.globalSwipeGesture)
-                Text("""
-                A three- or four-finger horizontal swipe anywhere on screen. This one requires \
-                Input Monitoring, which is broader than anything else the app asks for — it \
-                covers all keyboard and pointer input, so it stays off unless you turn it on.
-
-                macOS normally uses these swipes for switching Spaces and will keep doing so. \
-                Turn off "Swipe between full-screen applications" in System Settings › Trackpad › \
-                More Gestures, or both will happen at once.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                if store.globalSwipeGesture {
-                    fingerCountPicker
-                    inputMonitoringStatus
-                }
-
-                if store.swipeOverStrip || store.globalSwipeGesture {
-                    HStack {
-                        Text("Sensitivity")
-                        Slider(value: $store.swipeSensitivity, in: 0...1)
-                        Text(sensitivityLabel).font(.caption).foregroundStyle(.secondary)
-                            .frame(width: 62, alignment: .trailing)
-                    }
-                    Text("""
-                    How far your fingers must travel before the group changes. Higher means a \
-                    lighter flick is enough; lower asks for a deliberate sweep and is less likely \
-                    to fire while you are scrolling something.
-                    """)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-
-                Toggle("Slide the strip when the group changes", isOn: $store.animateGroupChanges)
-                Text("""
-                The bar slides in the direction you moved and resizes to its new contents as it \
-                goes. Turn this off for an instant change.
+                Main covers every running app the Dock would show. A named capsule covers only \
+                apps that had a window in it.
                 """)
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
 
             Section("Groups") {
-                Toggle("Add new windows to the active group", isOn: $store.autoAddNewWindows)
+                Toggle("New windows join the capsule you're working in",
+                       isOn: $store.autoAddNewWindows)
                 Text("""
-                While a group other than All is showing, any window you open joins it automatically. \
-                Windows already open are untouched, and switching Space doesn't sweep anything in — \
-                only genuinely new windows are captured.
+                A window you open joins the capsule holding the window you were last working in, \
+                and lands in Main when that was Main. Windows already open are untouched, and \
+                switching Space sweeps nothing in — only genuinely new windows are captured.
 
                 Paused while groups are still being restored after a restart, so reopening \
-                applications aren't swept into whichever group you happen to be viewing.
+                applications aren't swept into the wrong capsule.
                 """)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -590,19 +447,6 @@ struct BehaviorSettingsView: View {
                 Toggle("Hide the strip in fullscreen", isOn: $store.hideInFullscreen)
                 Text("Push the cursor to the very bottom of the screen to bring it back, the way "
                      + "the Dock behaves.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Toggle("Separate ungrouped windows in All", isOn: $store.showUngroupedSeparately)
-                Text("In the All tab, windows that belong to no group are moved to the right of a "
-                     + "divider, so it is obvious at a glance what still needs filing.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Toggle("Show the focused window when it isn't in this group",
-                       isOn: $store.showOffGroupWindow)
-                Text("Appears faded at the end, after a separator, so the strip always says which "
-                     + "window you are actually in.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -730,12 +574,6 @@ struct ShortcutsSettingsView: View {
     /// Named rather than sliced out of one list by position — the sections drifted
     /// apart the moment an action was added in the middle.
     private static let windowActions: [ShortcutAction] = [.cycleGroupWindows, .cycleAppWindows]
-    private static let groupCycleActions: [ShortcutAction] = [
-        .cycleGroups(.previous), .cycleGroups(.next)
-    ]
-    private var groupSelectActions: [ShortcutAction] {
-        (1...min(store.groups.count, 9)).map { ShortcutAction.selectGroup($0) }
-    }
 
     var body: some View {
         Form {
@@ -759,24 +597,13 @@ struct ShortcutsSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Toggle("In All, cycle within the pill you're working in",
-                       isOn: $store.cycleWithinPill)
-                Text("""
-                In All's pill view, both cycling shortcuts are limited to the capsule holding the \
-                window you are in, rather than to every window on the bar. A window that belongs to \
-                several groups uses the leftmost capsule it appears in; an unfiled window uses the \
-                unfiled capsule. Only applies in pill view.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                Toggle("Cycling this app's windows stays in the current group",
+                Toggle("Cycling this app's windows stays in the capsule",
                        isOn: $store.appCycleStaysInGroup)
                 Text("""
-                Cycling an app's windows is always limited to the group on screen while you are \
-                standing in it. This decides what happens when you are not: on, it moves you into \
-                the group's windows of that app; off, it falls back to every window that app has \
-                open, wherever it is.
+                Cycling is always limited to the capsule holding the window you are in. This \
+                decides what happens when that capsule has only one window of the app: on, the \
+                shortcut stays put; off, it falls back to every window that app has open, \
+                wherever on the strip it is.
                 """)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -787,33 +614,6 @@ struct ShortcutsSettingsView: View {
                 Release the key faster than this and it simply switches, with no interface shown \
                 at all. Hold longer and the switcher appears so you can pick. Set it to 0 to \
                 always show it.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-
-            Section("Groups") {
-                ForEach(Self.groupCycleActions, id: \.storageKey) { action in
-                    row(action)
-                }
-                Text("""
-                Same hold-and-tap behaviour: tap to move one group, or hold to open the list and \
-                keep tapping, then let go to switch. The list runs in strip order and wraps at \
-                both ends.
-
-                ⌘↑ and ⌘↓ are used by other apps — Finder's enclosing folder and open, and \
-                start and end of document in text editors. Recording them here takes them from \
-                those apps, so pick something else if you rely on them.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                ForEach(groupSelectActions, id: \.storageKey) { action in
-                    row(action)
-                }
-                Text("""
-                macOS claims ⌃1–⌃9 for "Switch to Desktop" whenever you have more than one \
-                Desktop, and it wins. If one shows as in use, record a different combination here.
                 """)
                 .font(.caption)
                 .foregroundStyle(.secondary)
