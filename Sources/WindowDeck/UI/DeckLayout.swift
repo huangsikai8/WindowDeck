@@ -150,8 +150,11 @@ enum DeckLayout {
         }
 
         // An app is "crowded" when more than one of its windows is loose on the
-        // strip. Clustered windows don't count — they aren't competing for
-        // recognition, they're already behind one icon.
+        // strip. Clustered and stacked windows don't count — they aren't
+        // competing for recognition, they're already behind one icon. Stacks get
+        // this for free by no longer being `.window` items, which is also what
+        // stops a stacked app forcing titles onto its own single loose window in
+        // some other group.
         var windowsPerApp: [pid_t: Int] = [:]
         for case .window(let window) in items {
             windowsPerApp[window.pid, default: 0] += 1

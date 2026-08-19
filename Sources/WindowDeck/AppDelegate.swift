@@ -17,6 +17,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settings: SettingsWindowController!
     private var statusItem: NSStatusItem!
     private var terminationSource: DispatchSourceSignal?
+    private var heartbeatTimer: Timer?
+    /// What was last handed to Carbon, so an unchanged set is not re-registered.
+    private var registeredShortcuts: [ShortcutAction: Shortcut]?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Never shown (agent app), but it is what makes ⌘A/⌘C/⌘V work in the
@@ -173,9 +176,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSLog("WindowDeck: launched — accessibility trusted = %@", Permissions.isTrusted ? "YES" : "NO")
 
+        // Permission state first, because it explains most "it does nothing"
+        // reports on its own: without Accessibility the app is inert, and the
+        // other two silently disable one feature each.
+        Trace.log(.system, "permissions — accessibility \(Permissions.isTrusted ? "granted" : "DENIED"), "
+            + "input monitoring \(Permissions.canMonitorInput ? "granted" : "denied")")
+        Trace.log(.system, "settings — \(store.groups.count) groups, preview \(store.previewMode), "
+            + "currentSpaceOnly \(store.currentSpaceOnly), pillView \(store.pillView), "
+            + "\(store.shortcuts.count) shortcuts bound")
+        startHeartbeat()
+
         if Permissions.isTrusted {
             engine.start()
         } else {
+            Trace.warn(.system, "accessibility DENIED — engine not started, app is inert until granted")
             // The strip stays up showing a "Grant Accessibility…" affordance;
             // trust is only re-read out of band, so we watch for the flip.
             Permissions.requestTrust()
@@ -183,6 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 MainActor.assumeIsolated {
                     NSLog("WindowDeck: accessibility granted — starting engine")
+                    Trace.log(.system, "accessibility granted — starting engine")
                     self.store.refreshTrust()
                     self.engine.start()
                 }
@@ -191,9 +206,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        Trace.log(.app, "terminating — flushing state")
         store.saveNow()
         engine.stop()
         hotKeys.unregisterAll()
+        heartbeatTimer?.invalidate()
+        // Last, so everything above is already on disk when the clean-exit
+        // marker is written. A marker that beats the final lines would claim a
+        // tidy shutdown for a session that never finished one.
+        Trace.markCleanExit()
     }
 
     /// `pkill` — which the build script uses on every rebuild — sends SIGTERM,
@@ -204,6 +225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signal(SIGTERM, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         source.setEventHandler { [weak self] in
+            Trace.log(.app, "SIGTERM received (rebuild or kill) — saving before exit")
             self?.store.saveNow()
             NSApp.terminate(nil)
         }
@@ -223,6 +245,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return true
         }
+
+        // `register` unregisters everything first, so repeating it with an
+        // identical set is not merely wasted work — it leaves a window in which
+        // no shortcut is bound at all. The tracker below fires on *any* mutation
+        // of `groups`, not only on a change to its count, and `groups` is
+        // rewritten on every refresh that touches membership or ordering: the
+        // diagnostics log showed all eleven hotkeys being torn down and rebuilt
+        // roughly every three seconds, indefinitely.
+        guard usable != registeredShortcuts else { return }
+        registeredShortcuts = usable
         hotKeys.register(usable)
         store.registeredActions = hotKeys.registeredActions
 
@@ -231,6 +263,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // anything — "the key does nothing" is otherwise indistinguishable from a
         // bug in the action itself.
         let refused = usable.keys.filter { !hotKeys.registeredActions.contains($0) }
+        Trace.log(.hotkey, "registered \(hotKeys.registeredActions.count)/\(usable.count) shortcuts"
+            + (refused.isEmpty ? "" : " — macOS refused \(refused.map(\.storageKey).joined(separator: ", "))"),
+            level: refused.isEmpty ? .info : .warn)
         if !refused.isEmpty {
             NSLog("WindowDeck: system refused %@", refused
                 .map { "\($0.storageKey)=\(store.shortcuts[$0]?.displayString ?? "?")" }
@@ -265,6 +300,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "New Group…", action: #selector(promptNewGroup), keyEquivalent: "n"))
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Reveal Diagnostics Log",
+                                action: #selector(revealLog), keyEquivalent: ""))
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit WindowDeck", action: #selector(quit), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
         statusItem.menu = menu
@@ -295,6 +333,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func applicationLaunched() {
         store.extendRestoreWindow()
+    }
+
+    /// Selects the log in the Finder rather than opening it. A log is read in
+    /// whatever the reader prefers, and its neighbour — the previous
+    /// generation — is usually wanted too.
+    @objc private func revealLog() {
+        NSWorkspace.shared.activateFileViewerSelecting([Trace.logURL])
+    }
+
+    /// One line a minute saying what this process actually costs.
+    ///
+    /// Deliberately a fixed, slow cadence rather than something tied to
+    /// activity: the question it answers — "was WindowDeck the thing making the
+    /// machine slow?" — is asked after the fact, about a period nobody was
+    /// measuring at the time. It has twice turned out to be something else, so
+    /// the log needs to be able to say so.
+    private func startHeartbeat() {
+        Trace.heartbeat(windows: store.windows.count, groups: store.groups.count)
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                Trace.heartbeat(windows: self.store.windows.count, groups: self.store.groups.count)
+            }
+        }
     }
 
     @objc private func toggleDeck() {

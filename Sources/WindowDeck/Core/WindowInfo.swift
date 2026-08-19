@@ -90,11 +90,16 @@ extension WindowInfo {
     /// Only for the self-test. A real `WindowInfo` carries an `AXUIElement`,
     /// which cannot be conjured; a null element is fine because the harness never
     /// touches Accessibility.
+    /// - Parameter pid: defaults to 0, which is fine for anything keyed on
+    ///   window id or bundle id — but **app-scoped cycling filters on `pid`**, so
+    ///   a fixture that leaves every window at 0 makes every window the same
+    ///   application and any test of that scoping vacuous. Set it whenever the
+    ///   thing under test distinguishes applications.
     static func testInstance(id: CGWindowID, bundleID: String, title: String,
-                             frame: CGRect? = nil) -> WindowInfo {
+                             frame: CGRect? = nil, pid: pid_t = 0) -> WindowInfo {
         WindowInfo(
             id: id,
-            pid: 0,
+            pid: pid,
             bundleID: bundleID,
             appName: bundleID,
             title: title,

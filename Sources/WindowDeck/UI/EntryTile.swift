@@ -41,6 +41,12 @@ struct EntryTile: View {
     /// What this window can be merged with, and the action that does it.
     var groupWithTargets: [AppStore.GroupWithTarget] = []
     var onGroupWith: ((CGWindowID) -> Void)?
+    /// How many windows of this application are on show here, or nil when there
+    /// is nothing worth stacking. A plain count rather than a list of windows:
+    /// building a per-tile menu model on every redraw was once measured at 46%
+    /// of this app's CPU, and the stack menu needs only the number.
+    var stackableCount: Int?
+    var onStack: (() -> Void)?
 
     @State private var isHovering = false
     @State private var frame: CGRect = .zero
@@ -224,6 +230,15 @@ struct EntryTile: View {
                     .disabled(target.isSelf)
                 }
             }
+        }
+
+        // Collapsing this app's windows behind one icon. Distinct from "Group
+        // with" directly above it, which merges *chosen* windows of any
+        // applications and opens all of them — this one names an application and
+        // opens a single window. Saying the app and the count in the label is
+        // what keeps the two apart at the moment of choosing.
+        if let onStack, let stackableCount {
+            Button("Stack \(window.appName)'s \(stackableCount) Windows", action: onStack)
         }
 
         // Pinning from here is the natural place to reach for it: you are already

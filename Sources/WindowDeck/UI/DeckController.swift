@@ -12,6 +12,7 @@ final class DeckController {
     private let hosting: NSHostingView<DeckView>
     let hover = HoverController()
     private let allGroups = AllGroupsPanel()
+    private let stackPanel = AppStackPanel()
 
     private var isHiddenForFullscreen = false
     /// Hidden deliberately via the menu bar item, which fullscreen must not undo.
@@ -32,6 +33,8 @@ final class DeckController {
         // Assigned after init so the handlers can reach `self`.
         var hoverHandler: (WindowInfo, Bool, CGRect) -> Void = { _, _, _ in }
         var showAllGroups: () -> Void = {}
+        var stackHoverHandler: (String, String, [WindowInfo], Bool, CGRect) -> Void
+            = { _, _, _, _, _ in }
         self.hosting = NSHostingView(rootView: DeckView(
             store: store,
             onActivate: onActivate,
@@ -41,7 +44,10 @@ final class DeckController {
             onHover: { window, hovering, frame in hoverHandler(window, hovering, frame) },
             onActivateAll: onActivateAll,
             onRenameCluster: onRenameCluster,
-            onShowAllGroups: { showAllGroups() }
+            onShowAllGroups: { showAllGroups() },
+            onStackHover: { bundleID, name, windows, hovering, frame in
+                stackHoverHandler(bundleID, name, windows, hovering, frame)
+            }
         ))
 
         // Empty sizing options: by default NSHostingView installs constraints
@@ -89,6 +95,35 @@ final class DeckController {
                 anchor: self.screenRect(fromHosting: frame),
                 entering: hovering
             )
+        }
+
+        stackHoverHandler = { [weak self] bundleID, name, windows, hovering, frame in
+            guard let self else { return }
+            // The two panels are mutually exclusive: a stack tile has no single
+            // window to preview, and leaving one up while the other opens would
+            // stack two floating panels over the strip.
+            //
+            // The stack is asked *first*, and the order is the whole fix for a
+            // stacked app stalling in the middle of a sweep. What makes the
+            // strip warm is a panel being on screen, and taking the preview down
+            // before the stack looks leaves only the lingering window — which is
+            // zero for anyone who set it that way, so the stack went back to the
+            // full delay while a thumbnail was still visibly up. Nothing left
+            // the bar; this is a handover, not a departure. Both run in one
+            // turn, so the preview never draws a frame alongside the list.
+            self.stackPanel.hover(
+                bundleID: bundleID,
+                name: name,
+                windows: windows,
+                anchor: self.screenRect(fromHosting: frame),
+                entering: hovering,
+                timings: self.store.hoverTimings
+            )
+            if hovering { self.hover.cancel() }
+        }
+
+        stackPanel.onSelect = { [weak self] window in
+            self?.onActivateWindow?(window)
         }
     }
 

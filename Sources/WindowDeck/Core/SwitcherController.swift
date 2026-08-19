@@ -87,13 +87,10 @@ final class SwitcherController {
         // suppress a reorder; the transaction can.
         withTransaction(Transaction(animation: nil)) {
             panel.model.candidates = candidates
-            // Index 1, not 0: index 0 is the window you are already in, so the
-            // first tap must land on the one before it. Only meaningful because
-            // cycleCandidates places the current window at 0 explicitly. With a
-            // lone candidate there is nowhere else to go, so it stays at 0.
-            panel.model.selection = candidates.count > 1
-                ? (reversed ? candidates.count - 1 : 1)
-                : 0
+            // Where the first tap lands depends on how the list was ordered —
+            // index 0 is the current window only in most-recently-used order —
+            // so the store decides, next to the ordering that makes it true.
+            panel.model.selection = store.cycleStartIndex(candidates, reversed: reversed)
 
             // Everything already captured is shown immediately. Opening performs
             // no capturing of its own — windows you have used were snapshotted

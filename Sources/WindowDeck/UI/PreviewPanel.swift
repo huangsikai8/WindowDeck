@@ -41,8 +41,6 @@ final class HoverController {
     private var current: WindowInfo?
     private var currentAnchor: CGRect = .zero
     private var isOverPanel = false
-    /// Set when the panel hides; until it lapses, the next hover skips the wait.
-    private var warmUntil: Date?
 
     /// Read fresh on every hover so Settings changes apply without a restart.
     var timings: HoverTimings = .defaults
@@ -160,8 +158,9 @@ final class HoverController {
     /// you to the full wait.
     private var isWarm: Bool {
         if panel.isVisible && model.isExpanded { return true }
-        if let warmUntil, Date() < warmUntil { return true }
-        return false
+        // Shared with the app-stack list: warmth belongs to the strip, not to
+        // one panel, or crossing between the two re-imposes the full delay.
+        return StripWarmth.shared.isWarm
     }
 
     // MARK: - The two states
@@ -172,6 +171,7 @@ final class HoverController {
     }
 
     private func expand(_ window: WindowInfo, anchor: CGRect) {
+        StripWarmth.shared.hold("preview")
         model.isExpanded = true
         layout(anchor: anchor, expanded: true)
         panel.orderFrontRegardless()
@@ -314,7 +314,9 @@ final class HoverController {
         // Stay warm briefly, so glancing away and back doesn't re-impose the
         // full delay.
         if model.isExpanded {
-            warmUntil = Date().addingTimeInterval(timings.warmWindow)
+            StripWarmth.shared.release("preview", staying: timings.warmWindow)
+        } else {
+            StripWarmth.shared.release("preview", staying: 0)
         }
         peek.hide()
         panel.orderOut(nil)
@@ -326,6 +328,15 @@ final class HoverController {
 
     func forget(_ id: CGWindowID) {
         service.forget(id)
+    }
+
+    /// Takes the preview down at once, cancelling anything scheduled.
+    ///
+    /// For the moment the pointer moves onto a stacked app: that tile has its own
+    /// panel and no single window to preview, so both must never be up together.
+    func cancel() {
+        guard current != nil || panel.isVisible else { return }
+        hideAll()
     }
 }
 

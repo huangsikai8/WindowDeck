@@ -107,6 +107,15 @@ struct DeckGroup: Identifiable, Hashable {
     /// membership, since which apps you want to hand are exactly what differs
     /// between one context and another.
     var pinnedApps: [PinnedApp]
+    /// Applications whose windows are collapsed behind a single icon here.
+    ///
+    /// A *rule*, not a list of windows — which is the whole difference from
+    /// `clusters`. Every window of a named app in this group is in its stack, so
+    /// one opened later joins on its own and one closed leaves without anything
+    /// having to notice. That is why this can be a bare bundle id: there are no
+    /// window ids to go stale, nothing to prune, and nothing for
+    /// `rebindReopenedWindows` to repair.
+    var stackedAppBundleIDs: Set<String> = []
     /// The built-in "All" group: shows every window, can't be renamed, deleted,
     /// or moved out of first position, and is the only group with pinned apps.
     let isAll: Bool
@@ -134,9 +143,11 @@ struct DeckGroup: Identifiable, Hashable {
         savedOrder: [OrderRef] = [],
         clusters: [WindowCluster] = [],
         pinnedApps: [PinnedApp] = [],
+        stackedAppBundleIDs: Set<String> = [],
         isAll: Bool = false
     ) {
         self.pinnedApps = pinnedApps
+        self.stackedAppBundleIDs = stackedAppBundleIDs
         self.id = id
         self.name = name
         self.memberIDs = memberIDs
@@ -156,7 +167,8 @@ struct DeckGroup: Identifiable, Hashable {
 
     static func allGroup(order: [String] = [], savedOrder: [OrderRef] = [],
                          clusters: [WindowCluster] = [],
-                         pinnedApps: [PinnedApp] = []) -> DeckGroup {
+                         pinnedApps: [PinnedApp] = [],
+                         stackedAppBundleIDs: Set<String> = []) -> DeckGroup {
         DeckGroup(
             id: allGroupID,
             name: "All",
@@ -165,6 +177,7 @@ struct DeckGroup: Identifiable, Hashable {
             savedOrder: savedOrder,
             clusters: clusters,
             pinnedApps: pinnedApps,
+            stackedAppBundleIDs: stackedAppBundleIDs,
             isAll: true
         )
     }

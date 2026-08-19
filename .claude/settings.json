@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck)",
+      "Bash(WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdneg ./build/WindowDeck.app/Contents/MacOS/WindowDeck)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

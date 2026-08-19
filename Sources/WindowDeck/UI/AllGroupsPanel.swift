@@ -128,7 +128,12 @@ final class AllGroupsModel {
 
     func reload() {
         guard let store else { return }
-        let live = store.visibleWindows
+        // Every window, not `visibleWindows` — that intersects with the *active
+        // group's* membership, and the panel can outlive the group it was opened
+        // in (⌘↓ is a Carbon hotkey, so the dismissal monitor never sees it).
+        // Each row filters by its own `memberIDs` a line below; the active group
+        // has no business in that intersection.
+        let live = store.windows
         groups = store.groups.filter { !$0.isAll }.map { group in
             Row(id: group.id,
                 name: group.name,

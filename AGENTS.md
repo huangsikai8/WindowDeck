@@ -75,8 +75,6 @@ Sources/WindowDeck/
 │   ├── GroupSwitcherController.swift  the same shape, applied to groups (⌘↑/⌘↓)
 │   ├── HotKeyManager.swift   Carbon global hotkeys, keyed by action
 │   ├── Shortcut.swift        keycode + Carbon modifiers, display strings
-│   ├── CycleOrder.swift      switcher order: most-recently-used or strip order
-│   ├── Trace.swift           the diagnostics log, crash handlers, perf heartbeat
 │   └── PreviewMode / HoverTimings / GroupColor / PinnedApp / Permissions / LaunchAtLogin
 ├── UI/
 │   ├── DeckPanel.swift       the strip's NSPanel (borderless, non-activating)
@@ -84,8 +82,6 @@ Sources/WindowDeck/
 │   ├── DeckView.swift        strip contents + DeckMetrics
 │   ├── DeckLayout.swift      the sizing algorithm — read this before touching widths
 │   ├── EntryTile / ClusterTile / PinnedTile / GroupSelector
-│   ├── AppStackTile.swift    one app's windows behind its own icon, with a count
-│   ├── AppStackPanel.swift   the hover list of a stacked app's windows
 │   ├── PreviewPanel.swift    HoverController: title bar → thumbnail → peek escalation
 │   ├── PeekOverlay.swift     full-size captured image drawn at the window's real rect
 │   ├── SwitcherPanel.swift   the ⌃`/⌘` switcher grid
@@ -94,7 +90,6 @@ Sources/WindowDeck/
 └── Persistence/State.swift   the JSON state file and its migrations
 
 Tools/MakeIcon.swift         draws the app icon; `build.sh` runs it when the .icns is missing
-Tools/watch-webthumbnails.sh records where macOS's QuickLook web-thumbnail helpers come from
 ```
 
 The icon is **generated, not a binary asset.** `Tools/MakeIcon.swift` draws it with AppKit at each
@@ -106,45 +101,7 @@ fill, so the lit tile is drawn twice; and the back window pane needs ≥0.8 alph
 filler rather than a window.
 
 State lives at `~/Library/Application Support/WindowDeck/state.json`, with the previous generation at
-`state.backup.json`. The diagnostics log sits beside it in `logs/`.
-
----
-
-## The diagnostics log
-
-`Trace` writes a durable log to `~/Library/Application Support/WindowDeck/logs/windowdeck.log`, one
-previous generation beside it, reachable from the status menu (**Reveal Diagnostics Log**). Three
-properties are the whole point, and each rules out a simpler design:
-
-- **Every line is on disk before the call returns.** Buffering is the obvious optimisation and it
-  loses exactly the lines worth having — the last few before the process dies. The file is opened
-  `O_APPEND` once and written with `write(2)`.
-- **A crash writes its own record.** `NSSetUncaughtExceptionHandler` catches ObjC exceptions with a
-  full symbolicated stack; fatal signals go through a bare C handler that does nothing but `write`
-  and `backtrace_symbols_fd`, from a descriptor and frame buffer prepared at launch — a signal
-  handler that allocates deadlocks precisely when the crash was in the allocator. It then re-raises
-  with the default disposition, so this *augments* the system crash report rather than swallowing it.
-- **Formatting happens on the caller, the syscall on a utility queue.** This app is unusually
-  sensitive to work on the keypress path.
-
-A clean shutdown drops a `.clean-exit` marker, removed at the next launch. Its absence is the only
-way to tell a crash from a quit after the fact — both simply stop producing lines — so every session
-opens by saying how the previous one ended.
-
-`.info` is the default and is meant to stay readable for a whole session: start-up context,
-permissions, state load/save outcomes, membership edits, group changes, hotkey registration, and one
-`perf` line a minute with uptime, CPU, memory and counts. `.debug` adds per-decision detail — most
-usefully every input to a rebind decision, which is where the recurring "window landed in the wrong
-group" bugs live. Turn it on with `WINDOWDECK_TRACE=1`.
-
-The log honours `WINDOWDECK_STATE_DIR` for the same reason the state file does, and the self-test
-asserts it: fabricated lines interleaved with a live session's would cost the log its only value.
-
-**A `perf` line exists because misattribution is the normal failure.** "WindowDeck is making my
-machine slow" cannot be checked afterwards without a number, and the answer has three times been
-something else — the strip redraw rather than the engine tick, an `NSImage` rasterisation rather than
-the redraw's layout, and once a system helper this app never touches (see below). A line a minute
-settles it either way.
+`state.backup.json`.
 
 ---
 
@@ -212,15 +169,6 @@ plus a full strip redraw. Running that during a keypress delays the *next* event
 modifier release — so the following press advanced the open switcher session instead of starting a
 new switch. `scheduleRefresh(full:)` defers and coalesces; `full: false` skips the AX pass entirely
 because raising a window changes nothing about what windows exist.
-
-**An observation tracker fires on any mutation, not on the value you read.** `trackGroupCount`
-observes `store.groups.count` to re-register the hotkeys when groups are added or removed — but
-`withObservationTracking` fires for any write to `groups`, and `groups` is rewritten on every refresh
-that touches membership or ordering. `HotKeyManager.register` unregisters everything first, so all
-eleven Carbon hotkeys were being torn down and rebuilt roughly every three seconds, indefinitely,
-each time leaving a window in which no shortcut was bound at all. `syncHotKeys` now returns early
-when the effective set is unchanged. Found by reading the diagnostics log eight seconds after it
-first existed, which is the argument for having one.
 
 **`@Observable` fires on assignment regardless of equality.** Assigning an identical `windows` array
 redraws the whole strip. Guard every store assignment with a change check.
@@ -463,24 +411,6 @@ defaults to nil — so `sharesFrame` was false regardless and the seizure it was
 never have happened. It passed with the fix *reverted*. It now runs the scenario twice and asserts
 the unguarded path really does seize the window before asserting the guarded one does not.
 
-**A cluster member id is a slot too, and only membership treated it as one.** `pruneClusters` deleted
-any member id that was not in the current `windows` list, then dissolved whatever was left below two
-members. Group membership deliberately does the opposite — a dead id lingers so `rebindReopenedWindows`
-can hand the slot to the returning window — so closing two of five clustered Finder windows destroyed
-the cluster outright, and `scheduleSave` wrote the destruction to disk within the second. Measured on
-the live state file: every group's `clusters` array was `[]` while the five Finder windows were still
-correctly filed in Actelligent, which is why the report reads as one loss and is two ("grouped
-together (5), now i open but its ungrouped"). Note the same eviction fired on an ordinary tab switch,
-which only orders a window off screen.
-
-The fix is symmetry with `pruneDeadMembers`: a dead cluster id survives while its application does.
-Retaining it is necessary but not sufficient — `rebindReopenedWindows` updated `memberIDs` and `order`
-and never `clusters`, so a reopened window rejoined the group standing *beside* the cluster it had
-been in. Both halves are needed and the self-test fails on either one alone. Retention also matters for
-persistence: `persisted(_ cluster:)` builds the on-disk `(app, title)` refs from `memberIDs` through
-`knownRefs`, so an id evicted while the app still ran was gone from the file as well, and no relaunch
-could restore it.
-
 ## Design decisions and why
 
 **Membership is held twice.** `memberIDs: Set<CGWindowID>` is authoritative during a session — immune
@@ -498,41 +428,6 @@ another Space is absent from `windows`; building the snapshot from that list sil
 pins — so pins and windows share one arrangement and a pin can sit between two windows. Persisted as
 `[OrderRef]`, an enum over `.window(MemberRef)` and `.pinned(bundleID)`. The retired `[MemberRef]`
 shape still decodes and migrates.
-
-**An app stack is a rule; a cluster is a list.** Both collapse several windows behind one icon, and
-that is where the resemblance ends. `WindowCluster` is a list of window ids the user assembled by
-hand, which is why it needs `pruneClusters`, dead-slot retention, an `(app, title)` snapshot and a
-branch inside `rebindReopenedWindows` — the machinery behind several of the data-loss bugs above.
-`DeckGroup.stackedAppBundleIDs` is a `Set<String>`: "Chrome is stacked in Main". Members are
-recomputed from `windows` on every redraw, so a window opened later joins with nothing being told, a
-window closed leaves with nothing being told, and there is no id that can go stale, need pruning or
-need rebinding. Persisting a bundle id also needs no restore pass — it means the same thing after a
-relaunch as before one.
-
-They behave differently on purpose, too: clicking a cluster raises **all** its members, clicking a
-stack raises **one** — the most recent, ranked through the same `mruOrder` the cycling shortcuts use
-rather than a second notion of "most recent" that could disagree with the switcher.
-
-**A hand-made arrangement outranks a blanket rule.** `foldAppStacks` runs over the *output* of
-`foldClusters` and folds only `.window` items, so a window deliberately clustered stays in its cluster
-even when its application is also stacked. Folding stacks first instead swallows the cluster whole —
-asserted by the self-test in both directions.
-
-**A new item kind needs a place in the arrangement before it needs a tile.** `applyManualOrder` sends
-any key it cannot rank to the end of the row, so `stackApp` inserting a fresh `s<bundle>` key without
-touching `order` dropped the stack to the far right the instant it was created — the same trap the
-hidden-pins note describes. `stackApp` puts the key in the leftmost member's slot and removes the
-rest; `unstackApp` expands it back. Measured with the fix reverted: `["w800", "w803", "scom.browser"]`
-where `["w800", "scom.browser", "w803"]` was wanted.
-
-**The stack's hover list is a separate panel, not a mode of `HoverController`.** That controller
-escalates title → thumbnail → peek for a *single* `current` window and every timer in it assumes one;
-a stack has no single window to preview. `AppStackPanel` is modelled on `AllGroupsPanel` instead — a
-mouse-driven list anchored to the strip — and explicitly **not** on `SwitcherPanel`, which sets
-`ignoresMouseEvents = true` because it is keyboard-driven. The two panels are mutually exclusive:
-hovering a stack calls `hover.cancel()` first, or both float over the strip at once. Its thumbnails
-ask at `switcherMaxAge`, not `hoverMaxAge` — a stack's windows are mostly not the one you were just
-in, so a 3-second tolerance would mean no images at all.
 
 **Pinned launchers are ordinary items in the row.** They were once a separate section with its own
 fixed tile width, which meant they held 40pt while windows compressed to ~24pt around them — the pins
@@ -590,124 +485,8 @@ which is most of the time once groups exist. It restricts to the group only when
 it. Note that a single-window app legitimately has nothing to cycle: a quick tap does nothing, holding
 still shows the panel.
 
-**Cycling order is most-recently-used by default**, with the current window placed at index 0
-*explicitly* rather than trusting it to be `mruOrder[0]`.
-
-**`CycleOrder.stripOrder` fixes the positions instead, and must not hoist the current window.** MRU is
-right for a ⌘Tab flip and wrong for muscle memory — the list is rebuilt on every open, so the window
-that was third is second now and there is no position to learn. Strip order reuses `applyManualOrder`,
-already the single description of what order a group is drawn in, so the switcher and the strip cannot
-drift apart and "let me rearrange it" needs no new interface: you drag a tile. The temptation is to
-keep the `result.insert(current, at: 0)` line for both modes; that is exactly what makes positions
-move, and the self-test asserts the array is unchanged after focus changes. Measured with the mode
-disabled: `[10, 11, 12, 13]` became `[13, 11, 10, 12]` on the next open.
-
-Ordering by *when a window opened* was considered and is not available: `createdAt` is discarded after
-`arrivalGrace`, and after a relaunch every window is first seen at once — so the order would be
-arbitrary precisely when it most needs to be stable.
-
-**The starting index belongs with the ordering, not in the switcher.** `SwitcherController` held a
-literal `1` with a comment explaining that index 0 is the window you are already in. True for MRU,
-false for strip order, and nothing connected the two. `cycleStartIndex(_:reversed:)` now answers it
-per mode — the neighbour of where you stand, wrapping, when the order is fixed.
-
-**App cycling is group-scoped whenever you are standing in the group; `appCycleStaysInGroup` decides
-the rest.** The original fix for "it is a silent no-op outside the group" widened the scope to every
-window of the app, which removed the choice rather than offering it. With the setting on (the default)
-being outside the group cycles the group's windows of that app anyway, walking you *into* it — the
-answer to a no-op is to offer something, not to leave the group.
-
-**"The group on screen" is not the scope you are working in, once pill view exists.** In All the
-active group is All, so cycling offered every window on the bar — but pill view buckets them into
-capsules and only one of those is the one being worked in. `cycleWithinPill` scopes both cycling
-shortcuts to the capsule holding the focused window. This is the same class of mistake as the cluster
-operations that wrote to `activeGroupID`: in pill view the group on screen and the group being acted
-on are different things, and there is now a third case — the group being *cycled*.
-
-Three details it forced:
-
-* **A window in several groups is drawn in several capsules**, so there is no single pill to read off
-  the screen. The first in strip order wins — deterministic, and visible in the bar rather than hidden
-  state. Reordering groups therefore changes it, which the self-test asserts, because that is the only
-  control the tie-break rests on.
-* **The capsule's own arrangement has to travel with the scope.** Each capsule honours its own group's
-  order, so `.stripOrder` must sort by *that* group rather than All's — otherwise the switcher lists
-  the pill's windows in All's order and the two disagree about a row you can see.
-* **A folded group still scopes.** Its capsule is not drawn, but it still owns its windows; skipping it
-  would silently widen the cycle to everything the moment a group was collapsed.
-
-**A stack must be ordered from the members it is drawing, not re-derived from its bundle id.**
-`stackWindowsByRecency` took a bundle id and filtered `windows` — *every* window of that application,
-in any group. So a stack of five Chrome windows in Main showed a badge counting the group's five while
-the click, the hover list and the context menu all worked from a different set, and clicking it opened
-whichever Chrome window was most recent anywhere. Reported as "I can't open the 5 Chrome tabs in Main
-now". Two things generalise: an item already knows its own contents, so re-deriving them is a chance
-to disagree with what is on screen; and a bug of this shape is invisible in the tile, because the part
-that stayed correct is the part you can see.
-
-**Hover warmth belongs to the strip, not to a panel.** The delay before a preview appears exists to
-stop one firing as the pointer merely crosses the bar; once something *is* up that question is settled,
-and `HoverController` skips the wait. It kept that state privately, so the app-stack list — a separate
-panel with its own timers — always waited the full delay: sliding along the row was instant tile after
-tile and then stalled at a stacked app, which reads as the stack being broken rather than as a
-deliberate wait. `StripWarmth` is shared by both. It tracks *holders* rather than an expiry alone,
-because resting on a panel for longer than the warm window would otherwise go cold while it was still
-on screen.
-
-**Warmth is answered by what is on screen, so nothing may take a panel down before asking.** Sharing
-the state was not enough: the stack still stalled for the full delay in the middle of a sweep, with a
-thumbnail visibly up at the moment the pointer arrived. Two places threw the answer away and both
-deferred to `warmWindow`, which is **0 in a real user's settings** — it means "how long after nothing
-is on screen", and neither of these was that moment. The strip's hover handler cancelled the preview
-*before* consulting the stack, dropping the holder that made the strip warm; and `AppStackPanel`
-released while its own list was still up for its 0.25s grace, on the reasoning that the pointer had
-already left the tile — but holding says "something is on screen" without depending on a setting, and
-that is the same answer only more reliably. Both are handovers along one continuous bar, not
-departures from it. The rule: ask before tearing down, and hold for exactly as long as something is
-drawn. `release` can now only ever *extend* a linger, never cut one short, so a panel that was never
-shown cannot take warmth from one that was; `chill()` is the deliberate way to go cold.
-
-**The stack's list uses the switcher's tile, and one row that scrolls.** These are windows of a single
-application, so titles routinely fail to distinguish them — "New Tab" three times — and the content is
-the only discriminator; a 92×24 strip of a 16:10 window showed a horizontal slice of nothing. It wraps
-to no second row on purpose: a second row pushes the first one upward as the panel grows, so the tile
-being reached for moves while it is being reached for. Scrolling sideways leaves every tile where it
-was.
-
-**A hover guard must recognise its subject from the moment the pointer arrives, not from the moment
-the panel appears.** `AppStackPanel`'s exit path identified its own stack by `model.bundleID`, which is
-only written inside `present()` — a delay later. Leave the tile before that fires and the guard matched
-nothing, returned early, and never cancelled the pending show: the list appeared with the pointer
-somewhere else entirely ("I hover over the 5 Chrome for a short while then hover over the others, then
-it will pop up even though my mouse is not on Chrome anymore"). `HoverController` gets this right by
-assigning `current` on entry, and the shape of its guard was copied without the assignment that makes
-the guard work. Both halves are needed and the self-test fails on either: dropping the cancel lets a
-stale timer fire, and dropping the guard makes a slide from one stack to the next cancel the arriving
-one, since SwiftUI delivers the new tile's enter *before* the old tile's exit.
-
-**A view offset outside its tile is still hovered *as* the tile.** The count badge was drawn with
-`.offset(x: iconSize * 0.42, y: -iconSize * 0.38)` inside the tile's `ZStack`, putting it ~13pt beyond
-a 40pt tile — and SwiftUI hit-tests an offset view where it was offset *to*, not where it was laid
-out. The stack therefore answered hover over its **neighbour**, so the panel opened for a tile the
-pointer was merely near ("it randomly does a preview when my mouse is close to it and not on it").
-The badge is now an `overlay` with inset padding, and the tile carries `.contentShape(Rectangle())` so
-hit-testing is its own rectangle whatever decoration is added later. Worth checking on any tile that
-grows a badge, a dot or a marker: `offset` is the tempting way to place one and it silently widens the
-hover area.
-
-**Self-test cases inherit persisted state from each other.** Every `AppStore()` reads the state file
-the previous case saved, so `pillView` — set by `clustering()` — leaked forward into the cycling
-cases. Pill scoping only applies in pill view, so `cyclingAcrossTwoGroups` was silently measuring
-capsule scope while claiming to measure group scope, and failed the moment the feature landed. It bit
-a second time immediately: a new stack case left Chrome stacked in the same group `appStackOrdering`
-uses, and `stackApp` returns early when the rule is already there, so that case stopped seeding the
-arrangement it exists to test. Any case whose behaviour depends on a persisted setting must set it
-explicitly and **assert the precondition** rather than inherit it.
-
-**A fixture that leaves every window at `pid: 0` cannot test app scoping.** `WindowInfo.testInstance`
-hardcoded it, and app cycling filters on `pid` — so every fabricated window was the same application
-and any test of the scoping would have passed no matter what the code did. The same shape as the
-`frame`-nil fixture that made the tab-seizure test vacuous. `testInstance` now takes a `pid`.
+**Cycling order is most-recently-used**, with the current window placed at index 0 *explicitly* rather
+than trusting it to be `mruOrder[0]`.
 
 **The strip slides when the group changes, and the panel resizes with it.** Direction comes from the
 change itself: the cycling and swiping paths pass it explicitly, because comparing group indices gets
@@ -794,9 +573,9 @@ something that fits on a screen.
 WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
 ```
 
-~218 checks, about a second, covering persistence (legacy files, a changed field type degrading rather
+~90 checks, about a second, covering persistence (legacy files, a changed field type degrading rather
 than wiping the file, round-trips), ordering, restore matching, membership moves, pruning, clustering,
-app stacks, switcher candidate ordering and scope, section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never
+section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never
 touch the real state file — destructive persistence tests once left fabricated groups in the running
 app.
 
@@ -824,38 +603,6 @@ There are no unit tests. Verification is done by driving the real app and readin
   keystrokes. Add it, verify, then remove it.
 - Idle CPU: sample `ps -p <pid> -o time=` twice ~30s apart. **Measure after the app settles** —
   startup work (restore pass, preview warming) makes the first minute read several times higher.
-
----
-
-## Investigated and not us: the WebThumbnailExtension processes
-
-Dozens of `com.apple.WebKit.WebContent.EnhancedSecurity` processes, shown in Activity Monitor under
-the process group **WebThumbnailExtension Web Content**, accumulate over a session and are easy to
-blame on whatever is in front at the time. Measured on 2026-08-19, with 21 of them alive at once:
-
-- They are the QuickLook thumbnail path for web content — `WebThumbnailExtension.appex`, hosted by
-  `com.apple.quicklook.ThumbnailsAgent`, launched on behalf of whichever process asked for a
-  thumbnail. In the unified log the only clients over eight hours were **Spotlight**, and open/save
-  panels belonging to VS Code, System Settings, Safari, GitHub Desktop, Word, Excel, TextEdit,
-  Script Editor and Preview. WindowDeck never appears; a file browser in an open panel previews what
-  it lists, which is why so many applications are on that list.
-- `sample` on a stuck one is pure `WebCore` table layout — `RenderTable::slowColElement` under
-  `RenderTableCell::collapsedBeforeBorder`, nothing else on the stack. No Accessibility, no window
-  server, no ScreenCaptureKit. It is a pathological layout case, not an interaction with anything.
-- Peak `phys_footprint` was **941 MB, 842 MB and 436 MB** for three of them. Several at once pushes a
-  16 GB machine into swap, at which point every application stutters — including WindowDeck, whose
-  strip is the visible thing that stops responding. That is how the misattribution happens, and the
-  CPU-time counters are frozen once the system suspends them, so they look idle by the time anyone
-  looks.
-- WindowDeck's sources contain no QuickLook or thumbnail API at all, and an hour of it running idle
-  spawned none.
-
-The one place WindowDeck touches this machinery is Settings → the pinned-app picker, which is an
-`NSOpenPanel` like everyone else's; it defaults to `/Applications`, where there is no web content.
-
-Because the bursts are intermittent, `Tools/watch-webthumbnails.sh` records each spawn with the
-responsible application and whether WindowDeck was running, and samples any helper that passes
-300 MB. Run it and leave it; the question is only answerable while it is happening.
 
 ---
 

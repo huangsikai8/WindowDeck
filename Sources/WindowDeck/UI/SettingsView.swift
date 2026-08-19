@@ -745,9 +745,38 @@ struct ShortcutsSettingsView: View {
                 }
                 Text("""
                 Hold the modifier and tap the key to move through windows; let go to switch. \
-                Add Shift to go backwards, or press Escape to cancel without changing anything. \
-                Ordering is most-recently-used, so a single tap flips back to the window you \
-                were in before.
+                Add Shift to go backwards, or press Escape to cancel without changing anything.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Picker("Order", selection: $store.cycleOrder) {
+                    ForEach(CycleOrder.allCases) { order in
+                        Text(order.label).tag(order)
+                    }
+                }
+                Text(store.cycleOrder.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("In All, cycle within the pill you're working in",
+                       isOn: $store.cycleWithinPill)
+                Text("""
+                In All's pill view, both cycling shortcuts are limited to the capsule holding the \
+                window you are in, rather than to every window on the bar. A window that belongs to \
+                several groups uses the leftmost capsule it appears in; an unfiled window uses the \
+                unfiled capsule. Only applies in pill view.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Toggle("Cycling this app's windows stays in the current group",
+                       isOn: $store.appCycleStaysInGroup)
+                Text("""
+                Cycling an app's windows is always limited to the group on screen while you are \
+                standing in it. This decides what happens when you are not: on, it moves you into \
+                the group's windows of that app; off, it falls back to every window that app has \
+                open, wherever it is.
                 """)
                 .font(.caption)
                 .foregroundStyle(.secondary)

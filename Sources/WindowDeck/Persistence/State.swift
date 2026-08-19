@@ -50,6 +50,13 @@ struct PersistedGroup: Codable {
     var order: [OrderRef]
     var clusters: [PersistedCluster]
     var pinnedAppBundleIDs: [String]
+    /// Applications collapsed behind one icon in this group.
+    ///
+    /// Bundle ids and nothing else. Unlike `clusters`, which must carry an
+    /// `(app, title)` snapshot because window ids do not survive a relaunch,
+    /// a stack is a rule about an application — and "Chrome is stacked here"
+    /// means exactly the same thing after a relaunch as before one.
+    var stackedAppBundleIDs: [String]
 
     init(
         id: String,
@@ -60,9 +67,11 @@ struct PersistedGroup: Codable {
         members: [MemberRef],
         order: [OrderRef] = [],
         clusters: [PersistedCluster] = [],
-        pinnedAppBundleIDs: [String] = []
+        pinnedAppBundleIDs: [String] = [],
+        stackedAppBundleIDs: [String] = []
     ) {
         self.pinnedAppBundleIDs = pinnedAppBundleIDs
+        self.stackedAppBundleIDs = stackedAppBundleIDs
         self.id = id
         self.name = name
         self.colorIndex = colorIndex
@@ -96,6 +105,7 @@ struct PersistedGroup: Codable {
         }
         clusters = container.lenient([PersistedCluster].self, .clusters) ?? []
         pinnedAppBundleIDs = container.lenient([String].self, .pinnedAppBundleIDs) ?? []
+        stackedAppBundleIDs = container.lenient([String].self, .stackedAppBundleIDs) ?? []
     }
 }
 
@@ -114,6 +124,8 @@ struct PersistedState: Codable {
     /// The built-in All group has no entry in `groups`, so its launchers live
     /// here — same shape as its order and clusters.
     var allGroupPinnedBundleIDs: [String] = []
+    /// All's stacked applications, for the same reason as the line above.
+    var allGroupStackedBundleIDs: [String] = []
     var activeGroupID: String?
     var pinnedAppBundleIDs: [String] = []
     var currentSpaceOnly: Bool = true
@@ -126,6 +138,13 @@ struct PersistedState: Codable {
     var clampZoomedWindows: Bool = true
     var hideInFullscreen: Bool = true
     var switcherHoldDelay: TimeInterval = 0.18
+    /// What order the window switcher lists candidates in.
+    var cycleOrder: CycleOrder = .recentlyUsed
+    /// Keep app cycling inside the active group even when the focused window is
+    /// not a member of it.
+    var appCycleStaysInGroup: Bool = true
+    /// In All's pill view, scope cycling to the capsule the focused window is in.
+    var cycleWithinPill: Bool = true
     /// Horizontal swipe over the strip switches groups. Free — the events reach
     /// our own window without any permission.
     var swipeOverStrip: Bool = true
@@ -168,6 +187,7 @@ struct PersistedState: Codable {
         allGroupOrder: [OrderRef],
         allGroupClusters: [PersistedCluster],
         allGroupPinnedBundleIDs: [String],
+        allGroupStackedBundleIDs: [String] = [],
         activeGroupID: String?,
         pinnedAppBundleIDs: [String],
         currentSpaceOnly: Bool,
@@ -180,6 +200,9 @@ struct PersistedState: Codable {
         clampZoomedWindows: Bool,
         hideInFullscreen: Bool,
         switcherHoldDelay: TimeInterval,
+        cycleOrder: CycleOrder = .recentlyUsed,
+        appCycleStaysInGroup: Bool = true,
+        cycleWithinPill: Bool = true,
         shortcuts: [String: Shortcut],
         shortcutSeedVersion: Int,
         swipeOverStrip: Bool,
@@ -200,6 +223,9 @@ struct PersistedState: Codable {
         self.globalSwipeGesture = globalSwipeGesture
         self.swipeFingerCounts = swipeFingerCounts
         self.switcherHoldDelay = switcherHoldDelay
+        self.cycleOrder = cycleOrder
+        self.appCycleStaysInGroup = appCycleStaysInGroup
+        self.cycleWithinPill = cycleWithinPill
         self.showOffGroupWindow = showOffGroupWindow
         self.showUngroupedSeparately = showUngroupedSeparately
         self.clampZoomedWindows = clampZoomedWindows
@@ -210,6 +236,7 @@ struct PersistedState: Codable {
         self.allGroupOrder = allGroupOrder
         self.allGroupClusters = allGroupClusters
         self.allGroupPinnedBundleIDs = allGroupPinnedBundleIDs
+        self.allGroupStackedBundleIDs = allGroupStackedBundleIDs
         self.activeGroupID = activeGroupID
         self.pinnedAppBundleIDs = pinnedAppBundleIDs
         self.currentSpaceOnly = currentSpaceOnly
@@ -256,6 +283,7 @@ struct PersistedState: Codable {
         // pin would silently disappear on upgrade.
         allGroupPinnedBundleIDs = container.lenient([String].self, .allGroupPinnedBundleIDs)
             ?? (container.lenient([String].self, .pinnedAppBundleIDs) ?? [])
+        allGroupStackedBundleIDs = container.lenient([String].self, .allGroupStackedBundleIDs) ?? []
         activeGroupID = container.lenient(String.self, .activeGroupID)
         pinnedAppBundleIDs = container.lenient([String].self, .pinnedAppBundleIDs)
             ?? fallback.pinnedAppBundleIDs
@@ -281,6 +309,11 @@ struct PersistedState: Codable {
             ?? fallback.shortcuts
         switcherHoldDelay = container.lenient(TimeInterval.self, .switcherHoldDelay)
             ?? fallback.switcherHoldDelay
+        cycleOrder = container.lenient(CycleOrder.self, .cycleOrder) ?? fallback.cycleOrder
+        appCycleStaysInGroup = container.lenient(Bool.self, .appCycleStaysInGroup)
+            ?? fallback.appCycleStaysInGroup
+        cycleWithinPill = container.lenient(Bool.self, .cycleWithinPill)
+            ?? fallback.cycleWithinPill
         shortcutSeedVersion = container.lenient(Int.self, .shortcutSeedVersion)
             ?? fallback.shortcutSeedVersion
         swipeOverStrip = container.lenient(Bool.self, .swipeOverStrip)
@@ -308,6 +341,7 @@ struct PersistedState: Codable {
         try container.encode(allGroupOrder, forKey: .allGroupOrder)
         try container.encode(allGroupClusters, forKey: .allGroupClusters)
         try container.encode(allGroupPinnedBundleIDs, forKey: .allGroupPinnedBundleIDs)
+        try container.encode(allGroupStackedBundleIDs, forKey: .allGroupStackedBundleIDs)
         try container.encodeIfPresent(activeGroupID, forKey: .activeGroupID)
         try container.encode(pinnedAppBundleIDs, forKey: .pinnedAppBundleIDs)
         try container.encode(currentSpaceOnly, forKey: .currentSpaceOnly)
@@ -321,6 +355,9 @@ struct PersistedState: Codable {
         try container.encode(hideInFullscreen, forKey: .hideInFullscreen)
         try container.encode(shortcuts, forKey: .shortcuts)
         try container.encode(switcherHoldDelay, forKey: .switcherHoldDelay)
+        try container.encode(cycleOrder, forKey: .cycleOrder)
+        try container.encode(appCycleStaysInGroup, forKey: .appCycleStaysInGroup)
+        try container.encode(cycleWithinPill, forKey: .cycleWithinPill)
         try container.encode(shortcutSeedVersion, forKey: .shortcutSeedVersion)
         try container.encode(swipeOverStrip, forKey: .swipeOverStrip)
         try container.encode(globalSwipeGesture, forKey: .globalSwipeGesture)
@@ -333,11 +370,13 @@ struct PersistedState: Codable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case groups, allGroupOrder, allGroupClusters, allGroupPinnedBundleIDs, activeGroupID
+        case groups, allGroupOrder, allGroupClusters, allGroupPinnedBundleIDs
+        case allGroupStackedBundleIDs, activeGroupID
         case pinnedAppBundleIDs, currentSpaceOnly, showTitles, previewMode, hoverTimings
         case autoAddNewWindows, showOffGroupWindow, showUngroupedSeparately
         case clampZoomedWindows, hideInFullscreen
         case shortcuts, switcherHoldDelay, shortcutSeedVersion
+        case cycleOrder, appCycleStaysInGroup, cycleWithinPill
         case swipeOverStrip, globalSwipeGesture, swipeFingerCounts
         case swipeSensitivity, animateGroupChanges, bootTime, showRunningApps, pillView
         /// Retired in favour of `groups`; still read so existing files migrate.
@@ -380,15 +419,26 @@ enum StateStore {
         // them. Only a genuine decode failure falls through.
         if let data = try? Data(contentsOf: fileURL),
            let state = try? JSONDecoder().decode(PersistedState.self, from: data) {
+            Trace.log(.state, "loaded primary: \(data.count) bytes, \(state.groups.count) groups, "
+                + "\(state.groups.reduce(0) { $0 + $1.members.count }) members, "
+                + "\(state.shortcuts.count) shortcuts")
             return state
         }
 
+        // Worth a warning rather than a note. Reaching the backup means the
+        // primary failed to decode, which is the failure mode that once wiped
+        // every group — the recovery worked, but something upstream is wrong.
         if let data = try? Data(contentsOf: backupURL),
            let state = try? JSONDecoder().decode(PersistedState.self, from: data) {
             NSLog("WindowDeck: primary state unreadable — recovered from backup")
+            Trace.warn(.state, "primary state UNREADABLE — recovered backup: "
+                + "\(state.groups.count) groups, \(data.count) bytes")
             return state
         }
 
+        let existed = FileManager.default.fileExists(atPath: fileURL.path)
+        Trace.log(.state, "starting from defaults (state file \(existed ? "present but unreadable" : "absent"))",
+                  level: existed ? .error : .info)
         return PersistedState()
     }
 
@@ -415,8 +465,11 @@ enum StateStore {
             }
 
             try data.write(to: url, options: .atomic)
+            Trace.debug(.state, "saved \(data.count) bytes, \(state.groups.count) groups, "
+                + "\(state.groups.reduce(0) { $0 + $1.members.count }) members")
         } catch {
             NSLog("WindowDeck: failed to save state — \(error.localizedDescription)")
+            Trace.error(.state, "SAVE FAILED — \(error.localizedDescription)")
         }
     }
 }

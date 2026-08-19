@@ -12,6 +12,10 @@ struct DeckView: View {
     let onRenameCluster: (WindowCluster) -> Void
     /// Opens the panel showing every group, folded ones included.
     var onShowAllGroups: () -> Void = {}
+    /// Hovering a stacked app. A separate channel from `onHover` on purpose:
+    /// the preview panel escalates title → thumbnail → peek for a *single*
+    /// window, so routing a stack through it would put two panels on screen.
+    var onStackHover: (String, String, [WindowInfo], Bool, CGRect) -> Void = { _, _, _, _, _ in }
 
     @State private var dragging: String?
     /// Which pill the current drag started in, so a drop elsewhere can move the
@@ -341,7 +345,14 @@ struct DeckView: View {
                 },
                 pinTargets: store.pinTargets(for: window.id),
                 groupWithTargets: store.groupWithTargets(for: window.id, in: sectionGroupID),
-                onGroupWith: { store.combine($0, into: window.id, in: sectionGroupID) }
+                onGroupWith: { store.combine($0, into: window.id, in: sectionGroupID) },
+                stackableCount: window.bundleID.flatMap {
+                    store.stackableWindowCount(for: $0, in: sectionGroupID)
+                },
+                onStack: {
+                    guard let bundleID = window.bundleID else { return }
+                    store.stackApp(bundleID: bundleID, in: sectionGroupID)
+                }
             )
 
         case .pinned(let app):
@@ -392,6 +403,32 @@ struct DeckView: View {
                 onHover: { hovering, frame in
                     // The first member stands in for the cluster on hover.
                     if let first = members.first { onHover(first, hovering, frame) }
+                }
+            )
+
+        case .appStack(let bundleID, let members):
+            // Recency order is resolved here rather than in the fold, so the
+            // *row* keeps the leftmost member's position while the menu and the
+            // hover list read most-recent-first.
+            let byRecency = store.stackWindowsByRecency(members)
+            AppStackTile(
+                name: members.first?.appName ?? bundleID,
+                icon: members.first?.icon,
+                count: members.count,
+                width: slot.width,
+                iconSize: slot.iconSize,
+                isDragging: dragging == slot.item.orderKey,
+                isFocused: members.contains { $0.id == store.focusedWindowID },
+                memberColors: store.colors(containing: members.first?.id ?? 0),
+                focusTint: store.focusTint,
+                windows: byRecency,
+                // One window, not all of them — the whole point of the feature.
+                onActivate: { if let first = byRecency.first { onActivate(first) } },
+                onActivateWindow: { onActivate($0) },
+                onUnstack: { store.unstackApp(bundleID: bundleID, in: sectionGroupID) },
+                onHover: { hovering, frame in
+                    onStackHover(bundleID, members.first?.appName ?? bundleID,
+                                 byRecency, hovering, frame)
                 }
             )
         }

@@ -27,6 +27,16 @@ enum DeckItem: Identifiable {
     /// dot, exactly as the Dock behaves. Nil when the app was never in a group,
     /// which only happens in All.
     case running(PinnedApp, placeholderFor: CGWindowID?)
+    /// Every window of one application in this group, behind that application's
+    /// own icon.
+    ///
+    /// Deliberately *not* a `cluster` of one app. A cluster is a list of window
+    /// ids the user assembled; this is a rule about an application, so its
+    /// members are recomputed from `windows` on every redraw and a window opened
+    /// later joins with nothing having to be told. The two also behave
+    /// differently on click — a cluster raises all its members, a stack raises
+    /// one — which is why they are separate kinds rather than a flag.
+    case appStack(bundleID: String, windows: [WindowInfo])
 
     var id: String {
         switch self {
@@ -36,6 +46,7 @@ enum DeckItem: Identifiable {
         case .ungrouped(let window): "u\(window.id)"
         case .pinned(let app): "p\(app.bundleID)"
         case .running(let app, _): "r\(app.bundleID)"
+        case .appStack(let bundleID, _): "s\(bundleID)"
         }
     }
 
@@ -50,6 +61,11 @@ enum DeckItem: Identifiable {
         // the manual arrangement instead of jumping when the window closes.
         case .running(let app, let windowID):
             windowID.map { "w\($0)" } ?? "p\(app.bundleID)"
+        // The application, not its leftmost member. A cluster keys its
+        // arrangement on `members.first`, which goes stale the moment that
+        // window closes; a stack's identity *is* the app, so this key is good
+        // for the stack's whole life however its windows come and go.
+        case .appStack(let bundleID, _): "s\(bundleID)"
         }
     }
 
@@ -62,6 +78,11 @@ enum DeckItem: Identifiable {
 
     var isCluster: Bool {
         if case .cluster = self { return true }
+        return false
+    }
+
+    var isStack: Bool {
+        if case .appStack = self { return true }
         return false
     }
 
@@ -84,6 +105,10 @@ enum DeckItem: Identifiable {
         case .ghost(let window): [window]
         case .ungrouped(let window): [window]
         case .pinned, .running: []
+        // Reporting these is what keeps `pins(alongside:)` hiding the launcher
+        // for a stacked app: the rule there is "an app with a window here does
+        // not also need a launcher", and a stacked window is still a window.
+        case .appStack(_, let members): members
         }
     }
 
