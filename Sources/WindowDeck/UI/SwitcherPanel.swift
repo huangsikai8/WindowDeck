@@ -149,36 +149,35 @@ struct SwitcherContent: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background {
-            ZStack {
-                VisualEffectBackground(material: .hudWindow)
-                // A definite dark ground rather than whatever is behind the
-                // panel, so thumbnails read consistently and the HUD looks like
-                // a system component rather than a form.
-                Color.black.opacity(0.34)
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        // The same plate as the hover preview and the app-stack list. This was
+        // the last dark surface in the app, kept that way on the argument that a
+        // keyboard mode taking over the screen should say so with a dark ground.
+        // Three panels answering the same question — which window do you want —
+        // in two different skins reads as two applications, and the argument
+        // does not survive that: the strip is right there behind it either way.
+        .background(VisualEffectBackground(material: .popover))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(.white.opacity(0.16), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
         )
     }
 
     private func tile(_ window: WindowInfo, isSelected: Bool) -> some View {
         VStack(spacing: 6) {
             ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(.white.opacity(0.06))
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(.primary.opacity(0.06))
 
                 if let image = model.images[window.id] {
-                    // Fills its tile rather than floating inside a grey box.
+                    // `.fit`, like the preview and the stack list: on a light
+                    // plate a cropped thumbnail reads as a mistake, and the
+                    // window's real proportions are what tell two windows of one
+                    // application apart.
                     Image(nsImage: image)
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: SwitcherPanel.tileWidth - 22,
-                               height: SwitcherPanel.tileHeight - 46)
-                        .clipped()
+                        .aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 } else if let icon = window.icon {
                     // Windows never visited have no capture yet; the icon stands
                     // in rather than blocking the panel.
@@ -188,7 +187,6 @@ struct SwitcherContent: View {
                 }
             }
             .frame(width: SwitcherPanel.tileWidth - 22, height: SwitcherPanel.tileHeight - 46)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             HStack(spacing: 4) {
                 if let icon = window.icon {
@@ -196,7 +194,7 @@ struct SwitcherContent: View {
                 }
                 Text(window.displayTitle)
                     .font(.system(size: 10.5, weight: isSelected ? .semibold : .regular))
-                    .foregroundStyle(isSelected ? .white : .white.opacity(0.72))
+                    .foregroundStyle(.primary.opacity(isSelected ? 1 : 0.7))
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
@@ -204,16 +202,19 @@ struct SwitcherContent: View {
         }
         .padding(7)
         .frame(width: SwitcherPanel.tileWidth, height: SwitcherPanel.tileHeight)
-        // A thin bright ring and a slight lift of the tile — the previous heavy
+        // A thin ring and a slight lift of the tile — the previous heavy
         // accent-coloured block read as crude, and nothing scales or moves, so
         // stepping through is a ring jumping rather than tiles resizing.
+        //
+        // Drawn in `.primary`, not white: the panel no longer supplies its own
+        // dark ground, and a white ring on a light popover is invisible.
         .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(.white.opacity(isSelected ? 0.16 : 0))
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.primary.opacity(isSelected ? 0.14 : 0))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(.white.opacity(isSelected ? 0.9 : 0), lineWidth: 1.5)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(.primary.opacity(isSelected ? 0.75 : 0), lineWidth: 1.5)
         )
     }
 }

@@ -41,13 +41,11 @@ struct PinnedTile: View {
                 }
             }
             .frame(width: width, height: DeckMetrics.tileHeight)
-            // Running indicator, same idea as the Dock's dot.
-            //
-            // Anchored to the *tile*, matching `DeckMetrics.statusDotSize` and
-            // `statusDotInset` exactly as the group dots on a window tile do.
-            // It used to hang off the bottom of the icon inside a ZStack, which
-            // put it 2.5pt higher than its neighbours and half a point smaller —
-            // a whole row of dots that visibly failed to line up.
+            // Anchored to the *tile* and drawn by the shared `StatusDot`, so it
+            // lines up with every other dot in the row. It used to hang off the
+            // bottom of the icon inside a ZStack, which put it 2.5pt higher than
+            // its neighbours and half a point smaller — a whole row of dots that
+            // visibly failed to line up.
             .overlay(alignment: .bottom) {
                 // Neutral, not the capsule's colour: this app is running but has
                 // no window in this capsule, which is a different state from the

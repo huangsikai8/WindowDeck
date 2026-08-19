@@ -561,9 +561,9 @@ private struct AppStackTileView: View {
             .padding(7)
             .frame(width: AppStackPanel.tileWidth, height: AppStackPanel.tileHeight)
             // Selection drawn in `.primary`, not white. On the popover material
-            // this panel now uses, a white plate and a white ring are invisible
-            // in light appearance — the switcher can hardcode white because it
-            // supplies its own dark ground and this no longer does.
+            // every panel now uses, a white plate and a white ring are invisible
+            // in light appearance — nothing in this app supplies its own dark
+            // ground any more.
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(.primary.opacity(isHovering ? 0.10 : 0))

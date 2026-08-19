@@ -579,6 +579,23 @@ Main defers to the other capsules over running-app launchers: an app already dra
 Work does not appear again in Main. Main is where things go when nothing else has them, and that
 applies to launchers as much as to windows.
 
+**Every dot on the strip comes through `StatusDot`, and the colour is a
+vocabulary.** Tinted with the capsule's colour means an open window drawn in that capsule, solid for
+the one you are in; neutral grey means the application is running but has no window here, which is
+exactly what a launcher is; no dot means not running at all. It reads the way the Dock does on
+purpose — a bar of icons along the bottom of the screen with a dot under the live ones is a shape
+every Mac user can already read, and it gives the row a baseline for the icons to sit on.
+
+Shared rather than drawn per tile because they stopped lining up the last time: one sat 2.5pt higher
+than its neighbours and half a point smaller. The tinted dot is drawn at 0.85 alpha, not the 0.6 tried
+first — it sits on a bed of its own hue (the capsule is tinted at 0.13–0.22) and vanished into it.
+
+**The groups button shows the total window count.** Each capsule can only say how many *it* holds, and
+a busy session runs to dozens across six of them; the total is the one number nothing else on the
+strip answers. Icon over count rather than side by side, so the control stays one tile wide and the
+space keeps going to windows. Monospaced digits, because it changes several times a minute and the
+button must not twitch.
+
 **A launcher for a closed app is unlit.** The filled plate is what says "this exists right now", so a
 pin whose app isn't running gets no plate and a half-strength icon; it lights on hover to stay
 obviously clickable. Full strength claimed the app was already open, which is the one thing a launcher
@@ -682,16 +699,18 @@ which is why the tile is the switcher's 158×122. It wraps to no second row on p
 pushes the first one upward as the panel grows, so the tile being reached for moves while it is being
 reached for. Scrolling sideways leaves every tile where it was.
 
-The *appearance* is the window preview's, though, and taking the switcher's whole look was a mistake
-worth naming. Hovering a window and hovering a stacked app are the same gesture a few pixels apart on
-the same bar, so they came up in two different skins — the preview's `.popover` plate beside the
-switcher's dark HUD ground — and it read as two apps rather than as one strip. The switcher is the odd
-one out **on purpose**: it is a keyboard mode that takes over the screen, and a dark ground is what says
-the rest is suspended. Nothing is suspended when you hover. Two things the borrowed skin had hidden in
-it: the tiles cropped to `.fill` because a fixed grid has to be full, where a list of near-identical
-windows needs the real proportions (`.fit` in a faint plate, exactly as the preview draws its
-thumbnail); and every highlight was hardcoded **white**, which is invisible on a popover in light
-appearance. Anything drawn on this panel goes in `.primary`, since it no longer supplies its own ground.
+**One skin for every panel: the `.popover` plate.** The hover preview, the app-stack list and the ⌃`
+switcher all answer the same question — which window do you want — and they came up in two different
+looks, the preview's light plate beside the switcher's dark HUD ground. The switcher was defended as
+the odd one out on the argument that a keyboard mode taking over the screen should say so; that does
+not survive three panels disagreeing, and the strip is visible behind all of them either way. They are
+now the same material, the same hairline and the same tile.
+
+Two things the dark skin had hidden in it, and both bite anything that adopts it: tiles cropped to
+`.fill` because a fixed grid has to be full, where near-identical windows need their real proportions
+(`.fit` in a faint plate); and every highlight hardcoded **white**, which is invisible on a popover in
+light appearance. Nothing supplies its own dark ground any more, so everything drawn on these panels
+goes in `.primary`.
 
 **A row peeks, like the preview does.** Resting on a window in the list draws it full size at its real
 screen rect through the same `PeekOverlayController` contract — a captured image, nothing raised or

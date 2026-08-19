@@ -223,7 +223,7 @@ struct DeckView: View {
     /// drawn in, so a drop can tell a reorder from a move between groups.
     @ViewBuilder
     private func draggableSlot(_ slot: DeckLayout.Slot, section: DeckSection) -> some View {
-        slotView(slot, sectionGroupID: section.groupID)
+        slotView(slot, section: section)
             .onDrag {
                 dragging = slot.item.orderKey
                 draggingFromGroup = section.groupID
@@ -277,8 +277,19 @@ struct DeckView: View {
         }
     }
 
+    /// The colour of the capsule a slot is drawn in. Taken from the section
+    /// rather than looked up per item, so a cluster and the windows beside it
+    /// cannot disagree about which capsule they are in.
+    private func sectionTint(_ section: DeckSection) -> Color {
+        section.color ?? store.main.displayColor
+    }
+
     @ViewBuilder
-    private func slotView(_ slot: DeckLayout.Slot, sectionGroupID: UUID?) -> some View {
+    private func slotView(_ slot: DeckLayout.Slot, section: DeckSection) -> some View {
+        // The capsule the slot is drawn in, which is what every operation on it
+        // acts on. Never "the current group": that distinction is the one this
+        // file got wrong four times.
+        let sectionGroupID = section.groupID
         switch slot.item {
         case .window(let window):
             EntryTile(
@@ -290,7 +301,7 @@ struct DeckView: View {
                 memberGroupID: store.group(of: window.id).id,
                 isDragging: dragging == slot.item.orderKey,
                 isFocused: store.focusedWindowID == window.id,
-                focusTint: store.group(of: window.id).displayColor,
+                tint: store.group(of: window.id).displayColor,
                 onActivate: { onActivate(window) },
                 // Filing into a capsule *moves* the window, so picking the one
                 // it is already in would be a no-op — `add` handles that.
@@ -356,6 +367,8 @@ struct DeckView: View {
                 width: slot.width,
                 iconSize: slot.iconSize,
                 isDragging: dragging == slot.item.orderKey,
+                tint: sectionTint(section),
+                isFocused: members.contains { $0.id == store.focusedWindowID },
                 onActivate: { onActivateAll(members) },
                 onSeparate: { store.dissolveCluster(cluster.id) },
                 onRename: { onRenameCluster(cluster) },
@@ -379,10 +392,10 @@ struct DeckView: View {
                 iconSize: slot.iconSize,
                 isDragging: dragging == slot.item.orderKey,
                 isFocused: members.contains { $0.id == store.focusedWindowID },
-                // Its own capsule's colour, like an entry tile's. Using "the
-                // active capsule's colour" would tint a focused stack in Work
-                // with Main's colour whenever focus sat elsewhere.
-                focusTint: members.first.map { store.group(of: $0.id).displayColor } ?? store.focusTint,
+                // Its own capsule's colour, like an entry tile's. Reading "the
+                // active capsule's colour" instead would tint a stack in Work
+                // with Main's colour whenever focus happened to sit elsewhere.
+                tint: sectionTint(section),
                 windows: byRecency,
                 // One window, not all of them — the whole point of the feature.
                 onActivate: { if let first = byRecency.first { onActivate(first) } },

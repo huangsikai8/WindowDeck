@@ -11,6 +11,10 @@ struct ClusterTile: View {
     let width: CGFloat
     let iconSize: CGFloat
     let isDragging: Bool
+    /// Its capsule's colour, for the dot beneath.
+    let tint: Color
+    /// One of its members is frontmost.
+    var isFocused: Bool = false
     let onActivate: () -> Void
     let onSeparate: () -> Void
     let onRename: () -> Void
@@ -38,6 +42,7 @@ struct ClusterTile: View {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .strokeBorder(.primary.opacity(0.18), lineWidth: 1)
             )
+            .overlay(alignment: .bottom) { StatusDot(tint: tint, isFocused: isFocused) }
             .background(frameReader)
         }
         .buttonStyle(.plain)

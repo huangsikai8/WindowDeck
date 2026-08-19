@@ -57,19 +57,33 @@ struct GroupSelector: View {
     @State private var isHovering = false
 
     var body: some View {
-        Image(systemName: "rectangle.3.group")
-            .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(.secondary)
-            .frame(width: DeckMetrics.selectorWidth, height: DeckMetrics.tileHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(.primary.opacity(isHovering ? 0.18 : 0.10))
-            )
-            .background(MenuAnchorView(controller: controller))
-            .contentShape(Rectangle())
-            .onHover { isHovering = $0 }
-            .onTapGesture { showMenu() }
-            .help("Groups")
+        // Icon over count, not side by side: the strip is 56pt tall and 40pt
+        // wide per tile, so stacking keeps this the same width as everything
+        // else in the row rather than stealing space from the windows.
+        VStack(spacing: 1) {
+            Image(systemName: "rectangle.3.group")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+            // How many windows the strip is showing in total — the one number
+            // that is not visible anywhere else, since each capsule shows only
+            // its own and a busy session runs to dozens.
+            Text("\(store.windows.count)")
+                .font(.system(size: 10, weight: .semibold))
+                // Monospaced so the button does not twitch as windows open and
+                // close, which it does several times a minute.
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: DeckMetrics.selectorWidth, height: DeckMetrics.tileHeight)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.primary.opacity(isHovering ? 0.18 : 0.10))
+        )
+        .background(MenuAnchorView(controller: controller))
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+        .onTapGesture { showMenu() }
+        .help("\(store.windows.count) windows in \(store.groups.count) groups")
     }
 
     /// A small colour dot for the menu. NSMenu takes an NSImage, so the swatch is
