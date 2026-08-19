@@ -7,7 +7,7 @@
 <p align="center">
   A macOS Dock replacement that groups <b>individual windows</b> rather than apps.
 </p>
-
+ 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey">
   <img alt="Swift" src="https://img.shields.io/badge/Swift-6.2-orange">
