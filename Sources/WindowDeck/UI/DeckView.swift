@@ -335,6 +335,7 @@ struct DeckView: View {
                 iconSize: slot.iconSize,
                 isDragging: dragging == slot.item.orderKey,
                 isRunning: store.runningApps.all.contains(app.bundleID),
+                tint: sectionTint(section),
                 onOpen: { AppLauncher.open(app) },
                 onTogglePin: { store.togglePin(app.bundleID, in: $0) },
                 isPinnedIn: { store.isPinned(app.bundleID, in: $0) },
@@ -342,7 +343,7 @@ struct DeckView: View {
                 onUnpin: { store.unpin(app.bundleID) }
             )
 
-        case .running(let app, _):
+        case .running(let app, _, let instance):
             PinnedTile(
                 app: app,
                 width: slot.width,
@@ -351,7 +352,10 @@ struct DeckView: View {
                 isPinned: false,
                 // Reaching this case at all means the app is running.
                 isRunning: true,
-                onOpen: { AppLauncher.open(app) },
+                tint: sectionTint(section),
+                // The copy *this* process came from, so a second installation
+                // reopens itself rather than its namesake.
+                onOpen: { AppLauncher.open(url: instance?.url ?? app.url) },
                 onTogglePin: { store.togglePin(app.bundleID, in: $0) },
                 isPinnedIn: { store.isPinned(app.bundleID, in: $0) },
                 pinTargets: store.pinTargets(forApp: app.bundleID),
@@ -445,8 +449,11 @@ enum DeckMetrics {
     static let cornerRadius: CGFloat = 16
     static let padding: CGFloat = 10
     // 44 inside a 56pt strip: the icon carries the information, so the bar
-    // should not be mostly padding. Width is deliberately untouched, so the same
-    // number of windows still fit before the layout starts tightening.
+    // should not be mostly padding. Neither number may grow to make icons
+    // bigger — the strip's height is screen the user does not get back, and the
+    // tile's width is how many windows fit before the layout tightens. The way
+    // the Dock gets a large icon is not a large tile, it is a tile that is
+    // almost entirely icon, so growth comes out of this tile's own slack.
     static let tileHeight: CGFloat = 44
     static let pinnedTileWidth: CGFloat = 40
     static let tileSpacing: CGFloat = 6
@@ -457,6 +464,16 @@ enum DeckMetrics {
     /// launcher. Shared so the two kinds line up along the bottom of the row.
     static let statusDotSize: CGFloat = 4
     static let statusDotInset: CGFloat = 1.5
+    /// Space kept clear at the bottom of a tile for the dot, so the icon can
+    /// take everything above it.
+    ///
+    /// Centring the icon in the whole tile is what wasted the room: it split the
+    /// slack evenly top and bottom and then the dot had to be drawn *over* the
+    /// bottom half of it, so the icon could never grow into either. Reserving
+    /// the dot's band explicitly gives the icon one contiguous space instead of
+    /// two useless margins, which is the arrangement the Dock has — icon, then a
+    /// thin strip with the indicator in it, and nothing else.
+    static let dotClearance: CGFloat = 5
     static let dividerWidth: CGFloat = 1
     /// Gap between the strip and the screen edge.
     static let edgeInset: CGFloat = 8

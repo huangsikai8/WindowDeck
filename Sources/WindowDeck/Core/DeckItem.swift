@@ -20,7 +20,10 @@ enum DeckItem: Identifiable {
     /// *not* a separate class of thing in the row: same icon, same place, same
     /// dot, exactly as the Dock behaves. Nil when the app was never in a group,
     /// which only happens in All.
-    case running(PinnedApp, placeholderFor: CGWindowID?)
+    /// `instance` is the process this launcher stands for. Two copies of one
+    /// application share a bundle id, so it is the process — not the bundle —
+    /// that makes two launchers two different things. Nil only in fixtures.
+    case running(PinnedApp, placeholderFor: CGWindowID?, instance: AppStore.AppInstance?)
     /// Every window of one application in this group, behind that application's
     /// own icon.
     ///
@@ -37,7 +40,11 @@ enum DeckItem: Identifiable {
         case .window(let window): "w\(window.id)"
         case .cluster(let cluster, _): "c\(cluster.id.uuidString)"
         case .pinned(let app): "p\(app.bundleID)"
-        case .running(let app, _): "r\(app.bundleID)"
+        // The process, not the bundle id: two copies of one application would
+        // otherwise be one identity on two views, which is what once rendered
+        // the switcher rotated with two tiles highlighted at once.
+        case .running(let app, _, let instance):
+            instance.map { "r\(app.bundleID)#\($0.pid)" } ?? "r\(app.bundleID)"
         case .appStack(let bundleID, _): "s\(bundleID)"
         }
     }
@@ -51,7 +58,7 @@ enum DeckItem: Identifiable {
         case .pinned(let app): "p\(app.bundleID)"
         // The closed window's own key, so the slot keeps the position it held in
         // the manual arrangement instead of jumping when the window closes.
-        case .running(let app, let windowID):
+        case .running(let app, let windowID, _):
             windowID.map { "w\($0)" } ?? "p\(app.bundleID)"
         // The application, not its leftmost member. A cluster keys its
         // arrangement on `members.first`, which goes stale the moment that
@@ -61,11 +68,40 @@ enum DeckItem: Identifiable {
         }
     }
 
+    /// Which applications this item stands for.
+    ///
+    /// A *set* rather than one id because a hand-made cluster can hold windows
+    /// of two applications, and a new window of either one should recognise the
+    /// cluster its siblings are already in.
+    ///
+    /// A window with no bundle id falls back to its application's name. Both
+    /// halves are namespaced, or an app named after another's bundle id would
+    /// match it.
+    var appKeys: Set<String> {
+        switch self {
+        case .pinned(let app), .running(let app, _, _): ["b\(app.bundleID)"]
+        // The rule, not its current members: a stack is an application, and it
+        // has to answer for that application even in the moment it is drawing
+        // no windows.
+        case .appStack(let bundleID, _): ["b\(bundleID)"]
+        default: Set(windows.map { window in
+                window.bundleID.map { "b\($0)" } ?? "n\(window.appName)"
+            })
+        }
+    }
+
+    /// Do these two items belong to the same application? What "beside the
+    /// window that is already open" means when the strip places a tile the user
+    /// has not arranged by hand.
+    func sharesApp(with other: DeckItem) -> Bool {
+        !appKeys.isDisjoint(with: other.appKeys)
+    }
+
     /// The application a launcher stands for, if this item is one. Main defers
     /// to the other capsules over these, so it has to be able to ask.
     var launcherBundleID: String? {
         switch self {
-        case .pinned(let app), .running(let app, _): app.bundleID
+        case .pinned(let app), .running(let app, _, _): app.bundleID
         default: nil
         }
     }

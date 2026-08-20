@@ -60,7 +60,18 @@ enum AppLauncher {
     /// click a running app's icon, which is what makes it create a window again.
     /// It launches the app when it isn't running, so one path covers both.
     static func open(_ app: PinnedApp) {
-        guard let url = app.url else { NSSound.beep(); return }
+        open(url: app.url)
+    }
+
+    /// Reopens one specific copy of an application.
+    ///
+    /// Two installations share a bundle id, so `urlForApplication(withBundleIdentifier:)`
+    /// cannot tell them apart and answers with whichever LaunchServices prefers —
+    /// clicking the launcher for `/Applications/Slack 2.app` would reopen
+    /// `/Applications/Slack.app`. The process's own `bundleURL` is the only thing
+    /// that names the right one.
+    static func open(url: URL?) {
+        guard let url else { NSSound.beep(); return }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
 

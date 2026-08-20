@@ -75,6 +75,28 @@ final class AppStore {
         /// Bundle ids owning a window on *any* Space, so an app with windows one
         /// Desktop away is not mistaken for having none.
         var withWindows: Set<String> = []
+        /// Dock-worthy processes with no window of their own, one entry each.
+        ///
+        /// Keyed by process rather than by bundle id, because a bundle id is not
+        /// unique: two copies of one application on disk run as two processes
+        /// sharing it. Measured — `/Applications/Slack.app` as pid 98963 and
+        /// `/Applications/Slack 2.app` as pid 824, both `com.tinyspeck.slackmacgap`.
+        /// The Dock draws an icon per process and showed two; every launcher here
+        /// was keyed by bundle id, so the set collapsed them into one and the
+        /// windowless copy was suppressed by the other copy's window.
+        var windowless: [AppInstance] = []
+    }
+
+    /// One running process of an application.
+    ///
+    /// `url` is the copy *this process* was launched from, which is what makes
+    /// clicking its launcher reopen the right one — `urlForApplication(withBundleIdentifier:)`
+    /// answers with whichever copy LaunchServices prefers and cannot tell two apart.
+    struct AppInstance: Equatable, Hashable {
+        let pid: pid_t
+        let bundleID: String
+        let name: String
+        let url: URL?
     }
 
     /// Observed, not ignored. A launcher draws unlit when its app is not in this
@@ -100,7 +122,21 @@ final class AppStore {
             if app.activationPolicy == .regular { sample.dockApps.insert(bundleID) }
             if windowOwnerPIDs.contains(app.processIdentifier) {
                 sample.withWindows.insert(bundleID)
+            } else if app.activationPolicy == .regular {
+                // Judged per process: another copy of the same application having
+                // a window says nothing about this one.
+                sample.windowless.append(AppInstance(
+                    pid: app.processIdentifier,
+                    bundleID: bundleID,
+                    name: app.localizedName ?? bundleID,
+                    url: app.bundleURL
+                ))
             }
+        }
+        // Stable order, so the row does not reshuffle between samples.
+        sample.windowless.sort {
+            $0.name == $1.name ? $0.pid < $1.pid
+                : $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
         if sample != runningApps { runningApps = sample }
     }
@@ -210,22 +246,49 @@ final class AppStore {
         }
     }
 
-    /// Items the user has dragged into place lead, in that order; anything else
-    /// keeps the default sort and trails behind. Operates on item keys so a
-    /// pinned app and a window can sit next to each other in one arrangement.
+    /// Items the user has arranged by hand lead, in that order; anything else
+    /// is placed beside the windows of its own application. Operates on item
+    /// keys so a pinned app and a window can sit next to each other in one
+    /// arrangement.
+    ///
+    /// **A newly opened window has no key at all.** Nothing writes one —
+    /// `captureNewWindows` files it into a group's membership and stops there,
+    /// and a key is only minted by a drag, by `stackApp` or by the restore pass.
+    /// So an unranked item used to be sent to the end of the row, which put a
+    /// second Finder window at the far right of the capsule while the first sat
+    /// wherever the arrangement had it.
+    ///
+    /// That is invisible until it is not: with an *empty* order the default sort
+    /// already groups by application (`AXSweeper` sorts by app name then title),
+    /// so a fresh install reads perfectly. The order is non-empty in every
+    /// session after the first, because the restore pass rebuilds it from
+    /// `savedOrder` — which is exactly when the app-grouped default stops
+    /// applying and the windows of one app scatter.
+    ///
+    /// Nothing here is persisted: the item still has no key, so there is no new
+    /// `OrderRef` case, nothing to prune when the window closes, and an
+    /// arrangement the user *made* still wins outright — two windows of one app
+    /// dragged to opposite ends are both ranked, and neither moves.
     private func applyManualOrder(_ items: [DeckItem], order: [String]) -> [DeckItem] {
         guard !order.isEmpty else { return items }
         var rank: [String: Int] = [:]
         for (index, key) in order.enumerated() { rank[key] = index }
 
-        return items.enumerated().sorted { lhs, rhs in
-            switch (rank[lhs.element.orderKey], rank[rhs.element.orderKey]) {
-            case let (l?, r?): return l < r
-            case (_?, nil): return true
-            case (nil, _?): return false
-            case (nil, nil): return lhs.offset < rhs.offset
+        var placed = items
+            .filter { rank[$0.orderKey] != nil }
+            .sorted { rank[$0.orderKey, default: 0] < rank[$1.orderKey, default: 0] }
+
+        // Searched against the *growing* list rather than the ranked items
+        // alone, so several new windows of one app land behind the first in the
+        // order they were given rather than all on top of the same anchor.
+        for item in items where rank[item.orderKey] == nil {
+            if let anchor = placed.lastIndex(where: { $0.sharesApp(with: item) }) {
+                placed.insert(item, at: anchor + 1)
+            } else {
+                placed.append(item)
             }
-        }.map(\.element)
+        }
+        return placed
     }
 
     /// Moves one item to sit where another currently is, inside one capsule.
@@ -338,11 +401,11 @@ final class AppStore {
                                   claimedElsewhere: Set<String>) -> [DeckItem] {
         guard showRunningApps else { return [] }
 
-        // "Has no windows" means none anywhere, not none on this Desktop. With
-        // current-Space filtering on, `windows` omits other Spaces, so judging by
-        // it alone claimed an app had nothing open while its windows sat one
-        // Desktop away.
-        let present = runningApps.withWindows
+        // Candidates come from `runningApps.windowless`, which is judged per
+        // process. "Has no windows" still means none anywhere rather than none on
+        // this Desktop — with current-Space filtering on, `windows` omits other
+        // Spaces, so judging by it alone claimed an app had nothing open while its
+        // windows sat one Desktop away.
         let pinned = Set(group.pinnedApps.map(\.bundleID))
         let live = Set(windows.map(\.id))
         let selfID = Bundle.main.bundleIdentifier
@@ -356,17 +419,29 @@ final class AppStore {
             slotFor[ref.bundleID] = id
         }
 
-        var wanted = group.isMain
-            ? runningApps.dockApps.subtracting(claimedElsewhere)
-            : Set(slotFor.keys).intersection(runningApps.dockApps)
+        // A named group is a record of what you worked with in it, so only a
+        // process whose window was closed *there* qualifies. Main is the
+        // catch-all and takes every windowless process the Dock would show,
+        // minus the ones another capsule already draws.
+        let candidates = runningApps.windowless.filter { instance in
+            guard instance.bundleID != selfID, !pinned.contains(instance.bundleID) else { return false }
+            return group.isMain
+                ? !claimedElsewhere.contains(instance.bundleID)
+                : slotFor[instance.bundleID] != nil
+        }
 
-        wanted.subtract(present)
-        wanted.subtract(pinned)
-        if let selfID { wanted.remove(selfID) }
-
-        return Self.pinnedApps(from: wanted.sorted())
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            .map { DeckItem.running($0, placeholderFor: slotFor[$0.bundleID]) }
+        // Two processes of one application both match the same closed-window
+        // slot, and only one can stand in it — the rest keep their own place.
+        // Without this they would share an `orderKey` and sort as one item.
+        var taken: Set<CGWindowID> = []
+        return candidates.compactMap { instance in
+            guard let app = Self.pinnedApp(for: instance) else { return nil }
+            var slot = slotFor[instance.bundleID]
+            if let claim = slot {
+                if taken.contains(claim) { slot = nil } else { taken.insert(claim) }
+            }
+            return DeckItem.running(app, placeholderFor: slot, instance: instance)
+        }
     }
 
     /// The single description of what the strip draws: one capsule per group,
@@ -598,6 +673,122 @@ final class AppStore {
         return result
     }
 
+    // MARK: - Switching between things on the strip
+
+    /// Everything ⌥Tab can switch to, most recently used first.
+    ///
+    /// Built straight from `sections(includingCollapsed: true)` — the same list
+    /// the strip draws — so the switcher and the bar can never disagree about
+    /// what an entry *is*. Two things about that are decisions:
+    ///
+    /// * **Collapsed capsules are included.** Mirroring the strip means the same
+    ///   grouping, not the same visibility. A folded capsule still owns its
+    ///   windows, and making them unreachable from the keyboard the moment a
+    ///   group is folded would be a trap rather than a simplification.
+    /// * **A launcher is listed only when its application is running.** A
+    ///   running app with no windows is exactly what ⌘Tab shows, so it belongs.
+    ///   One that is not running does not: releasing the key while passing over
+    ///   it would *launch* something, which is not what a switcher is for.
+    func switchEntries() -> [SwitchEntry] {
+        var entries: [SwitchEntry] = []
+
+        for section in sections(includingCollapsed: true) {
+            guard let groupID = section.groupID,
+                  let group = groups.first(where: { $0.id == groupID }) else { continue }
+
+            for item in section.items {
+                let id = "\(section.id)/\(item.id)"
+                switch item {
+                case .window(let window):
+                    entries.append(SwitchEntry(
+                        id: id, item: item, groupID: groupID, groupName: group.name,
+                        groupColor: group.displayColor, title: window.appName,
+                        icon: window.icon, windows: [window]))
+
+                case .appStack(let bundleID, let members):
+                    entries.append(SwitchEntry(
+                        id: id, item: item, groupID: groupID, groupName: group.name,
+                        groupColor: group.displayColor,
+                        title: members.first?.appName ?? bundleID,
+                        icon: members.first?.icon, windows: members))
+
+                case .cluster(let cluster, let members):
+                    entries.append(SwitchEntry(
+                        id: id, item: item, groupID: groupID, groupName: group.name,
+                        groupColor: group.displayColor,
+                        title: cluster.customName?.isEmpty == false
+                            ? cluster.customName! : cluster.displayName(resolving: members),
+                        icon: members.first?.icon, windows: members))
+
+                case .pinned(let app), .running(let app, _, _):
+                    guard runningApps.all.contains(app.bundleID) else { continue }
+                    entries.append(SwitchEntry(
+                        id: id, item: item, groupID: groupID, groupName: group.name,
+                        groupColor: group.displayColor, title: app.name,
+                        icon: app.icon, windows: []))
+                }
+            }
+        }
+
+        return orderedByRecency(entries)
+    }
+
+    /// Most-recently-used, ranked by each entry's best window.
+    ///
+    /// The same `mruOrder` the strip and `stackWindowsByRecency` use, so the
+    /// switcher cannot disagree with a tile about which window is most recent.
+    /// Entries with no windows — running launchers — have no recency to rank by
+    /// and sort last, in strip order.
+    private func orderedByRecency(_ entries: [SwitchEntry]) -> [SwitchEntry] {
+        var rank: [CGWindowID: Int] = [:]
+        for (index, id) in mruOrder.enumerated() { rank[id] = index }
+        func best(_ entry: SwitchEntry) -> Int {
+            entry.windows.compactMap { rank[$0.id] }.min() ?? Int.max
+        }
+
+        let ordered = entries.enumerated().sorted { lhs, rhs in
+            let l = best(lhs.element), r = best(rhs.element)
+            return l == r ? lhs.offset < rhs.offset : l < r
+        }.map(\.element)
+
+        // The entry you are in goes to index 0 *explicitly* rather than being
+        // trusted to rank first, mirroring `byRecency` and guarding the same
+        // race: `mruOrder` only leads with the focused window once that focus
+        // has been *recorded*, and the switcher opening a fraction early is what
+        // once made it lead with the wrong window. In-process the store cannot
+        // produce that state — every focus change updates `mruOrder` — so the
+        // self-test pins the property this produces, not this line.
+        guard let focusedWindowID,
+              let here = ordered.firstIndex(where: { $0.windows.contains { $0.id == focusedWindowID } })
+        else { return ordered }
+
+        var result = ordered
+        let current = result.remove(at: here)
+        result.insert(current, at: 0)
+        return result
+    }
+
+    /// What committing an entry does. Resolved here rather than in the switcher
+    /// so the choice is testable without a run loop, and so a stack picks its
+    /// window through the same recency the tile draws.
+    func commitTarget(for entry: SwitchEntry) -> SwitchEntry.Commit {
+        switch entry.item {
+        case .window(let window):
+            return .focus(window.id)
+        case .appStack:
+            // One window, not all of them — the whole point of a stack, and the
+            // same thing clicking the tile does.
+            guard let first = stackWindowsByRecency(entry.windows).first else { return .none }
+            return .focus(first.id)
+        case .cluster(_, let members):
+            // All of them, together: a cluster is a set someone assembled by
+            // hand, and clicking it raises the set.
+            return members.isEmpty ? .none : .focusAll(members.map(\.id))
+        case .pinned(let app), .running(let app, _, _):
+            return .open(app.bundleID)
+        }
+    }
+
     /// Where the first tap lands.
     ///
     /// The two orders disagree, and the difference used to be a literal `1` in
@@ -669,7 +860,8 @@ final class AppStore {
     /// and F1 is a brightness key unless that has been changed, so any default
     /// would silently fail to register.
     static func defaultShortcuts() -> [ShortcutAction: Shortcut] {
-        [.cycleGroupWindows: .defaultGroupCycle]
+        [.cycleGroupWindows: .defaultGroupCycle,
+         .cycleEntries: .defaultEntryCycle]
     }
 
     // MARK: - Membership
@@ -1094,6 +1286,15 @@ final class AppStore {
                         // wait for, unlike a window that has to reappear.
                         let key = "p\(bundleID)"
                         if !order.contains(key) { order.append(key) }
+                    case .stacked(let bundleID):
+                        // Same: a stack is a *rule* about an application, and
+                        // the rule is restored with the group, so its slot can
+                        // be taken immediately. It does not wait for the app's
+                        // windows the way a `.window` entry does — waiting would
+                        // put it behind whatever arrived first, which is the
+                        // reshuffle this whole path exists to prevent.
+                        let key = "s\(bundleID)"
+                        if !order.contains(key) { order.append(key) }
                     case .window(let member):
                         // The same window-id-first matcher membership uses. This
                         // was exact-title only, so an arrangement silently
@@ -1174,9 +1375,10 @@ final class AppStore {
               !groups[index].stackedAppBundleIDs.contains(bundleID) else { return }
 
         // Seed the arrangement before inserting the rule. `applyManualOrder`
-        // ranks by key and sends anything unranked to the end, so a brand-new
-        // `s<bundle>` key would drop the stack to the far right of the row the
-        // instant it was created — the same trap that would have condemned
+        // ranks by key, and an unranked stack has nothing to sit beside — its
+        // members' own keys are being removed here — so a brand-new `s<bundle>`
+        // key would drop the stack to the far right of the row the instant it
+        // was created — the same trap that would have condemned
         // hidden pins to the end on the first drag. Take the leftmost member's
         // place and drop the rest.
         let keys = stackKeys(bundleID, at: index)
@@ -1536,6 +1738,7 @@ final class AppStore {
                 switch ref {
                 case .window(let member): seenOrder.insert("w" + identity(member)).inserted
                 case .pinned(let bundleID): seenOrder.insert("p" + bundleID).inserted
+                case .stacked(let bundleID): seenOrder.insert("s" + bundleID).inserted
                 }
             }
             if dedupedOrder.count != groups[index].savedOrder.count {
@@ -1967,14 +2170,22 @@ final class AppStore {
 
     /// Bumped whenever a release adds actions that existing state files should
     /// be offered defaults for.
-    static let shortcutSeedVersion = 1
+    static let shortcutSeedVersion = 2
 
     private static func shortcutsIntroduced(inSeedVersion version: Int) -> [ShortcutAction] {
-        // Seed version 1 offered the group-cycling shortcuts, which no longer
-        // exist — there are no groups to cycle. Nothing has been added since, so
-        // no batch is outstanding; the counter itself stays, because the next
-        // action added needs exactly this machinery.
-        []
+        switch version {
+        // Version 1 offered the group-cycling shortcuts, which no longer exist —
+        // there are no groups to cycle. Its batch is deliberately empty rather
+        // than deleted: the version numbers are a ratchet, and reusing one would
+        // re-offer a binding to a file that has already declined it.
+        case 1: []
+        // ⌥Tab. A file written before it existed has no key for it, and defaults
+        // are only applied to a file with *no* shortcuts at all — which is never
+        // true after first launch — so without this the action would stay
+        // unbound forever on every existing install.
+        case 2: [.cycleEntries]
+        default: []
+        }
     }
 
     /// Coalesced so typing in a rename field doesn't hit disk per keystroke.
@@ -1986,6 +2197,15 @@ final class AppStore {
     }
 
     /// Bundle ids that no longer resolve to an installed app are dropped.
+    /// Built from the copy this process was launched from, so two installations
+    /// of one application carry their own display names — "Slack" and "Slack 2"
+    /// — rather than both resolving through the bundle id to whichever copy
+    /// LaunchServices happens to prefer.
+    private static func pinnedApp(for instance: AppInstance) -> PinnedApp? {
+        if let url = instance.url, let app = PinnedApp(url: url) { return app }
+        return PinnedApp(bundleID: instance.bundleID, name: instance.name)
+    }
+
     private static func pinnedApps(from bundleIDs: [String]) -> [PinnedApp] {
         bundleIDs.compactMap { bundleID in
             guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
@@ -2073,6 +2293,7 @@ final class AppStore {
     private func orderSnapshot(of group: DeckGroup) -> [OrderRef] {
         let live: [OrderRef] = group.order.compactMap { key in
             if key.hasPrefix("p") { return .pinned(String(key.dropFirst())) }
+            if key.hasPrefix("s") { return .stacked(String(key.dropFirst())) }
             guard let id = CGWindowID(key.dropFirst()), let ref = knownRefs[id] else { return nil }
             return .window(ref)
         }

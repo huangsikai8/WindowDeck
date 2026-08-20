@@ -18,6 +18,32 @@ enum AX {
     /// treatment, so geometry is never used to decide it.
     static let fullScreenAttribute = "AXFullScreen"
 
+    /// Seconds any one Accessibility round-trip may take before it gives up.
+    /// A healthy application answers in well under a millisecond, so this only
+    /// ever binds on one that is genuinely stuck.
+    static let messagingTimeout: Float = 0.5
+
+    /// Bounds every Accessibility round-trip this process makes.
+    ///
+    /// Each AX call is synchronous IPC into another process, and a full window
+    /// sweep makes hundreds of them on the main thread. With no timeout set they
+    /// use the system default, which is measured in *seconds* — so one
+    /// application that is busy, swapping or midway through quitting parks the
+    /// main thread, and with it the strip, the hotkeys and every timer.
+    ///
+    /// Measured: a 25-second stall, which appeared in the log only as a perf
+    /// heartbeat arriving 85s after the previous one instead of 60. Flat CPU
+    /// across the gap is the tell — the thread was blocked in `mach_msg`, not
+    /// busy — and it is the same blocked-leaf signature that made the engine
+    /// tick look expensive in a `sample` profile when it was mostly waiting.
+    ///
+    /// The timeout set on the system-wide element becomes the default for every
+    /// element that has none of its own, so this one call covers the sweep, the
+    /// zoom clamp, the fullscreen probe and raising a window alike.
+    static func boundMessagingTimeouts() {
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), messagingTimeout)
+    }
+
     static func windowID(of element: AXUIElement) -> CGWindowID? {
         var id: CGWindowID = 0
         guard _AXUIElementGetWindow(element, &id) == .success, id != 0 else { return nil }

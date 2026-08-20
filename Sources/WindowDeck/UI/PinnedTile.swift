@@ -17,6 +17,8 @@ struct PinnedTile: View {
     /// Passed in from the store's sampled snapshot. Asking
     /// `NSRunningApplication` here meant a lookup per launcher per redraw.
     let isRunning: Bool
+    /// The capsule's colour, for the running dot.
+    let tint: Color
     let onOpen: () -> Void
     /// Toggles the pin in a capsule; nil means Main.
     var onTogglePin: ((UUID?) -> Void)?
@@ -40,6 +42,7 @@ struct PinnedTile: View {
                         .opacity(isRunning ? 1 : (isHovering ? 0.85 : 0.5))
                 }
             }
+            .padding(.bottom, DeckMetrics.dotClearance)
             .frame(width: width, height: DeckMetrics.tileHeight)
             // Anchored to the *tile* and drawn by the shared `StatusDot`, so it
             // lines up with every other dot in the row. It used to hang off the
@@ -47,10 +50,13 @@ struct PinnedTile: View {
             // its neighbours and half a point smaller — a whole row of dots that
             // visibly failed to line up.
             .overlay(alignment: .bottom) {
-                // Neutral, not the capsule's colour: this app is running but has
-                // no window in this capsule, which is a different state from the
-                // open windows either side of it and must not look the same.
-                if isRunning { StatusDot() }
+                // The capsule's colour, exactly as an open window gets — the
+                // Dock draws one dot for "running" and does not care whether the
+                // app currently has a window, so neither does this. The earlier
+                // neutral dot distinguished a launcher from a real window, which
+                // is information the Dock never offered and which made an app
+                // that had simply been closed look like a lesser thing.
+                if isRunning { StatusDot(tint: tint) }
             }
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)

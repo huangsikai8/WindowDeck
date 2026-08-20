@@ -74,6 +74,11 @@ struct EntryTile: View {
                 }
             }
             .padding(.horizontal, showsTitle ? 7 : 0)
+            // Keeps the dot's band clear so the icon owns everything above it.
+            // Without this the icon is centred in the full tile and the dot is
+            // drawn on top of its bottom edge, which is what capped the icon at
+            // a size the tile had plenty of room for.
+            .padding(.bottom, DeckMetrics.dotClearance)
             .frame(width: width, height: DeckMetrics.tileHeight,
                    alignment: showsTitle ? .leading : .center)
             .background(

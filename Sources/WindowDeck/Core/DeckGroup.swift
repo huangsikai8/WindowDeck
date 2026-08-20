@@ -62,6 +62,16 @@ struct MemberRef: Codable, Hashable {
 enum OrderRef: Codable, Hashable {
     case window(MemberRef)
     case pinned(String)
+    /// An app stack, by bundle id. Every kind of thing the row can draw needs a
+    /// case here or its *position* is not persisted at all: `orderSnapshot`
+    /// silently drops any key it cannot describe, and `applyManualOrder` has
+    /// nowhere to put a key it cannot rank but the end of the row, since a stack
+    /// has no window of its own app left beside it to sit next to — so a stack
+    /// came back on the far right of its capsule after every relaunch, however
+    /// it had been arranged. Nothing failed and nothing was logged; the arrangement simply
+    /// changed under you. Adding a case is safe (an old file has none of them);
+    /// changing one is what wipes a file.
+    case stacked(String)
 }
 
 /// A named arrangement of windows — "Work", "Study", and so on.
@@ -81,9 +91,10 @@ struct DeckGroup: Identifiable, Hashable {
     var name: String
     var memberIDs: Set<CGWindowID>
     /// Manual left-to-right order set by dragging entries in the strip, as
-    /// `DeckItem.orderKey` values so windows and pins can interleave. Items
-    /// absent from it fall to the end in the default order, so something newly
-    /// opened never displaces what you already arranged.
+    /// `DeckItem.orderKey` values so windows and pins can interleave. Nothing
+    /// here is ever displaced by something newly opened: an item absent from
+    /// this list is drawn beside the windows of its own application, or at the
+    /// end when it has none here. See `AppStore.applyManualOrder`.
     var order: [String]
     var colorIndex: Int
     /// A colour chosen from the picker, as "rrggbb". Overrides `colorIndex` when

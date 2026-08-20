@@ -18,6 +18,11 @@ final class SwitcherModel {
     /// Asked to capture a window that has no image yet. Only fired for tiles
     /// actually on screen, so a large group costs a screenful, not all of it.
     @ObservationIgnored var onNeedsImage: ((WindowInfo) -> Void)?
+    /// The pointer moved onto a tile, or clicked one. Routed through the panel
+    /// rather than straight to the controller so the "has the mouse actually
+    /// moved yet" guard lives in one place.
+    @ObservationIgnored var onHoverIndex: ((Int) -> Void)?
+    @ObservationIgnored var onClickIndex: ((Int) -> Void)?
 }
 
 /// The switcher grid: as wide as the screen comfortably allows, about three rows
@@ -52,9 +57,35 @@ final class SwitcherPanel {
         panel.isOpaque = false
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
-        panel.ignoresMouseEvents = true
+        // Clickable. It was `ignoresMouseEvents = true` on the argument that
+        // this is keyboard-driven — true, and beside the point: the list is on
+        // screen and the obvious thing to do with a thing on screen is click it.
+        // The panel is non-activating, so a click commits without taking focus
+        // from whatever is in front.
+        panel.ignoresMouseEvents = false
         panel.animationBehavior = .none
         panel.contentView = hosting
+
+        model.onHoverIndex = { [weak self] index in
+            guard let self, self.pointerHasMoved else { return }
+            self.onHoverIndex?(index)
+        }
+        model.onClickIndex = { [weak self] index in self?.onClickIndex?(index) }
+    }
+
+    /// Pointer selection, once the pointer has actually moved.
+    var onHoverIndex: ((Int) -> Void)?
+    var onClickIndex: ((Int) -> Void)?
+
+    /// Where the pointer was when the panel appeared.
+    ///
+    /// SwiftUI reports a hover the moment a view appears *under* the cursor, so
+    /// without this the tile that happened to open beneath the mouse would seize
+    /// the selection from the keyboard before the first tap — and a switcher
+    /// that starts somewhere arbitrary is worse than one that ignores the mouse.
+    private var shownAt: NSPoint = .zero
+    private var pointerHasMoved: Bool {
+        hypot(NSEvent.mouseLocation.x - shownAt.x, NSEvent.mouseLocation.y - shownAt.y) > 4
     }
 
     var isVisible: Bool { panel.isVisible }
@@ -68,6 +99,7 @@ final class SwitcherPanel {
 
     func show() {
         resize()
+        shownAt = NSEvent.mouseLocation
         panel.orderFrontRegardless()
     }
 
@@ -129,8 +161,11 @@ struct SwitcherContent: View {
                     // ordering guarantees) SwiftUI reused views in stale
                     // positions and their selected state never refreshed,
                     // rendering the row rotated with leftover highlights.
-                    ForEach(model.candidates) { window in
+                    ForEach(Array(model.candidates.enumerated()), id: \.element.id) { index, window in
                         tile(window, isSelected: window.id == model.selectedWindowID)
+                            .contentShape(Rectangle())
+                            .onHover { if $0 { model.onHoverIndex?(index) } }
+                            .onTapGesture { model.onClickIndex?(index) }
                             .onAppear {
                                 if model.images[window.id] == nil {
                                     model.onNeedsImage?(window)

@@ -37,6 +37,7 @@ struct AppStackTile: View {
     var body: some View {
         Button(action: onActivate) {
             iconLayer
+                .padding(.bottom, DeckMetrics.dotClearance)
                 .frame(width: width, height: DeckMetrics.tileHeight)
                 .overlay(alignment: .topTrailing) { badge }
                 // One dot, not one per window: the badge already says how many.

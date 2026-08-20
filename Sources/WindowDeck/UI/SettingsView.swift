@@ -573,7 +573,9 @@ struct ShortcutsSettingsView: View {
 
     /// Named rather than sliced out of one list by position — the sections drifted
     /// apart the moment an action was added in the middle.
-    private static let windowActions: [ShortcutAction] = [.cycleGroupWindows, .cycleAppWindows]
+    private static let windowActions: [ShortcutAction] = [
+        .cycleEntries, .cycleGroupWindows, .cycleAppWindows
+    ]
 
     var body: some View {
         Form {
@@ -582,8 +584,12 @@ struct ShortcutsSettingsView: View {
                     row(action)
                 }
                 Text("""
-                Hold the modifier and tap the key to move through windows; let go to switch. \
+                Hold the modifier and tap the key to move through the list; let go to switch. \
                 Add Shift to go backwards, or press Escape to cancel without changing anything.
+
+                ⌥Tab moves between the things the strip draws, across every capsule — a stacked \
+                app is one entry however many windows it holds, and a capsule folded away is still \
+                listed. The other two stay inside the capsule you are working in.
                 """)
                 .font(.caption)
                 .foregroundStyle(.secondary)

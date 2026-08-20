@@ -60,15 +60,21 @@ struct GroupSelector: View {
         // Icon over count, not side by side: the strip is 56pt tall and 40pt
         // wide per tile, so stacking keeps this the same width as everything
         // else in the row rather than stealing space from the windows.
-        VStack(spacing: 1) {
+        //
+        // The two sit directly on top of each other with no gap, and both are
+        // drawn as large as that leaves room for. A 12pt glyph with a 10pt
+        // number spaced off it filled about half the tile's height, so this
+        // button read as a smaller, fainter thing than the icons beside it while
+        // the space it needed was already reserved. Nothing here got wider.
+        VStack(spacing: -1) {
             Image(systemName: "rectangle.3.group")
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(.secondary)
             // How many windows the strip is showing in total — the one number
             // that is not visible anywhere else, since each capsule shows only
             // its own and a busy session runs to dozens.
             Text("\(store.windows.count)")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 // Monospaced so the button does not twitch as windows open and
                 // close, which it does several times a minute.
                 .monospacedDigit()

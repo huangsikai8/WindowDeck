@@ -13,6 +13,16 @@ final class HotKeyManager {
     /// to cycle backwards.
     var onTrigger: ((ShortcutAction, Bool) -> Void)?
 
+    /// Fired when the shortcut's *key* is let go, while its modifier may still
+    /// be held.
+    ///
+    /// Carbon hotkeys do not auto-repeat — `RegisterEventHotKey` delivers one
+    /// press however long the key is held down — so holding Tab to run down a
+    /// long list did nothing at all. The switcher runs its own repeat, and this
+    /// is what tells it to stop. It is a separate question from the *modifier*
+    /// being released, which is what ends the session.
+    var onRelease: ((ShortcutAction) -> Void)?
+
     /// Actions whose shortcut registered successfully. A failure almost always
     /// means macOS already owns the combination — ⌃1–⌃9 belong to "Switch to
     /// Desktop" whenever multiple Spaces exist — so it is surfaced in Settings
@@ -66,10 +76,12 @@ final class HotKeyManager {
         guard !isInstalled else { return }
         isInstalled = true
 
-        var spec = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
+        var specs = [
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                          eventKind: UInt32(kEventHotKeyPressed)),
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                          eventKind: UInt32(kEventHotKeyReleased))
+        ]
 
         InstallEventHandler(
             GetApplicationEventTarget(),
@@ -87,17 +99,22 @@ final class HotKeyManager {
                 )
                 let manager = Unmanaged<HotKeyManager>.fromOpaque(userData).takeUnretainedValue()
                 let raw = id.id
+                let released = GetEventKind(event) == UInt32(kEventHotKeyReleased)
                 // Shift is read live rather than from the registration, so one
                 // binding covers both directions of cycling.
                 let reversed = NSEvent.modifierFlags.contains(.shift)
                 Task { @MainActor in
                     guard let action = manager.actionsByID[raw] else { return }
-                    manager.onTrigger?(action, reversed)
+                    if released {
+                        manager.onRelease?(action)
+                    } else {
+                        manager.onTrigger?(action, reversed)
+                    }
                 }
                 return noErr
             },
-            1,
-            &spec,
+            2,
+            &specs,
             Unmanaged.passUnretained(self).toOpaque(),
             &handler
         )

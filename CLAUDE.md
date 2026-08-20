@@ -84,7 +84,8 @@ Sources/WindowDeck/
 │   ├── DeckItem.swift        what the strip draws: window | cluster | appStack | pinned | running
 │   ├── WindowCluster.swift   several windows behind one icon
 │   ├── PreviewService.swift  ScreenCaptureKit captures, per-caller freshness, LRU caps
-│   ├── SwitcherController.swift  the hold-and-tap window switcher state machine
+│   ├── SwitcherController.swift  the hold-and-tap switcher state machine, both modes
+│   ├── SwitchEntry.swift     one thing ⌥Tab can switch to, and what committing it does
 │   ├── HotKeyManager.swift   Carbon global hotkeys, keyed by action
 │   ├── Shortcut.swift        keycode + Carbon modifiers, display strings
 │   ├── CycleOrder.swift      switcher order: most-recently-used or strip order
@@ -103,6 +104,7 @@ Sources/WindowDeck/
 │   ├── PeekOverlay.swift     full-size captured image drawn at the window's real rect
 │   ├── StripWarmth.swift     "is the pointer already scanning the strip", shared by both panels
 │   ├── SwitcherPanel.swift   the ⌃`/⌘` switcher grid
+│   ├── AppSwitcherPanel.swift  the ⌥Tab row of icons, one per thing on the strip
 │   ├── SettingsWindow / SettingsView / ShortcutRecorder / MainMenu
 └── Persistence/State.swift   the JSON state file and its migrations
 
@@ -272,9 +274,22 @@ debounce.
 **`NSHostingView` resizes its window by default.** Set `sizingOptions = []` or it fights
 `setContentSize` and the panel takes an arbitrary width.
 
-**Carbon hotkeys report key-down only.** Detecting the modifier *release* needs `flagsChanged`
-monitors (global *and* local). A very fast tap can release before the monitor is installed, so entry
-also reads live `NSEvent.modifierFlags`.
+**Carbon hotkeys report key-down only, and do not auto-repeat.** Two separate consequences.
+
+Detecting the *modifier* release needs `flagsChanged` monitors (global **and** local). A very fast tap
+can release before the monitor is installed, so entry also reads live `NSEvent.modifierFlags`.
+
+Detecting the *key* release needs `kEventHotKeyReleased`, registered alongside `kEventHotKeyPressed`
+— `RegisterEventHotKey` delivers exactly one press however long the key is held, so holding Tab to run
+down a long list did nothing at all. The switcher therefore runs its own repeat: a 0.42s pause so a
+deliberate single tap never repeats, then a step every 85ms. It is bounded three ways, because a
+repeat that outlives its key would walk the list on its own — the release event stops it, the modifier
+being gone stops it, and it stops itself after 200 steps.
+
+**A safety timeout must not fire on a hold that is still happening.** The switcher commits ten seconds
+after opening in case the release event is never seen — which also meant that studying the list for
+ten seconds closed it out from under you. It now re-arms while the modifier is genuinely still down,
+so the net still catches the case it exists for, within ten seconds of the key actually being let go.
 
 **A shortcut with no modifier swallows that key system-wide.** `ShortcutRecorder` refuses bare keys.
 
@@ -294,6 +309,50 @@ its windows vanish from the strip as though it had quit. Measured on a machine w
 twelve apps hidden that way — Excel, Word, Outlook, Terminal, Spotify, Firefox and more — accounted for
 almost every window the strip was not showing, and it presented convincingly as a Spaces problem. Both
 `isMinimized` and `NSRunningApplication.isHidden` must be exempted.
+
+**A bundle id is not a running application.** Two copies of one app installed side by side share
+one, and the Dock draws an icon per *process*: measured here as `/Applications/Slack.app` (pid 98963)
+and `/Applications/Slack 2.app` (pid 824), both `com.tinyspeck.slackmacgap`. Every launcher was keyed
+by bundle id — `Set<String>` for the candidates, `"r<bundleID>"` for the item — so two collapsed into
+one, and because "has a window" was asked of the *bundle*, the copy whose window had been closed was
+suppressed by the other copy's window. It presented as "2 in the Dock, 1 in WindowDeck".
+
+Window tiles were never affected, which is the tell: `WindowInfo` carries a `pid`, so both copies'
+windows always drew correctly. Only the launcher — the thing keyed by bundle id — could collapse.
+
+`RunningApps.windowless` is therefore `[AppInstance]`, one entry per process, and `DeckItem.running`
+carries that instance so its `id` is `r<bundleID>#<pid>`. Nothing here is persisted: a pid means
+nothing after a relaunch, and the order key deliberately stays the closed window's `w<id>` (or the
+bundle's `p<id>`), so no `OrderRef` case changed — the one edit that silently wipes the state file.
+Two processes matching the same closed-window slot is real, so the slot is claimed once and the
+others keep their own place, or they would share an order key and sort as one item.
+
+`AppLauncher` needs the instance too. `urlForApplication(withBundleIdentifier:)` answers with
+whichever copy LaunchServices prefers, so clicking Slack 2's launcher reopened Slack; the process's
+own `bundleURL` is the only thing that names the right one, and it is also what gives the two tiles
+their distinct names.
+
+**"Does the app have a window" has two answers, and the window server gives the wrong one.**
+`CGWindowList` keeps listing layer-0 windows for an application that closed its last one with the
+red button. Measured on ChatGPT: Accessibility correctly reported **zero** windows via
+`kAXWindowsAttribute`, while the window server still had five for that pid — one of them
+1280x668, indistinguishable by size or layer from a real window. So `withWindows` was built from
+`ownerPIDs` and said "it has windows", which suppressed the launcher, and the AX pass said "it has
+none", which drew no tile. The application disappeared from the strip entirely while the real Dock
+still showed it — and it presented as a *missing window* bug rather than a missing launcher, which
+is what made it hard to place.
+
+`windowOwnerPIDs` therefore comes from the sweep (`AXSweeper.Output.pidsWithWindows`), not from
+`server.ownerPIDs`. The subtlety worth keeping: the window server was consulted here for a real
+reason — with `currentSpaceOnly` on, `windows` omits other Spaces, so an app whose windows sit one
+Desktop away must not be offered as a launcher. That is why the pid is recorded *inside* `describe`,
+above the current-Space cull and below the tiny-window filter: a window on another Desktop still
+counts, a scratch window never does. Retained descriptions from a stuck application count too, or a
+backed-off app would grow a launcher beside the windows it is still holding.
+
+Not reachable by the self-test — it needs a live window server and a real AX client — so it was
+verified by A/B: with the old line the capsule built `[]`, with the new one
+`[com.openai.codex, com.jordanbaird.Ice]`.
 
 **A window's AX subrole can change when it is minimised.** Activity Monitor's main window reports
 `AXStandardWindow` normally and `AXDialog` once minimised, so a strict standard-window filter dropped
@@ -546,12 +605,51 @@ rather than a second notion of "most recent" that could disagree with the switch
 even when its application is also stacked. Folding stacks first instead swallows the cluster whole —
 asserted by the self-test in both directions.
 
-**A new item kind needs a place in the arrangement before it needs a tile.** `applyManualOrder` sends
-any key it cannot rank to the end of the row, so `stackApp` inserting a fresh `s<bundle>` key without
-touching `order` dropped the stack to the far right the instant it was created — the same trap the
+**Every item kind needs a case in `OrderRef`, or its position is not saved at all.** `orderSnapshot`
+describes each order key as an `OrderRef` and `compactMap`s the result, so a key it has no case for is
+*dropped* — silently, with nothing failing and nothing logged. `applyManualOrder` then sends anything
+it cannot rank to the end of the row, so every app stack came back on the far right of its capsule
+after a relaunch however it had been arranged. Measured on the live state file: four stacks across two
+groups, and not one `stacked` entry in any saved order.
+
+Two things generalise. A dropped key is invisible at the moment it happens — the loss only shows one
+relaunch later, which is why it survived so long. And the arrangement is unrecoverable once lost:
+`stackApp` removes the members' own `w<id>` keys when it inserts the stack's, so there is nothing left
+on disk to reconstruct the position from. Adding an enum case is safe (an old file simply has none of
+them); it is *changing* one that wipes a file.
+
+**A new item kind needs a place in the arrangement before it needs a tile.** `applyManualOrder` has
+nowhere to put a key it cannot rank but the end of the row, so `stackApp` inserting a fresh
+`s<bundle>` key without touching `order` dropped the stack to the far right the instant it was created — the same trap the
 hidden-pins note describes. `stackApp` puts the key in the leftmost member's slot and removes the
 rest; `unstackApp` expands it back. Measured with the fix reverted: `["w800", "w803", "scom.browser"]`
 where `["w800", "scom.browser", "w803"]` was wanted.
+
+**An unplaced item is drawn beside its own application's windows, not at the end of the row.**
+Nothing mints an order key for a newly opened window — `captureNewWindows` files it into membership
+and stops, and a key is only minted by a drag, by `stackApp` or by the restore pass. So a second
+Finder window used to be sent to the far right of the capsule while the first sat wherever the
+arrangement had it, and an app's windows scattered across the row as more opened. `applyManualOrder`
+now lays out the ranked items first and then inserts each unranked one after the last item of the same
+app already placed, appending only when the app has nothing there.
+
+What made this last is that it is invisible on a fresh install. With an *empty* order the default sort
+already groups by application (`AXSweeper` sorts by app name, then title), so the strip reads
+perfectly — and the order is non-empty in every session after the first, because the restore pass
+rebuilds it from `savedOrder`. The app-grouped default stops applying at exactly the moment there is
+an arrangement to honour.
+
+Three properties are deliberate. The search runs over the *growing* list, so several new windows of
+one app queue behind the first in the order they were given rather than all landing on one anchor.
+Nothing is persisted — the item still has no key, so there is no new `OrderRef` case, nothing to prune
+when the window closes, and none of the file-wiping risk that changing the arrangement's shape carries.
+And an arrangement the user *made* wins outright: two windows of one app dragged to opposite ends are
+both ranked, so neither moves. `AllGroupsModel.ordered` carries the same rule, because a folded group
+is only ever seen in that panel and would otherwise keep the scatter the strip no longer has.
+
+The affinity speaks only for items the user has not placed, which has a consequence worth knowing:
+drag one unplaced window somewhere and its still-unplaced siblings follow it there, since the anchor
+is the last window of that app on the row. Asserted in the self-test.
 
 **The stack's hover list is a separate panel, not a mode of `HoverController`.** That controller
 escalates title → thumbnail → peek for a *single* `current` window and every timer in it assumes one;
@@ -580,15 +678,31 @@ Work does not appear again in Main. Main is where things go when nothing else ha
 applies to launchers as much as to windows.
 
 **Every dot on the strip comes through `StatusDot`, and the colour is a
-vocabulary.** Tinted with the capsule's colour means an open window drawn in that capsule, solid for
-the one you are in; neutral grey means the application is running but has no window here, which is
-exactly what a launcher is; no dot means not running at all. It reads the way the Dock does on
-purpose — a bar of icons along the bottom of the screen with a dot under the live ones is a shape
-every Mac user can already read, and it gives the row a baseline for the icons to sit on.
+vocabulary.** Tinted with the capsule's colour means the application is running; neutral means the
+window you are in, whose tile is already filled with that colour; no dot means not running at all.
+It reads the way the Dock does on purpose — a bar of icons along the bottom of the screen with a dot
+under the live ones is a shape every Mac user can already read, and it gives the row a baseline for
+the icons to sit on.
+
+**The dot answers "is this alive", the plate answers "is there a window here".** The dot once carried
+both — neutral grey for a launcher, tinted for a real window — and it was reported as a glitch the
+first time an app was closed with the red button and reappeared as a launcher in its own capsule with
+a grey dot beside tinted neighbours. The Dock draws one indicator for "running" and says nothing about
+how many windows are behind it, so a two-tone dot is a distinction the shape does not lead anyone to
+expect, and it made an app you had merely closed look like a lesser kind of thing. The distinction is
+not lost, it moved: a launcher whose app is not running draws unlit, which is the same information on
+the signal that was already carrying it.
 
 Shared rather than drawn per tile because they stopped lining up the last time: one sat 2.5pt higher
 than its neighbours and half a point smaller. The tinted dot is drawn at 0.85 alpha, not the 0.6 tried
 first — it sits on a bed of its own hue (the capsule is tinted at 0.13–0.22) and vanished into it.
+
+**Contrast is against the plate directly underneath, and that plate changes colour.** A focused tile is
+filled with its capsule's own colour, so the dot on it — the same colour — disappeared: the blue window
+you were *in* had no visible dot while the green one beside it did. The focused dot is neutral for that
+reason, which reads on any group colour in either appearance; every other dot takes the capsule's
+colour, because those plates are near-neutral. The rule is "contrast with what is behind *this* dot",
+not "one colour per meaning".
 
 **The groups button shows the total window count.** Each capsule can only say how many *it* holds, and
 a busy session runs to dozens across six of them; the total is the one number nothing else on the
@@ -610,8 +724,30 @@ nowhere to be drawn.
 **Layout never scrolls and never overflows.** `DeckLayout` charges every separator to chrome, sizes
 titled entries from the leftover width, collapses to icon-only when titles would be useless (Chrome's
 behaviour), then tightens spacing 6→2 and shrinks icons. Fits to ~72 windows on a 1280pt display.
-Tile is 44pt tall with a 30pt icon inside a 56pt strip; width stays 40pt so bigger icons cost no
-density.
+Tile is 44pt tall and 40pt wide inside a 56pt strip, with a 36pt icon in it.
+
+**A bigger icon comes out of the tile's slack, not out of the tile.** At 30pt in the same tile the
+strip read as a row of thumbnails beside the Dock, and the obvious fix — a taller strip and wider
+tiles — is the wrong one twice over: the strip's height is screen the user does not get back, and the
+tile's width is how many windows fit before the layout starts tightening. What the Dock actually does
+is make the tile almost entirely icon. Two margins were paying for that and neither was buying
+anything:
+
+* **Horizontally**, `preferredIconSize` now sits 4pt under `iconOnlyWidth`, so what is left is the
+  separation between neighbouring icons and nothing else.
+* **Vertically**, the icon was centred in the whole tile — which split the slack into a top margin and
+  a bottom one, and then drew the status dot *on top of* the bottom half of the icon. `dotClearance`
+  reserves the dot's band explicitly and the icon takes everything above it, so the slack is one
+  contiguous space instead of two useless ones. Every tile kind pads by it, or its dot lands on its
+  icon while the rest of the row's does not.
+
+Capacity is unchanged by any of this: the ceiling is `hardMinimumWidth`, not the preferred tile.
+`minimumTitledWidth` does track `preferredIconSize` — a titled tile spends its width on 7pt of padding
+a side, the icon, and the 6pt gap before the text, so raising the icon without raising that leaves no
+room for the title it exists to guarantee.
+
+The groups button follows the same rule: icon over count with no gap between them, each as large as
+the 44pt tile leaves room for, rather than a small glyph and a small number with space between.
 
 **Titles only appear when they disambiguate** — an app with one open window renders icon-only.
 
@@ -624,6 +760,19 @@ panel only appears after `switcherHoldDelay` (default 0.18s, adjustable in Setti
 tap-and-release switches with no UI at all; a second press before the delay shows the panel at once,
 because that means cycling rather than flipping. Selection starts at **index 1** — index 0 is the
 window you are already in.
+
+**The switcher panels take the pointer, and the pointer must not take the selection.** Both were
+`ignoresMouseEvents = true` on the argument that they are keyboard-driven — true, and beside the
+point: a list on screen invites a click, and macOS's own ⌘Tab lets you hover and click while the
+modifier is held. They accept it now, hover moving the selection and a click committing, with the
+panels non-activating so nothing loses focus.
+
+The guard that makes it usable: SwiftUI reports a hover the moment a view appears *under* the cursor,
+so whichever tile happened to open beneath the mouse would seize the selection from the keyboard
+before the first tap. Each panel records `NSEvent.mouseLocation` when it appears and ignores hovers
+until the pointer has actually moved more than 4pt. Releasing the modifier still commits, exactly as
+⌘Tab does, so the pointer is for picking *while holding* rather than a second way to leave the panel
+open.
 
 **The switcher has no motion whatsoever.** Reordering between opens is suppressed by assigning
 candidates inside `withTransaction(Transaction(animation: nil))` — per-view `.animation()` modifiers
@@ -660,6 +809,47 @@ window. What is left for `appCycleStaysInGroup` to decide is the single case whe
 only *one* window of the focused app: stay put and do nothing, or widen to every window that app has
 open anywhere on the strip. A folded capsule still scopes — it still owns its windows even though it
 is not drawn, and widening the cycle the moment a group is collapsed would be a surprise.
+
+**⌥Tab mirrors the strip rather than inventing a second grouping.** Its entries *are* the items the
+bar draws — a stacked app is one entry with its count, a cluster is one, a loose window is its own —
+which is what makes "two Chrome entries, one of five and one of one" fall out of what is already on
+screen instead of from a parallel set of rules. Stacking an app on the bar is therefore also how you
+collapse it in the switcher, and the two can never disagree about what an entry is, because
+`switchEntries()` is built from `sections(includingCollapsed: true)` and nothing else.
+
+Two rules are layered on top, and both are decisions:
+
+* **Collapsed capsules are still listed.** Mirroring means the same grouping, not the same
+  *visibility*. Folding a group hides its capsule; making its windows unreachable from the keyboard at
+  the same time would be a trap, not a simplification.
+* **A launcher is listed only while its application is running.** A running app with no windows is
+  exactly what ⌘Tab offers, so it belongs. One that is not running does not: releasing the key while
+  passing over it would *launch* something, which is not what a switcher is for.
+
+Ordering is most-recently-used regardless of `cycleOrder` — that setting is about the window switcher,
+and reading it here would stop a quick ⌥Tab flipping back to the last thing, which is the entire
+gesture. An entry ranks by its best window in the same `mruOrder` the strip uses, so the switcher
+cannot disagree with a stack tile about which window is most recent.
+
+**One state machine, two modes — and this is the opposite call from the retired group switcher.** That
+one justified duplicating the hold-and-tap machine because it differed in what it cycled, what it
+drew, where it appeared *and* what committing meant. ⌥Tab differs only in the last three: the press,
+hold, release, Escape and safety-timeout behaviour is identical, down to the live
+`NSEvent.modifierFlags` read that catches a tap too fast for the monitor. Duplicating it would have
+been 120 lines destined to drift. What moved is small and specific: `selection` and the candidate
+count now live on the controller rather than on the window panel's model, because there are two panels
+and the machine must advance without knowing which is up.
+
+**Committing is resolved by the store, not the switcher.** `commitTarget(for:)` returns an enum —
+focus one window, focus several, open an application, or do nothing — so the choice is testable
+without a run loop the harness never turns, and so a stack picks its window through the same recency
+its tile draws.
+
+**The ⌥Tab panel labels every entry with its capsule, not just the selected one.** The list is
+most-recently-used, so capsules interleave; two Chrome icons side by side are otherwise identical, and
+a caption that only describes the selection makes you step through the row to find out where each one
+lives. The chip carries the group's name in the group's colour, and it is the chip — not the icon —
+that sets the cell width, because it is the part carrying information the icon cannot.
 
 **A stack must be ordered from the members it is drawing, not re-derived from its bundle id.**
 `stackWindowsByRecency` took a bundle id and filtered `windows` — *every* window of that application,
@@ -791,7 +981,7 @@ an empty group showing nothing looks like a badge that failed to render.
 WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
 ```
 
-~235 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
+~272 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
 field type degrading rather than wiping the file, round-trips), ordering, restore matching, membership
 moves, capture of new windows, pruning, clustering, app stacks, switcher candidate ordering and scope,
 section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never

@@ -48,6 +48,13 @@ final class WindowEngine {
     /// Kept so actions can resolve a window ID back to its AX element without
     /// the caller having to hold onto WindowInfo values.
     private var lastKnownWindows: [WindowInfo] = []
+    /// Which applications the last sweep found a real window for.
+    ///
+    /// Nil until the first sweep lands, and the window server answers in the
+    /// meantime — otherwise every running application would look window-less for
+    /// the first half second and the strip would open with a row of launchers
+    /// that immediately vanished.
+    private var pidsWithWindows: Set<pid_t>?
     /// Every window ID seen on the previous tick, across all Spaces, so genuinely
     /// new windows can be told apart from ones merely coming into view.
     private var knownWindowIDs: Set<CGWindowID> = []
@@ -59,12 +66,24 @@ final class WindowEngine {
     /// refresh so it cannot grow for the life of the process.
     private var standardWindowIDs: Set<CGWindowID> = []
 
+    /// The Accessibility pass, which runs off the main thread. See `AXSweeper`
+    /// for why that is not optional.
+    private let sweeper = AXSweeper()
+    /// A sweep is never run concurrently with itself; a request arriving while
+    /// one is in flight collapses into a single re-run when it lands.
+    private var sweepInFlight = false
+    private var sweepPending = false
+
     /// Windows smaller than this are palettes, HUDs and inspectors, not documents.
     private let minimumWindowSide: CGFloat = 80
 
     // MARK: - Lifecycle
 
     func start() {
+        // Before anything asks Accessibility a question: one stuck application
+        // must not be able to park the main thread. See `AX.boundMessagingTimeouts`.
+        AX.boundMessagingTimeouts()
+
         let center = NSWorkspace.shared.notificationCenter
         for name: NSNotification.Name in [
             NSWorkspace.didLaunchApplicationNotification,
@@ -181,14 +200,18 @@ final class WindowEngine {
         let server = queryWindowServer()
         let hasNewWindows = hasSeededKnownIDs && !server.allIDs.subtracting(knownWindowIDs).isEmpty
 
-        let windows: [WindowInfo]
+        // The Accessibility pass is asynchronous: it is asked for here and
+        // publishes a second time when it lands. This refresh goes out *now*,
+        // with the descriptions already in hand — which is exactly what a
+        // non-full refresh has always done for a raise, so nothing downstream
+        // needed a new state to absorb it. Everything below this line is window
+        // server data, which costs no IPC into another process and cannot block.
         if full || hasNewWindows {
-            windows = enumerateWindows(onScreen: server.onScreenIDs)
-            lastKnownWindows = windows
+            requestSweep(onScreen: server.onScreenIDs, live: server.allIDs,
+                         ignoreBackoff: hasNewWindows)
             ticksSinceFullScan = 0
-        } else {
-            windows = lastKnownWindows
         }
+        let windows = lastKnownWindows
 
         // "Newly created" is judged against every window on every Space, not
         // against the filtered list. With current-Space filtering on, switching
@@ -228,7 +251,11 @@ final class WindowEngine {
             created: created,
             focusedWindowID: focused,
             isFullscreen: fullscreen,
-            windowOwnerPIDs: server.ownerPIDs
+            // Accessibility, not the window server: an application that closed
+            // its last window with the red button can keep layer-0 windows in
+            // `CGWindowList`, which made it look like it still had one and
+            // suppressed the launcher the Dock draws for it.
+            windowOwnerPIDs: pidsWithWindows ?? server.ownerPIDs
         ))
     }
 
@@ -383,120 +410,71 @@ final class WindowEngine {
         })
     }
 
+    /// Asks for a fresh description of every window.
+    ///
     /// - Parameter onScreen: the visible-window set from the caller's existing
     ///   window-server query, so this doesn't repeat it.
-    func enumerateWindows(onScreen: Set<CGWindowID>) -> [WindowInfo] {
-        guard Permissions.isTrusted else { return [] }
+    /// - Parameter live: every window id the server knows, on any Space. The
+    ///   sweeper filters retained descriptions against it.
+    private func requestSweep(onScreen: Set<CGWindowID>, live: Set<CGWindowID>,
+                              ignoreBackoff: Bool = false) {
+        guard Permissions.isTrusted else { return }
+        // Overlapping sweeps would race on the retention cache and double the
+        // Accessibility traffic to learn the same thing twice.
+        guard !sweepInFlight else { sweepPending = true; return }
+        sweepInFlight = true
 
-        let selfBundleID = Bundle.main.bundleIdentifier
-        var results: [WindowInfo] = []
-
-        for app in NSWorkspace.shared.runningApplications
-        where app.activationPolicy == .regular && !app.isTerminated {
-
-            guard app.bundleIdentifier != selfBundleID else { continue }
-            let appName = app.localizedName ?? "Unknown"
-            let axApp = AXUIElementCreateApplication(app.processIdentifier)
-
-            guard let windows: [AXUIElement] = AX.value(axApp, kAXWindowsAttribute) else { continue }
-
-            for element in windows {
-                guard let info = describe(
-                    element: element,
-                    app: app,
-                    appName: appName,
-                    onScreen: onScreen
-                ) else { continue }
-                results.append(info)
-            }
-        }
-
-        // Group by app so the strip reads like a Dock, stable across refreshes.
-        return results.sorted {
-            $0.appName == $1.appName
-                ? $0.displayTitle.localizedStandardCompare($1.displayTitle) == .orderedAscending
-                : $0.appName.localizedStandardCompare($1.appName) == .orderedAscending
+        sweeper.sweep(AXSweeper.Input(
+            apps: currentAppRefs(),
+            onScreen: onScreen,
+            live: live,
+            currentSpaceOnly: currentSpaceOnly,
+            minimumWindowSide: minimumWindowSide,
+            standardWindowIDs: standardWindowIDs,
+            ignoreBackoff: ignoreBackoff
+        )) { [weak self] output in
+            MainActor.assumeIsolated { self?.sweepFinished(output) }
         }
     }
 
-    private func describe(
-        element: AXUIElement,
-        app: NSRunningApplication,
-        appName: String,
-        onScreen: Set<CGWindowID>
-    ) -> WindowInfo? {
-        guard let id = AX.windowID(of: element) else { return nil }
-
-        let subrole: String? = AX.value(element, kAXSubroleAttribute)
-        let isMinimized = AX.bool(element, kAXMinimizedAttribute)
-        let title: String = AX.value(element, kAXTitleAttribute) ?? ""
-        let isStandard = subrole == kAXStandardWindowSubrole as String
-        let isHiddenApp = app.isHidden
-
-        // Standard windows only — that filter is what keeps sheets, popovers,
-        // palettes and inspectors out of the strip. But it cannot be the whole
-        // story, because **a window's subrole can change while it is minimised**:
-        // Activity Monitor's main window reports `AXDialog` once minimised, so a
-        // strict test dropped it from every group and minimising was
-        // indistinguishable from closing.
-        //
-        // Two escapes, both narrow. A window already seen as standard stays
-        // accepted for as long as it exists, since minimising cannot turn a real
-        // window into a dialog. And a *minimised* dialog carrying a title is
-        // treated as real — genuine dialogs are modal and cannot be minimised at
-        // all, which is what keeps this from readmitting sheets. The second rule
-        // matters on a cold start, where nothing has been seen yet.
-        // Measured: a window reports `AXDialog` whenever it is *put away* —
-        // minimised, or belonging to an application hidden with ⌘H. Not only
-        // minimised, which is what the first version of this assumed, so nine
-        // hidden apps' windows were still being dropped: Firefox, Excel, Word,
-        // Outlook, Notes, Terminal, TextEdit, Activity Monitor, Google Docs.
-        //
-        // Still narrow. A genuine dialog is modal and can be neither minimised
-        // nor hidden, so requiring one of those states plus a title is what keeps
-        // sheets and alerts out.
-        let wasStandard = standardWindowIDs.contains(id)
-        let isPutAway = isMinimized || isHiddenApp
-        let dialogButRealWindow = isPutAway && !title.isEmpty
-            && subrole == kAXDialogSubrole as String
-        guard isStandard || wasStandard || dialogButRealWindow else { return nil }
-        if isStandard { standardWindowIDs.insert(id) }
-
-        // Minimized windows leave the on-screen set but must still be listed —
-        // they're the ones a user most wants a click target for. So do the
-        // windows of an application hidden with ⌘H, and that exemption was
-        // missing: hiding an app made every one of its windows disappear from
-        // the strip as though it had quit. Measured on a machine with a single
-        // Space, twelve apps hidden this way — Excel, Word, Outlook, Terminal,
-        // Spotify and more — accounted for nearly every window the strip was
-        // not showing, and it looked for all the world like a Spaces problem.
-        //
-        // "Off screen" answers *where the window is drawn*, which is not the same
-        // question as *does this window exist on this Desktop*.
-        if currentSpaceOnly && !isMinimized && !isHiddenApp && !onScreen.contains(id) {
-            return nil
+    /// The running applications, snapshotted on the main thread.
+    ///
+    /// The sweep handles no AppKit object of its own — it gets plain values.
+    /// `NSRunningApplication` is documented thread-safe, but reading the four
+    /// properties here costs one array walk and removes the need to keep proving
+    /// that for every property `describe` might grow.
+    private func currentAppRefs() -> [AXSweeper.AppRef] {
+        let selfBundleID = Bundle.main.bundleIdentifier
+        return NSWorkspace.shared.runningApplications.compactMap { app in
+            guard app.activationPolicy == .regular, !app.isTerminated else { return nil }
+            guard app.bundleIdentifier != selfBundleID else { return nil }
+            return AXSweeper.AppRef(
+                pid: app.processIdentifier,
+                bundleID: app.bundleIdentifier,
+                name: app.localizedName ?? "Unknown",
+                isHidden: app.isHidden
+            )
         }
+    }
 
-        // Zero-size and tiny windows are offscreen scratch windows some apps keep.
-        let size = AX.size(element)
-        if !isMinimized, let size,
-           size.width < minimumWindowSide || size.height < minimumWindowSide {
-            return nil
-        }
-        let frame = size.flatMap { size in
-            AX.position(element).map { CGRect(origin: $0, size: size) }
-        }
+    private func sweepFinished(_ output: AXSweeper.Output) {
+        sweepInFlight = false
+        standardWindowIDs.formUnion(output.newlyStandard)
+        lastKnownWindows = output.windows
+        pidsWithWindows = output.pidsWithWindows
 
-        return WindowInfo(
-            id: id,
-            pid: app.processIdentifier,
-            bundleID: app.bundleIdentifier,
-            appName: appName,
-            title: title,
-            isMinimized: isMinimized,
-            frame: frame,
-            element: element
-        )
+        // Publish unconditionally rather than only when the list changed. A
+        // sweep that moved nothing but a frame still has to reach the store:
+        // `WindowInfo.==` ignores `frame` on purpose, and `noteWindowRefs` runs
+        // on every snapshot precisely because a window that was merely moved
+        // must still update its recorded frame — that is what tab matching is
+        // keyed on. The redraw guard lives downstream, in `onChange`.
+        if sweepPending {
+            sweepPending = false
+            refresh(full: true)
+        } else {
+            refresh(full: false)
+        }
     }
 
     // MARK: - Actions

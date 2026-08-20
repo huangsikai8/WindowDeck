@@ -62,6 +62,7 @@ enum SelfTest {
 
         persistence()
         ordering()
+        newWindowSitsBesideItsApp()
         matching()
         membership()
         sections()
@@ -72,6 +73,8 @@ enum SelfTest {
         clusterSurvivesClosing()
         edgeCases()
         runningState()
+        closedWindowLauncher()
+        twoInstancesOfOneApp()
         menuIconCaching()
         capturing()
         appearedExcludesCreated()
@@ -92,9 +95,11 @@ enum SelfTest {
         appStacks()
         appStackOpensItsOwnWindows()
         appStackOrdering()
+        appStackOrderSurvivesRelaunch()
         appStackInteractions()
         appStackPersistence()
         appStackHover()
+        switchEntries()
         tracing()
 
         print("\n=== self-test: \(passes) passed, \(failures.count) failed ===")
@@ -225,6 +230,99 @@ enum SelfTest {
         check("short leftward move",
               store.order(in: group.id) == ["w1", "w3", "w2", "w4"],
               "\(store.order(in: group.id))")
+    }
+
+    /// Where a newly opened window is drawn inside a capsule that already has an
+    /// arrangement.
+    ///
+    /// Nothing mints an order key for a new window — `captureNewWindows` files it
+    /// into membership and stops — so it is unranked, and an unranked item used
+    /// to be sent to the end of the row. That put a second Finder window at the
+    /// far right of the capsule while the first sat wherever the arrangement had
+    /// it, and the app's windows scattered as more opened.
+    ///
+    /// It hides on a fresh install, which is why it lasted: with an *empty* order
+    /// the default sort already groups by application, and the arrangement is
+    /// only non-empty once the restore pass has rebuilt it from `savedOrder` —
+    /// every session after the first.
+    private static func newWindowSitsBesideItsApp() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        let finder = WindowInfo.testInstance(id: 900, bundleID: "com.finder",
+                                             title: "Documents", pid: 1)
+        let browser = WindowInfo.testInstance(id: 901, bundleID: "com.browser",
+                                              title: "Docs", pid: 2)
+        let mail = WindowInfo.testInstance(id: 902, bundleID: "com.mail",
+                                           title: "Inbox", pid: 3)
+        var live = [finder, browser, mail]
+        store.windows = live
+        store.noteWindowRefs(live)
+        for id in [900, 901, 902] { store.add(CGWindowID(id), to: group) }
+        store.setOrder(["w900", "w901", "w902"], in: group)
+        check("the arrangement is what it was set to",
+              items(store, in: group).map(\.orderKey) == ["w900", "w901", "w902"],
+              "\(items(store, in: group).map(\.orderKey))")
+
+        // A second Finder window opens. Nothing gives it a key.
+        let second = WindowInfo.testInstance(id: 903, bundleID: "com.finder",
+                                             title: "Downloads", pid: 1)
+        live.append(second)
+        store.windows = live
+        store.noteWindowRefs(live)
+        store.add(903, to: group)
+        check("a new window is drawn beside its own app's",
+              items(store, in: group).map(\.orderKey) == ["w900", "w903", "w901", "w902"],
+              "\(items(store, in: group).map(\.orderKey))")
+        check("and nothing is written to the arrangement",
+              store.order(in: group) == ["w900", "w901", "w902"],
+              "\(store.order(in: group))")
+
+        // A third queues behind the second rather than landing on the same
+        // anchor, which is why the search runs over the growing list.
+        let third = WindowInfo.testInstance(id: 904, bundleID: "com.finder",
+                                            title: "Desktop", pid: 1)
+        live.append(third)
+        store.windows = live
+        store.noteWindowRefs(live)
+        store.add(904, to: group)
+        check("several new windows of one app keep their order",
+              items(store, in: group).map(\.orderKey) == ["w900", "w903", "w904", "w901", "w902"],
+              "\(items(store, in: group).map(\.orderKey))")
+
+        // An app with nothing in this capsule has no anchor, and still trails.
+        let stranger = WindowInfo.testInstance(id: 905, bundleID: "com.notes",
+                                               title: "Notes", pid: 4)
+        live.append(stranger)
+        store.windows = live
+        store.noteWindowRefs(live)
+        store.add(905, to: group)
+        check("a window with no sibling here still trails",
+              items(store, in: group).map(\.orderKey).last == "w905",
+              "\(items(store, in: group).map(\.orderKey))")
+
+        // Dropping it somewhere lands it there: a drag names a position, and the
+        // affinity only ever speaks for an item the user has not placed. Note
+        // what happens to `w904`, which is still unplaced — it follows its
+        // sibling to the new position rather than staying beside `w900`,
+        // because the anchor is the *last* window of the app on the row. That
+        // is the rule working, not a leak: an unarranged window has no position
+        // of its own to keep.
+        store.moveItem("w903", before: "w902", in: group)
+        check("dragging a newly placed window puts it where it was dropped",
+              items(store, in: group).map(\.orderKey)
+                  == ["w900", "w901", "w903", "w904", "w902", "w905"],
+              "\(items(store, in: group).map(\.orderKey))")
+
+        // And an arrangement the user made outranks the affinity outright: two
+        // windows of one app deliberately dragged apart stay apart, since both
+        // are ranked and neither is the affinity's business.
+        store.windows = [finder, browser, mail, second]
+        store.setOrder(["w900", "w901", "w902", "w903"], in: group)
+        check("windows deliberately arranged apart are not pulled together",
+              items(store, in: group).map(\.orderKey) == ["w900", "w901", "w902", "w903"],
+              "\(items(store, in: group).map(\.orderKey))")
     }
 
     // MARK: - Restore matching
@@ -730,6 +828,112 @@ enum SelfTest {
         }
     }
 
+    /// An application still running after its last window was closed with the red
+    /// button must keep an icon on the strip, exactly as the Dock keeps one.
+    ///
+    /// The bug this exists for was two questions disagreeing about "does this app
+    /// have a window". `CGWindowList` keeps listing layer-0 windows for an app
+    /// whose windows are all closed — measured on ChatGPT: five of them, one
+    /// 1280x668, while Accessibility correctly reported none. So `withWindows`
+    /// was built from the window server and said "it has windows", which
+    /// suppressed the launcher, while the AX pass said "it has none" and drew no
+    /// tile. The application vanished from the strip while the real Dock still
+    /// showed it.
+    ///
+    /// **What this covers and what it does not.** The fix was to source
+    /// `windowOwnerPIDs` from the sweep rather than from `server.ownerPIDs`, and
+    /// that wiring lives in `WindowEngine` behind a live window server and a real
+    /// Accessibility client — neither of which the harness has, so a revert of
+    /// that one line would *not* fail here. What this pins down is the store rule
+    /// the wiring feeds: a pid set claiming windows suppresses the launcher, and
+    /// one that does not claim them draws it. Both directions are asserted,
+    /// because the "draws it" half passes on its own with the rule deleted.
+    private static func closedWindowLauncher() {
+        let store = freshStore()
+        let main = store.main.id
+
+        // A real running application, since `runningLaunchers` filters on
+        // `activationPolicy == .regular` and cannot be fooled with a fixture.
+        guard let finder = NSWorkspace.shared.runningApplications
+            .first(where: { $0.bundleIdentifier == "com.apple.finder" }) else {
+            check("Finder is running to stand in for a closed-window app", false)
+            return
+        }
+
+        // Preconditions, asserted rather than assumed: a pin test once passed
+        // while pinning nothing at all.
+        store.windows = []
+        store.sampleRunningApps(windowOwnerPIDs: [], force: true)
+        check("the stand-in app is Dock-worthy",
+              store.runningApps.dockApps.contains("com.apple.finder"))
+        check("and the strip is describing none of its windows",
+              !store.windows.contains { $0.bundleID == "com.apple.finder" })
+        check("running-app launchers are enabled", store.showRunningApps)
+
+        // The Accessibility answer: no window belongs to it, so the Dock would
+        // still draw it and so must the strip.
+        let drawn = items(store, in: main).contains { $0.launcherBundleID == "com.apple.finder" }
+        check("an app whose last window was closed keeps its icon", drawn,
+              "\(items(store, in: main).map(\.id))")
+
+        // The window-server answer, which is what the bug was: phantom windows
+        // for a pid make the app look like it still has one, and the launcher
+        // disappears. Asserted so the check above cannot pass by accident.
+        store.sampleRunningApps(windowOwnerPIDs: [finder.processIdentifier], force: true)
+        let suppressed = items(store, in: main).contains { $0.launcherBundleID == "com.apple.finder" }
+        check("a pid set claiming windows is what removes it", !suppressed)
+
+        // And back, so the difference is the pid set and nothing else.
+        store.sampleRunningApps(windowOwnerPIDs: [], force: true)
+        check("dropping that claim brings the icon back",
+              items(store, in: main).contains { $0.launcherBundleID == "com.apple.finder" })
+    }
+
+    /// Two copies of one application installed side by side are two Dock icons,
+    /// and must be two launchers.
+    ///
+    /// Measured on this machine: `/Applications/Slack.app` running as pid 98963
+    /// and `/Applications/Slack 2.app` as pid 824, both reporting the bundle id
+    /// `com.tinyspeck.slackmacgap`. Every launcher was keyed by bundle id — a
+    /// `Set<String>` for the candidates and `"r\(bundleID)"` for the item — so the
+    /// two collapsed into one, and the copy whose window had been closed was
+    /// suppressed by the *other* copy's window. Reported as "2 in the Dock, 1 in
+    /// WindowDeck", and isolated by closing one with the red button.
+    ///
+    /// Identity is the half worth guarding here: two views sharing one id is what
+    /// once rendered the switcher rotated with two tiles highlighted at once, so
+    /// a bundle id can never be a launcher's identity again.
+    ///
+    /// The candidate list itself is built from `NSWorkspace` and cannot be
+    /// fabricated, so this asserts the rule rather than the sampling.
+    private static func twoInstancesOfOneApp() {
+        let app = PinnedApp(bundleID: "com.example.twin", name: "Twin")
+        let first = AppStore.AppInstance(
+            pid: 4242, bundleID: "com.example.twin", name: "Twin",
+            url: URL(fileURLWithPath: "/Applications/Twin.app"))
+        let second = AppStore.AppInstance(
+            pid: 4243, bundleID: "com.example.twin", name: "Twin 2",
+            url: URL(fileURLWithPath: "/Applications/Twin 2.app"))
+
+        let a = DeckItem.running(app, placeholderFor: nil, instance: first)
+        let b = DeckItem.running(app, placeholderFor: nil, instance: second)
+        check("two processes of one application are two identities", a.id != b.id,
+              "\(a.id) vs \(b.id)")
+        check("and each identity names its own process",
+              a.id.contains("4242") && b.id.contains("4243"), "\(a.id) / \(b.id)")
+
+        // The same process twice is the same thing, or the row would grow a
+        // duplicate every time the sample was rebuilt.
+        let again = DeckItem.running(app, placeholderFor: nil, instance: first)
+        check("the same process is one identity", a.id == again.id)
+
+        // Each launcher opens the copy it stands for. Resolving through the
+        // bundle id instead hands both to whichever copy LaunchServices prefers.
+        check("each instance carries its own copy on disk",
+              first.url != second.url
+              && second.url?.path.contains("Twin 2") == true)
+    }
+
     // MARK: - Cycling
 
     /// Builds a group holding four windows across two apps, focused on the
@@ -1153,9 +1357,10 @@ enum SelfTest {
 
     /// Stacking must not shove the icon to the end of the row.
     ///
-    /// `applyManualOrder` sends any key it does not rank to the end, so a
-    /// brand-new `s<bundle>` key would drop the stack to the far right the
-    /// instant it was made — the same trap that would have condemned hidden pins
+    /// `applyManualOrder` can only place an unranked key beside its own app's
+    /// windows, and stacking removes exactly those keys — so a brand-new
+    /// `s<bundle>` key has no anchor and would drop the stack to the far right
+    /// the instant it was made — the same trap that would have condemned hidden pins
     /// to the end of the row on the first drag.
     private static func appStackOrdering() {
         let store = freshStore()
@@ -1202,6 +1407,56 @@ enum SelfTest {
         check("a non-member window of the same app stays out of the arrangement",
               !store.order(in: group).contains("w804"),
               "\(store.order(in: group))")
+    }
+
+    /// A stack's *position* must survive a relaunch.
+    ///
+    /// It did not, and nothing failed: `orderSnapshot` describes each key as an
+    /// `OrderRef`, had no case for `s<bundle>`, and `compactMap` dropped it.
+    /// `applyManualOrder` then has nowhere to put it but the end, a stack
+    /// having no loose window of its own app to sit beside, so every stacked app
+    /// came back on the far right of its capsule however it had been arranged — reported as "the relative positions of the apps in
+    /// the groups changed after relaunch". Measured on the live file: four
+    /// stacks across two groups, and not one `stacked` entry in any saved order.
+    private static func appStackOrderSurvivesRelaunch() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        let first = WindowInfo.testInstance(id: 810, bundleID: "com.editor", title: "Editor")
+        let a = WindowInfo.testInstance(id: 811, bundleID: "com.browser", title: "A")
+        let b = WindowInfo.testInstance(id: 812, bundleID: "com.browser", title: "B")
+        let last = WindowInfo.testInstance(id: 813, bundleID: "com.mail", title: "Mail")
+        store.windows = [first, a, b, last]
+        store.noteWindowRefs([first, a, b, last])
+        for id in [810, 811, 812, 813] { store.add(CGWindowID(id), to: group) }
+        store.setOrder(["w810", "w811", "w812", "w813"], in: group)
+        store.stackApp(bundleID: "com.browser", in: group)
+        // The stack sits in the *middle* on purpose: at either end a bug that
+        // sends it to the back is invisible half the time.
+        check("the stack starts in the middle",
+              store.order(in: group) == ["w810", "scom.browser", "w813"],
+              "\(store.order(in: group))")
+
+        store.saveNow()
+        let saved = StateStore.load().groups.first { $0.id == group.uuidString }
+        check("the stack's slot reaches disk",
+              saved?.order.contains { if case .stacked("com.browser") = $0 { true } else { false } } == true,
+              "\(saved?.order.count ?? -1) entries")
+
+        // A fresh store over that file, with the same windows present: the
+        // arrangement has to come back the way it was left.
+        let relaunched = AppStore()
+        relaunched.windows = [first, a, b, last]
+        relaunched.noteWindowRefs([first, a, b, last])
+        _ = relaunched.restorePass(against: [first, a, b, last])
+        check("the stack rule survives", relaunched.isStacked("com.browser", in: group))
+        check("and it comes back in its own slot, not at the end",
+              relaunched.order(in: group) == ["w810", "scom.browser", "w813"],
+              "\(relaunched.order(in: group))")
+        check("so the capsule draws it in the middle",
+              items(relaunched, in: group).map(\.orderKey) == ["w810", "scom.browser", "w813"],
+              "\(items(relaunched, in: group).map(\.orderKey))")
     }
 
     /// A stacked app's launcher must still stand aside, and its windows must stop
@@ -1390,6 +1645,142 @@ enum SelfTest {
         check("the peek stage honours the preview mode", !panel.hasPendingPeekForTesting)
         panel.mode = .thumbnailAndPeek
         panel.hide()
+    }
+
+    // MARK: - ⌥Tab
+
+    /// What ⌥Tab offers, and in what order.
+    ///
+    /// The list mirrors the strip, so most of its correctness is inherited from
+    /// `sections`. What is *not* inherited, and is asserted here, is the handful
+    /// of decisions layered on top: collapsed capsules still count, launchers
+    /// only count while their app runs, and the ordering has to put the thing
+    /// you are in first or a quick flip lands somewhere arbitrary.
+    private static func switchEntries() {
+        let store = freshStore()
+        guard store.groups.count >= 3 else { return check("two groups exist", false) }
+        let main = store.main.id
+        let work = store.groups[1].id
+        let folded = store.groups[2].id
+
+        // Five Chrome windows in Work, one in Main, one elsewhere — the reported
+        // shape: "there should be 2 chrome, 1 is 5, 1 is 1".
+        var all: [WindowInfo] = []
+        for i in 1...5 {
+            all.append(.testInstance(id: CGWindowID(400 + i), bundleID: "com.browser",
+                                     title: "Work \(i)", pid: 3))
+        }
+        all.append(.testInstance(id: 410, bundleID: "com.browser", title: "Loose", pid: 3))
+        all.append(.testInstance(id: 420, bundleID: "com.editor", title: "Folded away", pid: 4))
+        store.windows = all
+        store.noteWindowRefs(all)
+        for i in 1...5 { store.add(CGWindowID(400 + i), to: work) }
+        store.add(420, to: folded)
+        store.stackApp(bundleID: "com.browser", in: work)
+        store.setCollapsed(true, for: folded)
+
+        let entries = store.switchEntries()
+        let chrome = entries.filter { $0.title == "com.browser" }
+        check("one entry per capsule the app has windows in", chrome.count == 2,
+              "\(chrome.map { "\($0.groupName)×\($0.count)" })")
+        check("the stacked capsule is one entry of five",
+              chrome.contains { $0.groupID == work && $0.count == 5 },
+              "\(chrome.map { "\($0.groupName)×\($0.count)" })")
+        check("and the loose window is an entry of one",
+              chrome.contains { $0.groupID == main && $0.count == 1 })
+
+        // A folded capsule is still reachable from the keyboard. Mirroring the
+        // strip means the same grouping, not the same visibility — the opposite
+        // would hide windows the moment a group was collapsed.
+        check("a collapsed capsule is still listed",
+              entries.contains { $0.groupID == folded && $0.windows.contains { $0.id == 420 } },
+              "\(entries.map(\.groupName))")
+
+        // Item for item the same list the strip builds, so the two cannot drift.
+        let drawn = store.sections(includingCollapsed: true)
+            .flatMap { section in section.items.map { "\(section.id)/\($0.id)" } }
+        check("every entry is an item the strip draws",
+              Set(entries.map(\.id)).isSubset(of: Set(drawn)),
+              "\(entries.map(\.id))")
+
+        // Ordering: the thing you are in leads, so a quick ⌥Tab flips back to
+        // it. This pins the observable property; the explicit hoist in
+        // `orderedByRecency` guards a race the harness cannot produce, since
+        // every focus change here updates `mruOrder` before anything reads it.
+        store.focusedWindowID = 410
+        check("the entry you are in leads",
+              store.switchEntries().first?.windows.first?.id == 410,
+              "\(store.switchEntries().first?.title ?? "-")")
+        // Focus inside a stack promotes the *stack*, not one of its windows.
+        store.focusedWindowID = 403
+        let promoted = store.switchEntries().first
+        check("focusing a window inside a stack promotes the stack",
+              promoted?.count == 5 && promoted?.groupID == work,
+              "\(promoted?.title ?? "-")×\(promoted?.count ?? -1)")
+        check("and the list is otherwise unchanged in length",
+              store.switchEntries().count == entries.count)
+
+        // Launchers: in while the app runs, out when it does not. Both
+        // directions, or the check passes with the filter deleted.
+        let launchers = freshStore()
+        let group = launchers.groups[1].id
+        launchers.sampleRunningApps(windowOwnerPIDs: [], force: true)
+        check("the fixture's app really is running",
+              launchers.runningApps.all.contains("com.apple.finder"))
+        launchers.pinApp(bundleID: "com.apple.finder", in: group)
+        launchers.pin(PinnedApp(bundleID: "com.nonexistent.app", name: "Ghost"), in: group)
+        let titles = Set(launchers.switchEntries().map(\.title))
+        check("a running app with no windows is offered",
+              launchers.switchEntries().contains { $0.item.launcherBundleID == "com.apple.finder" },
+              "\(titles)")
+        check("an application that is not running is not",
+              !launchers.switchEntries().contains { $0.item.launcherBundleID == "com.nonexistent.app" },
+              "\(titles)")
+
+        commitTargets()
+    }
+
+    /// What committing each kind of entry does. Asserted through
+    /// `commitTarget(for:)` rather than by driving the switcher, which needs a
+    /// run loop `SelfTest.run` never turns.
+    private static func commitTargets() {
+        let store = freshStore()
+        let group = store.groups[1].id
+
+        let a = WindowInfo.testInstance(id: 500, bundleID: "com.browser", title: "A", pid: 3)
+        let b = WindowInfo.testInstance(id: 501, bundleID: "com.browser", title: "B", pid: 3)
+        let c = WindowInfo.testInstance(id: 502, bundleID: "com.editor", title: "C", pid: 4)
+        let d = WindowInfo.testInstance(id: 503, bundleID: "com.editor", title: "D", pid: 4)
+        store.windows = [a, b, c, d]
+        store.noteWindowRefs([a, b, c, d])
+        for id: CGWindowID in [500, 501, 502, 503] { store.add(id, to: group) }
+        store.stackApp(bundleID: "com.browser", in: group)
+        store.combine(503, into: 502, in: group)
+        // 501 is the most recently used of the stack's two windows.
+        store.focusedWindowID = 500
+        store.focusedWindowID = 501
+
+        let entries = store.switchEntries()
+        guard let stack = entries.first(where: { $0.item.isStack }),
+              let cluster = entries.first(where: { $0.item.isCluster })
+        else { return check("the fixture builds a stack and a cluster", false) }
+
+        check("a stack raises its most recent window",
+              store.commitTarget(for: stack) == .focus(501),
+              "\(store.commitTarget(for: stack))")
+        check("a cluster raises all of its windows",
+              store.commitTarget(for: cluster) == .focusAll([502, 503]),
+              "\(store.commitTarget(for: cluster))")
+
+        // A plain window entry, from a capsule with nothing folded into it.
+        let plain = freshStore()
+        let lone = WindowInfo.testInstance(id: 510, bundleID: "com.solo", title: "Solo", pid: 5)
+        plain.windows = [lone]
+        plain.noteWindowRefs([lone])
+        guard let entry = plain.switchEntries().first else {
+            return check("a lone window makes an entry", false)
+        }
+        check("a window entry raises itself", plain.commitTarget(for: entry) == .focus(510))
     }
 
     // MARK: - Diagnostics log
@@ -1765,6 +2156,16 @@ enum SelfTest {
         check("unarranged windows follow, in order",
               partial.map(\.id) == [3, 1, 2],
               "\(partial.map(\.id))")
+
+        // The strip's rule, in the panel that shows the same list: a window the
+        // arrangement does not mention is placed beside its own application's
+        // rather than behind everything. A folded group is only ever seen here,
+        // so without this it keeps the scatter the strip no longer has.
+        let sibling = WindowInfo.testInstance(id: 4, bundleID: "com.a", title: "A2")
+        let beside = AllGroupsModel.ordered([a, b, c, sibling], by: ["w1", "w2", "w3"])
+        check("an unarranged window joins its own app in the panel",
+              beside.map(\.id) == [1, 4, 2, 3],
+              "\(beside.map(\.id))")
     }
 
     // MARK: - Pruning

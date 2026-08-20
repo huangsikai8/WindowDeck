@@ -13,11 +13,14 @@ enum ShortcutAction: Hashable, Codable {
     case cycleGroupWindows
     /// Cycle windows of the frontmost app, within that capsule.
     case cycleAppWindows
+    /// Cycle the things the strip draws, across every capsule — ⌥Tab.
+    case cycleEntries
 
     var storageKey: String {
         switch self {
         case .cycleGroupWindows: "cycleGroupWindows"
         case .cycleAppWindows: "cycleAppWindows"
+        case .cycleEntries: "cycleEntries"
         }
     }
 
@@ -25,6 +28,7 @@ enum ShortcutAction: Hashable, Codable {
         switch storageKey {
         case "cycleGroupWindows": .cycleGroupWindows
         case "cycleAppWindows": .cycleAppWindows
+        case "cycleEntries": .cycleEntries
         default: nil
         }
     }
@@ -33,6 +37,7 @@ enum ShortcutAction: Hashable, Codable {
         switch self {
         case .cycleGroupWindows: "Cycle windows in group"
         case .cycleAppWindows: "Cycle windows of current app"
+        case .cycleEntries: "Switch between everything on the strip"
         }
     }
 }
@@ -134,10 +139,15 @@ struct Shortcut: Codable, Equatable, Hashable {
         carbonModifiers: UInt32(controlKey)
     )
 
-    /// ⌘↑ / ⌘↓ — moving between the groups themselves.
+    /// ⌥Tab — moving between the things on the strip.
     ///
-    /// These are not free keys: Finder uses ⌘↑ for the enclosing folder and ⌘↓
-    /// to open, and text editors use them for start and end of document. A
-    /// global hotkey takes them from every app, which is why they are worth
-    /// rebinding if that bites — Settings will accept anything.
+    /// Deliberately the neighbour of ⌘Tab, because it is the same gesture aimed
+    /// at a different list: macOS switches applications, this switches what the
+    /// bar draws. ⌘Tab and ⌘⇧Tab belong to the system and cannot be taken; ⌥Tab
+    /// is free, and Settings will accept anything else if it collides with
+    /// something you use.
+    static let defaultEntryCycle = Shortcut(
+        keyCode: UInt16(kVK_Tab),
+        carbonModifiers: UInt32(optionKey)
+    )
 }

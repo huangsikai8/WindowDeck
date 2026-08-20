@@ -44,11 +44,21 @@ enum DeckLayout {
     static let preferredTitledWidth: CGFloat = 150
     /// Below this a title is just an ellipsis, so entries collapse to icon-only
     /// instead — the same thing Chrome does when tabs get too narrow.
-    static let minimumTitledWidth: CGFloat = 58
+    ///
+    /// It tracks `preferredIconSize`: a titled tile spends its width on padding
+    /// (7 a side), the icon and the 6pt gap before the text, so raising the icon
+    /// without raising this leaves literally no room for the title it is
+    /// supposed to be guaranteeing.
+    static let minimumTitledWidth: CGFloat = 64
     /// Absolute floor. Only reached on a genuinely extreme strip; the fair share
     /// governs long before this does.
     static let hardMinimumWidth: CGFloat = 14
-    static let preferredIconSize: CGFloat = 30
+    /// Close to `iconOnlyWidth` on purpose. The Dock's tile is very nearly all
+    /// icon, and matching that is the only way to draw a Dock-sized icon without
+    /// a Dock-sized tile — the margins are the thing that was making the strip
+    /// look like a row of thumbnails. What is left, 2pt a side at full width, is
+    /// the separation between neighbouring icons and nothing more.
+    static let preferredIconSize: CGFloat = 36
     static let minimumIconSize: CGFloat = 10
     static let preferredSpacing: CGFloat = 6
 

@@ -27,10 +27,25 @@ import SwiftUI
 final class SwitcherController {
 
     var onCommit: ((WindowInfo) -> Void)?
+    /// Raise several windows together — what committing a cluster does, and what
+    /// clicking one on the strip already does.
+    var onCommitAll: (([WindowInfo]) -> Void)?
+
+    /// What is being cycled. The state machine below is identical for both; only
+    /// the list, the panel and what committing means differ, which is why this
+    /// is a mode rather than a second controller.
+    private enum Mode { case windows, entries }
+    private var mode: Mode = .windows
 
     private let store: AppStore
     private let panel = SwitcherPanel()
+    private let entryPanel = AppSwitcherPanel()
     private let previews = PreviewService.shared
+
+    /// Held here rather than on a panel's model, because there are two panels
+    /// and the machine has to be able to advance without knowing which is up.
+    private var selection = 0
+    private var candidateCount = 0
 
     private var isActive = false
     private var triggerFlags: NSEvent.ModifierFlags = []
@@ -41,9 +56,32 @@ final class SwitcherController {
     private var pendingCaptures: Set<CGWindowID> = []
     private var safetyWork: DispatchWorkItem?
     private var presentWork: DispatchWorkItem?
+    /// Auto-repeat while the shortcut's key is held down. Carbon delivers one
+    /// press however long a hotkey is held, so holding Tab to run down a long
+    /// list did nothing without this.
+    private var repeatWork: DispatchWorkItem?
+    private var repeatTimer: Timer?
+    private var repeatDelta = 1
+    private var repeatTicks = 0
+
+    /// Matched to the system's own key repeat closely enough to feel native:
+    /// a pause long enough that a deliberate single tap never repeats, then a
+    /// steady stream fast enough to cross a forty-entry list.
+    private static let repeatDelay: TimeInterval = 0.42
+    private static let repeatInterval: TimeInterval = 0.085
 
     init(store: AppStore) {
         self.store = store
+
+        // The pointer can drive either panel: hovering moves the selection,
+        // clicking commits it. Both are guarded inside the panel against the
+        // pointer merely *being* somewhere when the panel appears under it —
+        // otherwise wherever the mouse happened to rest would steal the
+        // selection from the keyboard the instant the switcher opened.
+        panel.onHoverIndex = { [weak self] index in self?.select(index) }
+        panel.onClickIndex = { [weak self] index in self?.select(index); self?.commit() }
+        entryPanel.onHoverIndex = { [weak self] index in self?.select(index) }
+        entryPanel.onClickIndex = { [weak self] index in self?.select(index); self?.commit() }
         // Only tiles that actually appear on screen ask for a capture, so a
         // large group costs a screenful rather than all of it.
         panel.model.onNeedsImage = { [weak self] window in
@@ -54,6 +92,7 @@ final class SwitcherController {
     /// Called on every press of a cycle shortcut.
     func handle(action: ShortcutAction, reversed: Bool, shortcut: Shortcut) {
         let appOnly = (action == .cycleAppWindows)
+        let wanted: Mode = (action == .cycleEntries) ? .entries : .windows
 
         if isActive {
             // A press while a session is open normally means cycling. But if the
@@ -64,13 +103,25 @@ final class SwitcherController {
             // what "it ignored my press" looked like.
             if !NSEvent.modifierFlags.intersection(triggerFlags).contains(triggerFlags) {
                 commit()
+            } else if wanted != mode {
+                // A different switcher entirely while one is open. Finish the
+                // session that is up rather than advancing it with the wrong
+                // list, then start the new one below.
+                commit()
             } else {
                 advance(reversed ? -1 : 1)
                 // A second press means cycling, not flipping — so stop waiting
                 // and show the panel straight away.
                 presentNow()
+                startRepeat(reversed ? -1 : 1)
                 return
             }
+        }
+
+        mode = wanted
+        if wanted == .entries {
+            beginEntries(reversed: reversed, shortcut: shortcut)
+            return
         }
 
         let candidates = store.cycleCandidates(appOnly: appOnly)
@@ -90,7 +141,9 @@ final class SwitcherController {
             // Where the first tap lands depends on how the list was ordered —
             // index 0 is the current window only in most-recently-used order —
             // so the store decides, next to the ordering that makes it true.
-            panel.model.selection = store.cycleStartIndex(candidates, reversed: reversed)
+            selection = store.cycleStartIndex(candidates, reversed: reversed)
+            candidateCount = candidates.count
+            panel.model.selection = selection
 
             // Everything already captured is shown immediately. Opening performs
             // no capturing of its own — windows you have used were snapshotted
@@ -124,13 +177,55 @@ final class SwitcherController {
         let work = DispatchWorkItem { [weak self] in self?.presentNow() }
         presentWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + store.switcherHoldDelay, execute: work)
+        startRepeat(reversed ? -1 : 1)
+    }
+
+    /// ⌥Tab. The same shape as the window path above — build the list, choose
+    /// the starting index, arm the machinery — with two differences: the list is
+    /// what the strip draws rather than windows, and it always starts at the
+    /// neighbour of where you stand, because this switcher is always
+    /// most-recently-used. `cycleOrder` is about the *window* switcher, and
+    /// reading it here would make a quick ⌥Tab stop flipping to the last thing.
+    private func beginEntries(reversed: Bool, shortcut: Shortcut) {
+        let entries = store.switchEntries()
+        guard !entries.isEmpty else { return }
+
+        withTransaction(Transaction(animation: nil)) {
+            entryPanel.model.entries = entries
+            selection = entries.count > 1 ? (reversed ? entries.count - 1 : 1) : 0
+            candidateCount = entries.count
+            entryPanel.model.selection = selection
+        }
+
+        isActive = true
+        triggerFlags = shortcut.triggerFlags
+        startMonitoring()
+        armSafetyTimeout()
+
+        if !NSEvent.modifierFlags.intersection(triggerFlags).contains(triggerFlags) {
+            commit()
+            return
+        }
+
+        presentWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.presentNow() }
+        presentWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + store.switcherHoldDelay, execute: work)
+        startRepeat(reversed ? -1 : 1)
     }
 
     private func presentNow() {
         presentWork?.cancel()
         presentWork = nil
-        guard isActive, !panel.isVisible else { return }
-        panel.show()
+        guard isActive else { return }
+        switch mode {
+        case .windows:
+            guard !panel.isVisible else { return }
+            panel.show()
+        case .entries:
+            guard !entryPanel.isVisible else { return }
+            entryPanel.show()
+        }
     }
 
     /// Commit is driven by seeing the modifier released. If that event is ever
@@ -138,16 +233,94 @@ final class SwitcherController {
     /// the panel would sit on screen forever. This bounds that.
     private func armSafetyTimeout() {
         safetyWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.commit() }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isActive else { return }
+            // Still holding the modifier? Then this is a deliberate long look at
+            // the list, not a release event that went missing — re-arm instead
+            // of closing the switcher out from under it. The net still catches
+            // the case it exists for, within ten seconds of the key actually
+            // being let go.
+            if NSEvent.modifierFlags.intersection(self.triggerFlags).contains(self.triggerFlags) {
+                self.armSafetyTimeout()
+            } else {
+                self.commit()
+            }
+        }
         safetyWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
     }
 
 
+    /// The pointer picked an entry. Same path as a keyboard advance, so the two
+    /// cannot disagree about what "selected" means.
+    private func select(_ index: Int) {
+        guard isActive, index >= 0, index < candidateCount else { return }
+        selection = index
+        switch mode {
+        case .windows: panel.model.selection = index
+        case .entries: entryPanel.model.selection = index
+        }
+    }
+
+    /// Called when the shortcut's key goes up, while its modifier may still be
+    /// held. Ends the repeat and nothing else — the session ends on the
+    /// *modifier* being released, which is a different event.
+    func handleRelease(action: ShortcutAction) {
+        stopRepeat()
+    }
+
+    private func startRepeat(_ delta: Int) {
+        stopRepeat()
+        repeatDelta = delta
+        repeatTicks = 0
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isActive else { return }
+            // Showing before the stream starts: a held key is unambiguously
+            // cycling rather than flipping, so the panel has earned its place.
+            self.presentNow()
+            self.repeatTimer = Timer.scheduledTimer(
+                withTimeInterval: Self.repeatInterval, repeats: true
+            ) { [weak self] timer in
+                MainActor.assumeIsolated {
+                    guard let self, self.isActive else { timer.invalidate(); return }
+                    // Stop if the modifier has gone, even without a release
+                    // event: a repeat that outlives the session would walk the
+                    // list on its own, which is worse than a missed repeat.
+                    guard NSEvent.modifierFlags.intersection(self.triggerFlags)
+                        .contains(self.triggerFlags) else {
+                        self.stopRepeat()
+                        return
+                    }
+                    // Bounded. The stream stops when the key is let go, which
+                    // arrives as a Carbon release event — and if that event ever
+                    // fails to arrive, an unbounded repeat would walk the list
+                    // on its own for as long as the modifier stayed down. Two
+                    // hundred steps is far more than any list and about
+                    // seventeen seconds.
+                    self.repeatTicks += 1
+                    guard self.repeatTicks < 200 else { self.stopRepeat(); return }
+                    self.advance(self.repeatDelta)
+                }
+            }
+        }
+        repeatWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.repeatDelay, execute: work)
+    }
+
+    private func stopRepeat() {
+        repeatWork?.cancel()
+        repeatWork = nil
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+    }
+
     private func advance(_ delta: Int) {
-        let count = panel.model.candidates.count
-        guard count > 0 else { return }
-        panel.model.selection = ((panel.model.selection + delta) % count + count) % count
+        guard candidateCount > 0 else { return }
+        selection = ((selection + delta) % candidateCount + candidateCount) % candidateCount
+        switch mode {
+        case .windows: panel.model.selection = selection
+        case .entries: entryPanel.model.selection = selection
+        }
     }
 
     /// Captures a single window that scrolled into view without an image —
@@ -174,13 +347,37 @@ final class SwitcherController {
 
     private func commit() {
         guard isActive else { return }
-        let selected = panel.model.candidates[safe: panel.model.selection]
-        finish()
-        // Skip the raise when the selection is the window already in front —
-        // with a lone candidate a quick tap would otherwise re-focus what you
-        // are looking at, costing a refresh for no visible effect.
-        guard let selected, selected.id != store.focusedWindowID else { return }
-        onCommit?(selected)
+        switch mode {
+        case .windows:
+            let selected = panel.model.candidates[safe: selection]
+            finish()
+            // Skip the raise when the selection is the window already in front —
+            // with a lone candidate a quick tap would otherwise re-focus what you
+            // are looking at, costing a refresh for no visible effect.
+            guard let selected, selected.id != store.focusedWindowID else { return }
+            onCommit?(selected)
+
+        case .entries:
+            let selected = entryPanel.model.entries[safe: selection]
+            let target = selected.map { store.commitTarget(for: $0) } ?? .none
+            finish()
+            switch target {
+            case .focus(let id):
+                guard id != store.focusedWindowID,
+                      let window = store.windows.first(where: { $0.id == id }) else { return }
+                onCommit?(window)
+            case .focusAll(let ids):
+                let windows = ids.compactMap { id in store.windows.first { $0.id == id } }
+                guard !windows.isEmpty else { return }
+                onCommitAll?(windows)
+            case .open(let bundleID):
+                guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+                      let app = PinnedApp(url: url) else { return }
+                AppLauncher.open(app)
+            case .none:
+                return
+            }
+        }
     }
 
     private func cancel() {
@@ -191,6 +388,9 @@ final class SwitcherController {
     private func finish() {
         isActive = false
         triggerFlags = []
+        stopRepeat()
+        selection = 0
+        candidateCount = 0
         safetyWork?.cancel()
         safetyWork = nil
         presentWork?.cancel()
@@ -198,6 +398,7 @@ final class SwitcherController {
         pendingCaptures.removeAll()
         stopMonitoring()
         panel.hide()
+        entryPanel.hide()
     }
 
     // MARK: - Monitors

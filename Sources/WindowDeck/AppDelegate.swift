@@ -133,6 +133,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switcher = SwitcherController(store: store)
         switcher.onCommit = { [weak self] window in self?.engine.focus(window) }
+        // Committing a cluster raises its whole set, exactly as clicking one on
+        // the strip does — the same engine call, so the two cannot diverge.
+        switcher.onCommitAll = { [weak self] windows in self?.engine.focusAll(windows) }
 
         store.onWindowLostFocus = { [weak self] window in
             self?.scheduleBlurCapture(window)
@@ -143,6 +146,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKeys.onTrigger = { [weak self] action, reversed in
             guard let self, let shortcut = self.store.shortcuts[action] else { return }
             self.switcher.handle(action: action, reversed: reversed, shortcut: shortcut)
+        }
+        // The key going up, which is not the modifier going up: it ends the
+        // auto-repeat and leaves the session open.
+        hotKeys.onRelease = { [weak self] action in
+            self?.switcher.handleRelease(action: action)
         }
         store.onShortcutsChanged = { [weak self] in self?.syncHotKeys() }
         syncHotKeys()

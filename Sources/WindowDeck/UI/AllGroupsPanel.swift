@@ -148,20 +148,47 @@ final class AllGroupsModel {
     /// The group's own arrangement, so the panel and the strip agree and a drag
     /// here means the same thing as a drag there.
     ///
-    /// The index tiebreak guards a group with no manual arrangement yet, where
-    /// every window ranks equally. `sorted(by:)` is not documented as stable —
-    /// though the current implementation is, measured at both 3 and 40 elements,
-    /// so removing the tiebreak does not currently change anything observable.
-    /// It stays because the contract, not the implementation, is what a future
-    /// toolchain will honour.
+    /// An unranked window is placed beside its own application's, exactly as
+    /// `AppStore.applyManualOrder` does it — a newly opened window has no key in
+    /// the arrangement, and trailing every one of them behind the ranked tiles
+    /// is what scattered an app's windows down the list. A folded group shows
+    /// the same list, so it needs the same rule or it shows the same mess.
+    ///
+    /// Windows only, so the app is the window's own. The strip's version has to
+    /// answer for clusters, stacks and launchers as well, which is why the
+    /// identity lives on `DeckItem` there rather than being shared with this.
     static func ordered(_ windows: [WindowInfo], by order: [String]) -> [WindowInfo] {
         let rank = Dictionary(order.enumerated().map { ($1, $0) },
                               uniquingKeysWith: { first, _ in first })
-        return windows.enumerated().sorted { a, b in
-            let ra = rank["w\(a.element.id)"] ?? Int.max
-            let rb = rank["w\(b.element.id)"] ?? Int.max
-            return ra == rb ? a.offset < b.offset : ra < rb
-        }.map(\.element)
+
+        // The index tiebreak guards a group with no manual arrangement yet,
+        // where every window ranks equally. `sorted(by:)` is not documented as
+        // stable — though the current implementation is, measured at both 3 and
+        // 40 elements, so removing the tiebreak does not currently change
+        // anything observable. It stays because the contract, not the
+        // implementation, is what a future toolchain will honour.
+        var placed = windows.enumerated()
+            .filter { rank["w\($0.element.id)"] != nil }
+            .sorted { a, b in
+                let ra = rank["w\(a.element.id)"] ?? Int.max
+                let rb = rank["w\(b.element.id)"] ?? Int.max
+                return ra == rb ? a.offset < b.offset : ra < rb
+            }
+            .map(\.element)
+
+        func sameApp(_ a: WindowInfo, _ b: WindowInfo) -> Bool {
+            if let one = a.bundleID, let other = b.bundleID { return one == other }
+            return a.appName == b.appName
+        }
+
+        for window in windows where rank["w\(window.id)"] == nil {
+            if let anchor = placed.lastIndex(where: { sameApp($0, window) }) {
+                placed.insert(window, at: anchor + 1)
+            } else {
+                placed.append(window)
+            }
+        }
+        return placed
     }
 
     /// Enough for the busiest row, so nothing is clipped.

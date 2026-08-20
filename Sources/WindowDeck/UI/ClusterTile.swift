@@ -27,16 +27,25 @@ struct ClusterTile: View {
     /// More than three overlapped icons is mush; the badge carries the real count.
     private var shown: [WindowInfo] { Array(members.prefix(3)) }
 
+    /// Filled with the capsule's colour when one of its windows is frontmost,
+    /// exactly as a window tile is — a cluster is a window you are in, and it
+    /// was the one tile kind that said nothing about it.
+    private var plateFill: AnyShapeStyle {
+        if isFocused { return AnyShapeStyle(tint.opacity(isHovering ? 0.62 : 0.50)) }
+        return AnyShapeStyle(.primary.opacity(isHovering ? 0.16 : 0.09))
+    }
+
     var body: some View {
         Button(action: onActivate) {
             ZStack(alignment: .bottomTrailing) {
                 stack
                 countBadge
             }
+            .padding(.bottom, DeckMetrics.dotClearance)
             .frame(width: width, height: DeckMetrics.tileHeight)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(.primary.opacity(isHovering ? 0.16 : 0.09))
+                    .fill(plateFill)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
