@@ -77,6 +77,7 @@ enum SelfTest {
         launcherRegressions()
         activeCapsuleTracking()
         activationRaiseIsNotIntent()
+        iconInkStaysInsideItsTile()
         newWindowPlacement()
         twoInstancesOfOneApp()
         menuIconCaching()
@@ -889,6 +890,47 @@ enum SelfTest {
         grow.forcePruneForTesting()
         check("Main's arrangement drops the key once the app is gone",
               !grow.order(in: mainID).contains("w930"), "\(grow.order(in: mainID))")
+    }
+
+    /// The icon frame may overhang its tile, but the *ink* may never leave it.
+    ///
+    /// `preferredIconSize` is deliberately larger than `iconOnlyWidth` because a
+    /// macOS icon carries ~15% transparent margin — measured across all 133 apps
+    /// on this machine, alpha bounds are a median 0.844 of the frame and at most
+    /// 0.898. The clamp multiplies by `inkHeadroom` so that ink stays inside the
+    /// slot at every width. Nothing asserted this before, and it is precisely the
+    /// invariant that decays into an overflow bug once someone raises the icon
+    /// again without re-deriving the headroom.
+    private static func iconInkStaysInsideItsTile() {
+        // The widest ink ratio measured on this machine. Anything drawn wider
+        // than this fraction of its frame would spill.
+        let worstInk: CGFloat = 0.898
+        check("the headroom is the inverse of the worst ink ratio",
+              abs(DeckLayout.inkHeadroom * worstInk - 1) < 0.01,
+              "\(DeckLayout.inkHeadroom * worstInk)")
+
+        // A row crowded enough to drive tiles well below their preferred width,
+        // so the clamp — not the preferred size — is what governs.
+        for count in [1, 8, 30, 72] {
+            let items = (0..<count).map { i in
+                DeckItem.window(WindowInfo.testInstance(id: CGWindowID(2000 + i),
+                                                        bundleID: "com.app\(i)",
+                                                        title: "Window \(i)",
+                                                        pid: pid_t(i)))
+            }
+            let layout = DeckLayout.compute(items: items, pinnedCount: 0,
+                                            titlesEnabled: true, maxWidth: 1240)
+            let spill = layout.slots.filter { $0.iconSize * worstInk > $0.width + 0.01 }
+            check("icon ink stays inside its tile with \(count) windows",
+                  spill.isEmpty,
+                  spill.first.map { "icon \($0.iconSize) ink \($0.iconSize * worstInk) > width \($0.width)" } ?? "")
+
+            // The row itself must still fit. Growing the drawn image must not have
+            // moved a single slot: this is the guarantee that distinguishes it
+            // from the documented "clamping a width up causes overflow" trap.
+            check("the row still fits with \(count) windows",
+                  layout.totalWidth <= 1240 + 0.01, "\(layout.totalWidth)")
+        }
     }
 
     /// A window raised by its own application activating is not a statement about

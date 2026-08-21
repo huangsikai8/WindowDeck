@@ -43,6 +43,13 @@ struct ClusterTile: View {
             }
             .padding(.bottom, DeckMetrics.dotClearance)
             .frame(width: width, height: DeckMetrics.tileHeight)
+            // The icon frame now overhangs the tile by design — a macOS icon
+            // carries ~15% transparent margin, so the frame is drawn larger than
+            // the box to make the *artwork* fill it. Hit-testing must stay the
+            // tile's own rectangle: SwiftUI would otherwise take the label's
+            // bounds, and a tile that answers hover 1.5pt beyond its edge is the
+            // count-badge trap again — a stack that opened for its neighbour.
+            .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(plateFill)

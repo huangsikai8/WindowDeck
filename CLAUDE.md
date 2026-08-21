@@ -971,6 +971,45 @@ titled entries from the leftover width, collapses to icon-only when titles would
 behaviour), then tightens spacing 6→2 and shrinks icons. Fits to ~72 windows on a 1280pt display.
 Tile is 44pt tall and 40pt wide inside a 56pt strip, with a 36pt icon in it.
 
+**A macOS icon is ~15% transparent margin, and the layout has to know that.** Measured across all
+133 applications on this machine by rasterising each icon and taking its alpha bounding box: the
+artwork is a median **0.844** of the drawn frame, at most **0.898** (Adobe Digital Editions; Safari
+0.891), at least 0.812 (Karabiner). IconServices composites everything into the same grid, so even
+Electron apps land on the median.
+
+The round of work described immediately below set `preferredIconSize` 4pt under `iconOnlyWidth` so
+that "what is left is the separation between neighbouring icons and nothing more". The reasoning was
+right and the number was wrong, because it treated the icon frame as fully inked. The real gap between
+two neighbours' *artwork* was 2 (tile margin) + ~3 (icon margin) + 6 (spacing) + ~3 + 2 = **~16.6pt**,
+against the Dock's ~9.9pt — wider in absolute points while drawing icons a third the size. That, not
+bar height, is what made the strip read as small icons floating in space.
+
+`iconSize` therefore bounds the **ink** rather than the frame: `min(preferredIconSize, width *
+inkHeadroom)`, where `inkHeadroom` is 1.11, the inverse of the worst measured ratio. At the extreme,
+ink = 0.898 × 1.11 × width = 0.997 × width, which holds at every width down to `hardMinimumWidth`.
+Icon 36 → 43 takes the visible artwork from 30.4pt to 36.3pt, **+42% in area**, inside the unchanged
+56pt bar.
+
+Three things this must keep, and the first is the one that will look wrong to a future reader:
+
+* **No width is clamped up.** This sits one word away from "clamping a width *up* causes overflow" and
+  is not that trap: every slot keeps exactly the width `compute` gave it and the row total is
+  unchanged. What grows is the image drawn inside a slot, over margins that are transparent.
+  `iconInkStaysInsideItsTile` asserts both halves — ink inside every slot, and the row still fitting —
+  at 1, 8, 30 and 72 windows.
+* **`.contentShape(Rectangle())` on every tile.** The frame now overhangs by ~1.5pt a side, and
+  SwiftUI takes a button's hit region from its label's bounds — the same mechanism as the count-badge
+  trap, where an offset view made a stack answer hover over its neighbour. Hover drives the preview
+  escalation, so this is not cosmetic.
+* **Never crop icons to their alpha bounds** to remove the margin. A 0.812 icon and a 0.898 icon would
+  then draw at the same apparent size but different frames, making the row visually uneven — the
+  opposite of the goal. Draw the standard canvas larger instead.
+
+`minimumTitledWidth` rose 64 → 71, by exactly the icon's growth, so the text allowance at the
+collapse threshold is unchanged. `clusterIconCap` was pinned to 32 — the value it previously derived
+from `preferredIconSize` — because a cluster stacks several icons in one tile and should not have
+been enlarged along with everything else.
+
 **A bigger icon comes out of the tile's slack, not out of the tile.** At 30pt in the same tile the
 strip read as a row of thumbnails beside the Dock, and the obvious fix — a taller strip and wider
 tiles — is the wrong one twice over: the strip's height is screen the user does not get back, and the

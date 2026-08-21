@@ -48,17 +48,41 @@ enum DeckLayout {
     /// It tracks `preferredIconSize`: a titled tile spends its width on padding
     /// (7 a side), the icon and the 6pt gap before the text, so raising the icon
     /// without raising this leaves literally no room for the title it is
-    /// supposed to be guaranteeing.
-    static let minimumTitledWidth: CGFloat = 64
+    /// supposed to be guaranteeing. Raised with the icon, by exactly the icon's
+    /// growth, so the text allowance at the collapse threshold is unchanged.
+    static let minimumTitledWidth: CGFloat = 71
     /// Absolute floor. Only reached on a genuinely extreme strip; the fair share
     /// governs long before this does.
     static let hardMinimumWidth: CGFloat = 14
-    /// Close to `iconOnlyWidth` on purpose. The Dock's tile is very nearly all
-    /// icon, and matching that is the only way to draw a Dock-sized icon without
-    /// a Dock-sized tile — the margins are the thing that was making the strip
-    /// look like a row of thumbnails. What is left, 2pt a side at full width, is
-    /// the separation between neighbouring icons and nothing more.
-    static let preferredIconSize: CGFloat = 36
+    /// Deliberately *larger* than `iconOnlyWidth`, and that is not a mistake.
+    ///
+    /// A macOS application icon is drawn into a canvas that is mostly artwork but
+    /// not entirely: measured across all 133 apps on this machine, the alpha
+    /// bounding box is a median **0.844** of the frame and never more than
+    /// **0.898** (Adobe Digital Editions; Safari 0.891). So roughly 15% of every
+    /// icon frame is guaranteed-transparent margin the icon brings with it.
+    ///
+    /// The previous round of this work set the icon 4pt under the tile so that
+    /// "what is left is the separation between neighbouring icons and nothing
+    /// more". That reasoning is right and the number was wrong, because it
+    /// treated the frame as fully inked. The real gap between two neighbours'
+    /// *artwork* was 2 (tile margin) + ~3 (icon margin) + 6 (spacing) + ~3 + 2 =
+    /// ~16.6pt — wider in absolute points than the Dock's ~9.9pt, while drawing
+    /// icons a third the size. That is what made the row read as small icons
+    /// floating in space, and no amount of bar height would have explained it.
+    ///
+    /// The frame therefore overhangs its tile and only the *ink* is bounded — see
+    /// `iconSize`. Nothing clips, so the overhang costs nothing; it is transparent
+    /// either way.
+    static let preferredIconSize: CGFloat = 43
+    /// The widest measured ink ratio, inverted. Multiplying a tile's width by this
+    /// gives the largest icon *frame* whose artwork is still guaranteed to fit
+    /// inside that width, for any application on the machine.
+    static let inkHeadroom: CGFloat = 1.11
+    /// Clusters stack several icons in one tile, so they stay at the size they
+    /// were before the icon grew — pinned to a number rather than derived from
+    /// `preferredIconSize`, which would have silently enlarged them too.
+    static let clusterIconCap: CGFloat = 32
     static let minimumIconSize: CGFloat = 10
     static let preferredSpacing: CGFloat = 6
 
@@ -227,9 +251,19 @@ enum DeckLayout {
     ) -> CGFloat {
         guard !showsTitle else { return preferredIconSize }
         if isCluster {
-            return max(minimumIconSize, min(preferredIconSize - 4, width * 0.42))
+            return max(minimumIconSize, min(clusterIconCap, width * 0.42))
         }
-        return max(minimumIconSize, min(preferredIconSize, width - 4))
+        // Bounds the ink, not the frame. `width * inkHeadroom` is the largest
+        // frame whose artwork still fits the tile: at the worst measured ratio,
+        // ink = 0.898 * 1.11 * width = 0.997 * width, which holds at every width
+        // down to `hardMinimumWidth`.
+        //
+        // This is *not* the "clamping a width up causes overflow" trap, and the
+        // distinction matters: no width is being clamped at all. Every slot keeps
+        // exactly the width `compute` gave it, and the row's total is unchanged.
+        // What grows is the image drawn inside a slot, over margins that are
+        // transparent.
+        return max(minimumIconSize, min(preferredIconSize, width * inkHeadroom))
     }
 
     /// Everything that isn't an item: padding, selector, dividers, pins.
