@@ -28,13 +28,15 @@ struct EntryTile: View {
     /// Reports hover state plus the tile's frame, which the preview panel
     /// anchors to.
     let onHover: (Bool, CGRect) -> Void
-    /// Toggles a pin for this window's application. Nil means All.
-    var onPin: ((UUID?) -> Void)?
+    /// Toggles a pin for this window's application in one capsule.
+    var onPin: ((UUID) -> Void)?
     /// Whether it is currently pinned there, for the tick.
-    var isPinnedIn: ((UUID?) -> Bool)?
-    /// Groups offered in the pin submenu: the ones this window belongs to, plus
-    /// whichever group is on screen. In All the first is the only useful list —
-    /// there is no "current group" to pin to there.
+    var isPinnedIn: ((UUID) -> Bool)?
+    /// Capsules offered in the pin submenu. Every one of them is a real capsule:
+    /// the menu used to lead with an "All" entry left over from the built-in
+    /// group of that name, which has not existed since the strip became one row
+    /// of capsules — it quietly pinned to Main, so the row it drew was a second,
+    /// differently-named way to do what the Main row below it already did.
     var pinTargets: [DeckGroup] = []
     /// What this window can be merged with, and the action that does it.
     var groupWithTargets: [AppStore.GroupWithTarget] = []
@@ -48,6 +50,10 @@ struct EntryTile: View {
 
     @State private var isHovering = false
     @State private var frame: CGRect = .zero
+
+    /// Sizes come from the strip that is drawing this tile, so every tile in the
+    /// row is built from the same scale the layout pass measured with.
+    @Environment(\.deckMetrics) private var metrics
 
     var body: some View {
         Button(action: onActivate) {
@@ -66,20 +72,20 @@ struct EntryTile: View {
 
                 if showsTitle {
                     Text(window.displayTitle)
-                        .font(.system(size: 11.5))
+                        .font(.system(size: metrics.titleFontSize))
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .foregroundStyle(window.isMinimized ? .secondary : .primary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .padding(.horizontal, showsTitle ? 7 : 0)
+            .padding(.horizontal, showsTitle ? metrics.titlePadding : 0)
             // Keeps the dot's band clear so the icon owns everything above it.
             // Without this the icon is centred in the full tile and the dot is
             // drawn on top of its bottom edge, which is what capped the icon at
             // a size the tile had plenty of room for.
-            .padding(.bottom, DeckMetrics.dotClearance)
-            .frame(width: width, height: DeckMetrics.tileHeight,
+            .padding(.bottom, metrics.dotClearance)
+            .frame(width: width, height: metrics.tileHeight,
                    alignment: showsTitle ? .leading : .center)
             // The icon frame now overhangs the tile by design — a macOS icon
             // carries ~15% transparent margin, so the frame is drawn larger than
@@ -89,11 +95,11 @@ struct EntryTile: View {
             // count-badge trap again — a stack that opened for its neighbour.
             .contentShape(Rectangle())
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: metrics.tileCornerRadius, style: .continuous)
                     .fill(tileFill)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: metrics.tileCornerRadius, style: .continuous)
                     .strokeBorder(isFocused ? tint.opacity(0.8) : .clear, lineWidth: 1)
             )
             // The Dock's running dot. Every tile in the row is an open window,
@@ -122,8 +128,8 @@ struct EntryTile: View {
     /// stable menu whose state you can see at a glance, matching how group
     /// membership is already presented.
     @ViewBuilder
-    private func pinItem(_ name: String, groupID: UUID?,
-                         onPin: @escaping (UUID?) -> Void) -> some View {
+    private func pinItem(_ name: String, groupID: UUID,
+                         onPin: @escaping (UUID) -> Void) -> some View {
         Button {
             onPin(groupID)
         } label: {
@@ -215,8 +221,6 @@ struct EntryTile: View {
         // right-clicking the app you want a launcher for.
         if let onPin {
             Menu("Pin \(window.appName) to") {
-                pinItem("All", groupID: nil, onPin: onPin)
-                if !pinTargets.isEmpty { Divider() }
                 ForEach(pinTargets) { group in
                     pinItem(group.name, groupID: group.id, onPin: onPin)
                 }

@@ -55,7 +55,8 @@ final class DeckController {
         // fights setContentSize. DeckLayout is the single authority on width.
         self.hosting.sizingOptions = []
 
-        self.panel = DeckPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: DeckMetrics.height))
+        self.panel = DeckPanel(contentRect: NSRect(x: 0, y: 0, width: 400,
+                                                   height: DeckMetrics(scale: store.deckScale).height))
         self.panel.contentView = hosting
 
         NotificationCenter.default.addObserver(
@@ -207,8 +208,17 @@ final class DeckController {
     /// a zoomed window's bottom lands flush on top of the strip rather than
     /// leaving a visible band of desktop above it.
     var reservedBandHeight: CGFloat {
-        DeckMetrics.height + DeckMetrics.edgeInset
+        let metrics = self.metrics
+        return metrics.height + metrics.edgeInset
     }
+
+    /// The strip's sizes at the user's chosen scale.
+    ///
+    /// Built on demand from the store rather than cached, so it cannot fall out
+    /// of step with the copy `DeckView` draws with — the panel measuring one
+    /// scale while its contents render another is exactly how the last icons get
+    /// clipped.
+    private var metrics: DeckMetrics { DeckMetrics(scale: store.deckScale) }
 
     var isVisible: Bool { panel.isVisible }
 
@@ -235,6 +245,7 @@ final class DeckController {
         // Measured on the flattened section list, exactly as `DeckView` does:
         // the whole row is sized in one pass, capsule padding included, or the
         // panel and its contents disagree about how wide the strip is.
+        let metrics = self.metrics
         let sections = store.sections
         let width: CGFloat = store.isTrusted
             ? DeckLayout.compute(
@@ -246,7 +257,8 @@ final class DeckController {
                 collapsedCount: store.collapsedGroups.count,
                 collapsedWindows: store.collapsedGroups.reduce(0) { $0 + $1.count },
                 sectionCount: sections.count,
-                dividerCount: sections.filter(\.dividerBefore).count
+                dividerCount: sections.filter(\.dividerBefore).count,
+                metrics: metrics
               ).totalWidth
             : 420
 
@@ -254,7 +266,7 @@ final class DeckController {
         // one event that no longer exists; `layout()` otherwise runs on every
         // window open and close, and animating a 1240pt panel re-lays out every
         // tile in the hosting view on each frame.
-        panel.setContentSize(NSSize(width: width, height: DeckMetrics.height))
+        panel.setContentSize(NSSize(width: width, height: metrics.height))
         reposition()
     }
 
@@ -268,6 +280,9 @@ final class DeckController {
             _ = store.collapsedGroups.count
             _ = store.isTrusted
             _ = store.showTitles
+            // The size setting changes every width and the strip's own height,
+            // so the panel has to be resized as well as redrawn.
+            _ = store.deckScale
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -285,7 +300,7 @@ final class DeckController {
         let size = panel.frame.size
         panel.setFrameOrigin(NSPoint(
             x: screenFrame.midX - size.width / 2,
-            y: screenFrame.minY + DeckMetrics.edgeInset
+            y: screenFrame.minY + metrics.edgeInset
         ))
     }
 

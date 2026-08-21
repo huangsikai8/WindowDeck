@@ -34,11 +34,15 @@ struct StatusDot: View {
     /// The window this stands for is frontmost.
     var isFocused: Bool = false
 
+    /// Sizes come from the strip that is drawing this tile, so every tile in the
+    /// row is built from the same scale the layout pass measured with.
+    @Environment(\.deckMetrics) private var metrics
+
     var body: some View {
         Circle()
             .fill(fill)
-            .frame(width: DeckMetrics.statusDotSize, height: DeckMetrics.statusDotSize)
-            .padding(.bottom, DeckMetrics.statusDotInset)
+            .frame(width: metrics.statusDotSize, height: metrics.statusDotSize)
+            .padding(.bottom, metrics.statusDotInset)
     }
 
     private var fill: Color {

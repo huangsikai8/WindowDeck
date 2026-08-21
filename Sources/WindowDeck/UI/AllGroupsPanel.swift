@@ -374,7 +374,7 @@ private struct AllGroupsContent: View {
     }
 
     private func pinItem(_ name: String, bundleID: String,
-                         groupID: UUID?, store: AppStore) -> some View {
+                         groupID: UUID, store: AppStore) -> some View {
         Button {
             store.togglePin(bundleID, in: groupID)
             model.reload()

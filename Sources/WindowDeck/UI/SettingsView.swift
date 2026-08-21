@@ -364,6 +364,40 @@ struct AppearanceSettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                HStack {
+                    Text("Deck size")
+                        .frame(width: 130, alignment: .leading)
+                    // The endpoints are labelled with the thing that changes, so
+                    // the slider says what it does without being read.
+                    Image(systemName: "square.grid.3x3")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    Slider(value: $store.deckScale,
+                           in: DeckMetrics.minScale...DeckMetrics.maxScale,
+                           step: 0.05)
+                    Image(systemName: "square.grid.2x2")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                    Text("\(Int((store.deckScale * 100).rounded()))%")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 46, alignment: .trailing)
+                }
+                Text("""
+                One control, the way the Dock has one: the strip's height, its tiles, the icons in them \
+                and the text all grow together. A larger deck holds fewer windows before it starts \
+                closing up the gaps between them, so if the row is crowded it will tighten sooner.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Button("Use the default size") {
+                    store.deckScale = DeckMetrics.defaultScale
+                }
+                .disabled(store.deckScale == DeckMetrics.defaultScale)
+            }
+
             Toggle("Show titles for apps with several windows", isOn: $store.showTitles)
             Text("""
             An app with one open window always shows as an icon alone — the icon already identifies it. \

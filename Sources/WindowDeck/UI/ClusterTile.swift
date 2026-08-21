@@ -24,6 +24,10 @@ struct ClusterTile: View {
     @State private var isHovering = false
     @State private var frame: CGRect = .zero
 
+    /// Sizes come from the strip that is drawing this tile, so every tile in the
+    /// row is built from the same scale the layout pass measured with.
+    @Environment(\.deckMetrics) private var metrics
+
     /// More than three overlapped icons is mush; the badge carries the real count.
     private var shown: [WindowInfo] { Array(members.prefix(3)) }
 
@@ -41,21 +45,21 @@ struct ClusterTile: View {
                 stack
                 countBadge
             }
-            .padding(.bottom, DeckMetrics.dotClearance)
-            .frame(width: width, height: DeckMetrics.tileHeight)
-            // The icon frame now overhangs the tile by design — a macOS icon
-            // carries ~15% transparent margin, so the frame is drawn larger than
-            // the box to make the *artwork* fill it. Hit-testing must stay the
-            // tile's own rectangle: SwiftUI would otherwise take the label's
-            // bounds, and a tile that answers hover 1.5pt beyond its edge is the
-            // count-badge trap again — a stack that opened for its neighbour.
+            .padding(.bottom, metrics.dotClearance)
+            .frame(width: width, height: metrics.tileHeight)
+            // The icon frame overhangs the tile by design — a macOS icon carries
+            // ~15% transparent margin, so the frame is drawn larger than the box
+            // to make the *artwork* fill it. Hit-testing must stay the tile's own
+            // rectangle: SwiftUI would otherwise take the label's bounds, and a
+            // tile that answers hover beyond its edge is the count-badge trap
+            // again — a stack that opened for its neighbour.
             .contentShape(Rectangle())
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: metrics.tileCornerRadius, style: .continuous)
                     .fill(plateFill)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: metrics.tileCornerRadius, style: .continuous)
                     .strokeBorder(.primary.opacity(0.18), lineWidth: 1)
             )
             .overlay(alignment: .bottom) { StatusDot(tint: tint, isFocused: isFocused) }
@@ -101,10 +105,10 @@ struct ClusterTile: View {
 
     private var countBadge: some View {
         Text("\(members.count)")
-            .font(.system(size: 8, weight: .bold))
+            .font(.system(size: metrics.badgeFontSize, weight: .bold))
             .foregroundStyle(.white)
-            .padding(.horizontal, 3)
-            .frame(minWidth: 12, minHeight: 12)
+            .padding(.horizontal, metrics.badgePadding)
+            .frame(minWidth: metrics.badgeMinSize, minHeight: metrics.badgeMinSize)
             .background(Capsule().fill(.blue))
             .padding(.trailing, 1)
             .padding(.bottom, 1)
