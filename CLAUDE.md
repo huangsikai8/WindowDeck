@@ -127,6 +127,20 @@ hold a stale slot for the same app, the app cannot know which won and takes the 
 Accepted: it is rare, self-corrects the next time a window of that app closes, and the alternative is
 persisting a fact solely to break a tie.
 
+That saved slot is read by `launcherBirthplace`, and it is an **unmatched `savedMembers` reference** —
+which is exactly "this capsule holds a slot for an app whose window is gone" written down. Nothing
+else on disk says it, and nothing else needs to.
+
+**Rule 3 only applies to a launcher a window left behind.** An app that was already running with no
+windows when WindowDeck started, or one still drawing its first window, has left no slot in any
+capsule: it falls back to Main *unanchored*, and it is retracted the moment its process owns a window
+again, wherever that window lands. Standing still there is what produced the one duplicate the rules
+are supposed to make impossible — measured on Slack, whose process started, sat windowless for a few
+seconds, took a launcher in Main, then drew its single window in Actelligent, leaving Main drawing a
+second Slack for the rest of the session. The distinction is only between a launcher that stands for a
+closed window and one that stands for nothing; the "launcher in Main plus a live window in Study"
+case above is the first kind and is untouched.
+
 ### Tabs
 
 **A tabbed window is one window.** Filing it files the whole thing; every tab inside it belongs to
@@ -791,6 +805,12 @@ per captured window, nothing removed them — one order key, one `knownRef` and 
 per window ever opened in Main, each holding the other alive (`pruneKnownRefs` deliberately keeps a
 ref the order still names).
 
+**A fixture that never opens a window cannot test a rule about closing one.** `closedWindowLauncher`
+built its launcher by declaring Finder windowless from the start and never giving it a window to lose,
+so it asserted the *ambient* case while its name and every comment in it described the transition. It
+began failing the moment the two were told apart, which is the only reason anyone noticed. Same shape
+as the `frame`-nil and `pid: 0` fixtures above: the test was green and was measuring something else.
+
 **A dead slot is chosen by recency, not by whichever the set yields first.** Dead member ids
 accumulate one per closed window while an application keeps running, so `slotFor` taking the first
 match put the launcher at the position of a long-gone window instead of the one just closed —
@@ -879,6 +899,29 @@ nowhere to put a key it cannot rank but the end of the row, so `stackApp` insert
 hidden-pins note describes. `stackApp` puts the key in the leftmost member's slot and removes the
 rest; `unstackApp` expands it back. Measured with the fix reverted: `["w800", "w803", "scom.browser"]`
 where `["w800", "scom.browser", "w803"]` was wanted.
+
+**A stacked application holds one slot, and dropping below two windows abandoned it.** `foldAppStacks`
+needs two windows — with one left the tile is indistinguishable from an ordinary entry — and
+`stackApp` had already deleted its members' own keys when it took their leftmost slot. So closing two
+of three stacked VS Code windows left the survivor unranked, with no same-app item to sit beside, and
+`applyManualOrder` appended it to the **far right of the capsule**; opening a second window folded the
+stack and jumped it back, which reads as flicker rather than as an ordering bug.
+
+`rankKey` answers "which slot does this item occupy" instead of every caller reading `orderKey`
+directly: a `.window` or a `.running` launcher of an application this capsule stacks ranks by
+`s<bundle>`. A cluster does not — hand-made arrangement outranks a blanket rule about an application,
+the same precedence `foldAppStacks` gets by running over `foldClusters`' output — and neither does a
+pin, which is a slot the user placed by hand.
+
+Three things this must keep. **The drag has to write the key the row ranks by**, or the tile snaps
+back: `moveItem` translates both the moved key and the target through `draggedKey`, and the target
+matters as much as the source, since a key that is not in `order` is not found at all and the drop
+appends to the end. **`placeInArrangement` mints nothing for a window of a stacked app** — the slot
+already exists, and the extra key was inert only until the app was unstacked, at which point the
+window was named twice in one arrangement and the stray, being later in the row, was the copy that
+won. Measured on the live file: five stray VS Code keys in Main beside the stack's own. And
+**`unstackApp` clears those strays before expanding the slot**, because files written before this
+carry them. Nothing here is persisted and no `OrderRef` case changed.
 
 **An unplaced item is drawn beside its own application's windows, not at the end of the row.**
 Nothing mints an order key for a newly opened window — `captureNewWindows` files it into membership
@@ -1312,7 +1355,7 @@ an empty group showing nothing looks like a badge that failed to render.
 WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
 ```
 
-~304 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
+~336 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
 field type degrading rather than wiping the file, round-trips), ordering, restore matching, membership
 moves, capture of new windows, pruning, clustering, app stacks, switcher candidate ordering and scope,
 section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never

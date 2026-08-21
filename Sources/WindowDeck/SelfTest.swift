@@ -75,6 +75,7 @@ enum SelfTest {
         closedWindowLauncher()
         launcherIsUniqueAndStaysPut()
         launcherRegressions()
+        launcherWithNoSlotBehindIt()
         activeCapsuleTracking()
         activationRaiseIsNotIntent()
         iconInkStaysInsideItsTile()
@@ -98,6 +99,7 @@ enum SelfTest {
         appStackOpensItsOwnWindows()
         appStackOrdering()
         appStackOrderSurvivesRelaunch()
+        loneStackedWindowKeepsTheStacksSlot()
         appStackInteractions()
         appStackPersistence()
         appStackHover()
@@ -707,6 +709,16 @@ enum SelfTest {
             return
         }
 
+        // Rule 1 is about a *transition* — this application had a window, and it
+        // closed — so the fixture has to make that transition rather than start
+        // from nothing. An app WindowDeck never saw with a window is a different
+        // case with a different rule; `launcherWithNoSlotBehindIt` owns it, and
+        // without these four lines this case was quietly testing that one.
+        let vanished = WindowInfo.testInstance(id: 899, bundleID: "com.apple.finder",
+                                               title: "Closed later", pid: finder.processIdentifier)
+        store.windows = [vanished]
+        store.noteWindowRefs([vanished])
+
         // Preconditions, asserted rather than assumed: a pin test once passed
         // while pinning nothing at all.
         store.windows = []
@@ -892,6 +904,84 @@ enum SelfTest {
         grow.forcePruneForTesting()
         check("Main's arrangement drops the key once the app is gone",
               !grow.order(in: mainID).contains("w930"), "\(grow.order(in: mainID))")
+    }
+
+    /// A launcher with no closed window behind it does not stand still.
+    ///
+    /// Rule 3 keeps a launcher where it is until *its own* capsule gets a window
+    /// of the application back, which is what makes a launcher in Main beside a
+    /// live window in Study correct. It is a rule about a slot a closed window
+    /// left behind — and an application that was already running with no windows
+    /// when WindowDeck started left none. It falls back to Main, and standing
+    /// still there meant Main drew a launcher for it for ever while its real
+    /// window lived somewhere else entirely: reported as "1 Slack in Main, 1 in
+    /// Actelligent, only 1 Slack open", with the launcher born in the seconds
+    /// between Slack's process starting and its first window appearing.
+    ///
+    /// Both directions are asserted, because a rule that simply retracted every
+    /// launcher would pass the first half alone.
+    private static func launcherWithNoSlotBehindIt() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a capsule exists", false) }
+        let work = store.groups[1].id
+        let mainID = store.main.id
+
+        guard let finder = NSWorkspace.shared.runningApplications
+            .first(where: { $0.bundleIdentifier == "com.apple.finder" }) else {
+            check("Finder is running to stand in for a windowless app", false)
+            return
+        }
+        let pid = finder.processIdentifier
+
+        func launcherCapsules(_ store: AppStore) -> [UUID] {
+            store.groups
+                .map(\.id)
+                .filter { id in
+                    items(store, in: id).contains { $0.launcherBundleID == "com.apple.finder" }
+                }
+        }
+        func settle(_ store: AppStore, hasWindows: Bool) {
+            store.sampleRunningApps(windowOwnerPIDs: hasWindows ? [pid] : [], force: true)
+            store.updateLaunchers()
+        }
+
+        // Never seen with a window, and no capsule holds a slot for it: Main.
+        settle(store, hasWindows: false)
+        check("a windowless app WindowDeck never saw gets its launcher in Main",
+              launcherCapsules(store) == [mainID], "\(launcherCapsules(store).count) capsule(s)")
+
+        // Its first window opens in Work. Main was never holding a slot for it,
+        // so Main must not go on drawing one beside Work's real window.
+        let opened = WindowInfo.testInstance(id: 940, bundleID: "com.apple.finder",
+                                             title: "First window", pid: pid)
+        store.windows = [opened]
+        store.noteWindowRefs(store.windows)
+        store.add(940, to: work)
+        settle(store, hasWindows: true)
+        check("and it goes the moment the app has a window anywhere",
+              launcherCapsules(store).isEmpty, "\(launcherCapsules(store))")
+
+        // The other direction. A capsule holding a saved reference for the app is
+        // holding a slot for it — that is what a launcher restored across a
+        // relaunch *is* — so the launcher is born there rather than in Main, and
+        // it stays put when a window opens elsewhere.
+        let restored = freshStore()
+        guard restored.groups.count >= 2 else { return check("a capsule exists", false) }
+        let savedHome = restored.groups[1].id
+        restored.groups[1].savedMembers = [MemberRef(bundleID: "com.apple.finder",
+                                                     title: "Filed before the relaunch")]
+        settle(restored, hasWindows: false)
+        check("a capsule holding a saved slot takes the launcher, not Main",
+              launcherCapsules(restored) == [savedHome], "\(launcherCapsules(restored))")
+
+        // A window in Main is not that capsule reclaiming it, so nothing moves.
+        let elsewhere = WindowInfo.testInstance(id: 941, bundleID: "com.apple.finder",
+                                                title: "Opened in Main", pid: pid)
+        restored.windows = [elsewhere]
+        restored.noteWindowRefs(restored.windows)
+        settle(restored, hasWindows: true)
+        check("an anchored launcher still stands still",
+              launcherCapsules(restored) == [savedHome], "\(launcherCapsules(restored))")
     }
 
     /// The icon frame may overhang its tile, but the *ink* may never leave it.
@@ -1650,6 +1740,85 @@ enum SelfTest {
         store.unstackApp(bundleID: "com.browser", in: group)
         check("a non-member window of the same app stays out of the arrangement",
               !store.order(in: group).contains("w804"),
+              "\(store.order(in: group))")
+    }
+
+    /// A stack that drops to one window must not move.
+    ///
+    /// `foldAppStacks` needs two windows — with one left the tile is an ordinary
+    /// entry — and `stackApp` deleted its members' own keys when it took their
+    /// leftmost slot. So the survivor is unranked, has no same-app item left to
+    /// sit beside, and `applyManualOrder` appends it to the far right: close two
+    /// of three stacked editor windows and the third jumps across the capsule,
+    /// then jumps back the moment a second one opens.
+    private static func loneStackedWindowKeepsTheStacksSlot() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        let editor = WindowInfo.testInstance(id: 820, bundleID: "com.editor", title: "Editor")
+        let a = WindowInfo.testInstance(id: 821, bundleID: "com.browser", title: "A")
+        let b = WindowInfo.testInstance(id: 822, bundleID: "com.browser", title: "B")
+        let c = WindowInfo.testInstance(id: 823, bundleID: "com.browser", title: "C")
+        let mail = WindowInfo.testInstance(id: 824, bundleID: "com.mail", title: "Mail")
+        store.windows = [editor, a, b, c, mail]
+        store.noteWindowRefs([editor, a, b, c, mail])
+        for id in [820, 821, 822, 823, 824] { store.add(CGWindowID(id), to: group) }
+        store.setOrder(["w820", "w821", "w822", "w823", "w824"], in: group)
+        store.stackApp(bundleID: "com.browser", in: group)
+        check("the stack sits between the two", 
+              items(store, in: group).map(\.orderKey) == ["w820", "scom.browser", "w824"],
+              "\(items(store, in: group).map(\.orderKey))")
+
+        // Two of the three closed. The rule is untouched — the app is still
+        // stacked here — so its one slot is still the stack's.
+        store.windows = [editor, c, mail]
+        check("the survivor holds the stack's place",
+              items(store, in: group).map(\.orderKey) == ["w820", "w823", "w824"],
+              "\(items(store, in: group).map(\.orderKey))")
+
+        // And back: reopening a second window re-folds it in the same slot,
+        // which is the half that made the jump look like flicker.
+        store.windows = [editor, b, c, mail]
+        store.noteWindowRefs([editor, b, c, mail])
+        check("and it re-folds where it stood",
+              items(store, in: group).map(\.orderKey) == ["w820", "scom.browser", "w824"],
+              "\(items(store, in: group).map(\.orderKey))")
+
+        // A window opening into a capsule that already stacks its application
+        // needs no key of its own — the stack's slot is where it draws. One was
+        // minted regardless, inert until the app was unstacked and the window
+        // was then named twice in one arrangement.
+        let d = WindowInfo.testInstance(id: 825, bundleID: "com.browser", title: "D")
+        store.windows = [editor, b, c, d, mail]
+        store.noteWindowRefs(store.windows)
+        store.endLaunchGraceForTesting()
+        store.focusedWindowID = 820
+        store.settleFocusForTesting()
+        store.captureNewWindows([825], focusHint: 820)
+        check("a window of a stacked app takes no second slot",
+              !store.order(in: group).contains("w825"), "\(store.order(in: group))")
+
+        // Dragging the survivor has to move the slot the row ranks it by, or the
+        // tile snaps back to where the stack stood.
+        store.windows = [editor, c, mail]
+        store.moveItem("w823", before: "w820", in: group)
+        check("dragging the lone window moves the stack's slot",
+              store.order(in: group) == ["scom.browser", "w820", "w824"],
+              "\(store.order(in: group))")
+        check("and the tile lands there",
+              items(store, in: group).map(\.orderKey) == ["w823", "w820", "w824"],
+              "\(items(store, in: group).map(\.orderKey))")
+
+        // Unstacking puts the members back in that one place. The stray key a
+        // pre-fix file carries must not survive it: later in the row, it is the
+        // copy `applyManualOrder` would have ranked by.
+        store.windows = [editor, b, c, mail]
+        store.noteWindowRefs(store.windows)
+        store.setOrder(["scom.browser", "w820", "w824", "w822"], in: group)
+        store.unstackApp(bundleID: "com.browser", in: group)
+        check("unstacking names each member exactly once",
+              store.order(in: group) == ["w822", "w823", "w820", "w824"],
               "\(store.order(in: group))")
     }
 

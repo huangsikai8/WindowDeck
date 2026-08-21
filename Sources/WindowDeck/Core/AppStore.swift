@@ -321,19 +321,33 @@ final class AppStore {
     /// `OrderRef` case, nothing to prune when the window closes, and an
     /// arrangement the user *made* still wins outright — two windows of one app
     /// dragged to opposite ends are both ranked, and neither moves.
-    private func applyManualOrder(_ items: [DeckItem], order: [String]) -> [DeckItem] {
+    ///
+    /// `stackSlots` is what makes a stacked application hold **one** slot here
+    /// however many windows it currently has — see `rankKey`.
+    private func applyManualOrder(_ items: [DeckItem], order: [String],
+                                  stackSlots: Set<String> = []) -> [DeckItem] {
         guard !order.isEmpty else { return items }
         var rank: [String: Int] = [:]
         for (index, key) in order.enumerated() { rank[key] = index }
 
-        var placed = items
-            .filter { rank[$0.orderKey] != nil }
-            .sorted { rank[$0.orderKey, default: 0] < rank[$1.orderKey, default: 0] }
+        func key(_ item: DeckItem) -> String { rankKey(item, stackSlots: stackSlots) }
+
+        // The index tiebreak, because `sorted(by:)` is not documented as stable
+        // and the alias can legitimately give two items one rank: two processes
+        // of one bundle, one drawing the stack and the other a launcher.
+        var placed = items.enumerated()
+            .filter { rank[key($0.element)] != nil }
+            .sorted { a, b in
+                let ra = rank[key(a.element), default: 0]
+                let rb = rank[key(b.element), default: 0]
+                return ra == rb ? a.offset < b.offset : ra < rb
+            }
+            .map(\.element)
 
         // Searched against the *growing* list rather than the ranked items
         // alone, so several new windows of one app land behind the first in the
         // order they were given rather than all on top of the same anchor.
-        for item in items where rank[item.orderKey] == nil {
+        for item in items where rank[key(item)] == nil {
             if let anchor = placed.lastIndex(where: { $0.sharesApp(with: item) }) {
                 placed.insert(item, at: anchor + 1)
             } else {
@@ -341,6 +355,62 @@ final class AppStore {
             }
         }
         return placed
+    }
+
+    /// Which slot of a capsule's arrangement an item occupies.
+    ///
+    /// Its own key, with one exception: **a stacked application holds exactly one
+    /// slot here — the stack's — however many windows it has in this capsule
+    /// right now.** `foldAppStacks` needs two windows to draw a stack, since with
+    /// one left the tile is indistinguishable from an ordinary entry, and
+    /// `stackApp` deleted its members' own keys when it took their leftmost slot.
+    /// So closing two of three stacked editor windows left the survivor unranked
+    /// with no same-app item to sit beside, and it was appended to the far right
+    /// of the capsule — then jumped back the instant a second window opened.
+    ///
+    /// A launcher is aliased for the same reason and by the same rule: closing
+    /// the *last* window of a stacked app must not move its icon either.
+    ///
+    /// A cluster is not, and a pin is not. A cluster is a hand-made arrangement
+    /// and outranks a blanket rule about an application — the same precedence
+    /// `foldAppStacks` already gives it by running over `foldClusters`' output —
+    /// and a pin is a slot the user placed by hand, drawn only when the app has
+    /// no window here at all.
+    private func rankKey(_ item: DeckItem, stackSlots: Set<String>) -> String {
+        guard !stackSlots.isEmpty else { return item.orderKey }
+        let bundleID: String?
+        switch item {
+        case .window(let window): bundleID = window.bundleID
+        case .running(let app, _, _): bundleID = app.bundleID
+        // `.appStack` already keys on the application; the other two keep theirs.
+        default: return item.orderKey
+        }
+        guard let bundleID, stackSlots.contains(bundleID) else { return item.orderKey }
+        return "s\(bundleID)"
+    }
+
+    /// The stacked applications this capsule holds a slot for. Empty in the
+    /// overwhelmingly common case of no stacks, which is what `rankKey` checks
+    /// first.
+    private func stackSlots(in group: DeckGroup) -> Set<String> {
+        guard !group.stackedAppBundleIDs.isEmpty else { return [] }
+        return group.stackedAppBundleIDs.filter { group.order.contains("s\($0)") }
+    }
+
+    /// The key a drag writes, which must be the key the row *ranks* by or the
+    /// tile snaps straight back: dragging the last window of a stacked app wrote
+    /// `w<id>`, and `rankKey` then went on reading the stack's slot. Applied to
+    /// the target as well — an unranked key is not found in `order` at all, so
+    /// the drop would have appended to the end of the row.
+    private func draggedKey(_ key: String, in group: DeckGroup) -> String {
+        guard !group.stackedAppBundleIDs.isEmpty, key.hasPrefix("w"),
+              let id = CGWindowID(key.dropFirst()),
+              let bundleID = windows.first(where: { $0.id == id })?.bundleID
+                ?? knownRefs[id]?.bundleID,
+              group.stackedAppBundleIDs.contains(bundleID),
+              group.order.contains("s\(bundleID)")
+        else { return key }
+        return "s\(bundleID)"
     }
 
     /// Moves one item to sit where another currently is, inside one capsule.
@@ -363,6 +433,10 @@ final class AppStore {
         // came back.
         var order = groups[index].order
         if order.isEmpty { order = seededOrder(forGroupAt: index) }
+
+        let key = draggedKey(key, in: groups[index])
+        let target = draggedKey(target, in: groups[index])
+        guard key != target else { return }
 
         // Which way the drag is going, decided *before* the key is pulled out.
         // Inserting only ever before the target made the last position
@@ -410,7 +484,8 @@ final class AppStore {
         let folded = foldAppStacks(foldClusters(members, in: group), in: group)
         let launchers = pins(alongside: folded, in: group)
             + runningLaunchers(for: group, folded: folded)
-        return applyManualOrder(launchers + folded, order: group.order)
+        return applyManualOrder(launchers + folded, order: group.order,
+                                stackSlots: stackSlots(in: group))
     }
 
     /// The group's launchers, minus any whose app already has a window here.
@@ -456,6 +531,24 @@ final class AppStore {
     private struct LauncherSlot {
         var groupID: UUID
         var instance: AppInstance
+        /// Whether a window of this application actually closed here.
+        ///
+        /// Rule 3 — a launcher never moves and never disappears on its own — is
+        /// about the slot a closed window left behind, and it is what makes a
+        /// launcher in Main beside a live window in Study correct rather than a
+        /// duplicate. An application that was *already* running with no windows
+        /// when WindowDeck started, or one still drawing its first window, left
+        /// no slot anywhere: it falls back to Main, and standing still there
+        /// meant Main drew a launcher for it for ever while its real window lived
+        /// in another capsule. Measured on Slack — one window in Actelligent, one
+        /// phantom launcher in Main, born in the seconds between the process
+        /// starting and its first window appearing, and reported as "1 Slack in
+        /// Main, 1 in Actelligent, only 1 Slack open".
+        ///
+        /// An unanchored launcher is therefore only as good as the present: it
+        /// holds nothing, so it lasts exactly as long as the process has no
+        /// window anywhere.
+        var anchored: Bool
         /// Resolved once, when the launcher is born.
         ///
         /// Building it is `Bundle(url:)` plus `FileManager.displayName(atPath:)` —
@@ -482,12 +575,20 @@ final class AppStore {
         // Rule 3: a launcher stays until *its own* capsule gets a real window of
         // that process back. Windows opening in another capsule are none of its
         // business — that is what makes it stand still.
+        let windowless = Set(runningApps.windowless.map(\.pid))
         for (pid, slot) in launcherHome {
             guard let group = groups.first(where: { $0.id == slot.groupID }) else {
                 launcherHome[pid] = nil
                 continue
             }
-            if windows(in: group).contains(where: { $0.pid == pid }) { launcherHome[pid] = nil }
+            if windows(in: group).contains(where: { $0.pid == pid }) {
+                launcherHome[pid] = nil
+                continue
+            }
+            // Nothing to stand still for. `windowless` is judged per process and
+            // spans every Space, so this asks the one question that matters:
+            // does this pid own a window anywhere now.
+            if !slot.anchored && !windowless.contains(pid) { launcherHome[pid] = nil }
         }
 
         guard showRunningApps else { return }
@@ -504,19 +605,23 @@ final class AppStore {
                   let home = launcherBirthplace(of: instance),
                   let app = Self.pinnedApp(for: instance)
             else { continue }
-            launcherHome[instance.pid] = LauncherSlot(groupID: home, instance: instance, app: app)
+            launcherHome[instance.pid] = LauncherSlot(groupID: home.group, instance: instance,
+                                                      anchored: home.anchored, app: app)
         }
     }
 
-    /// Which capsule a process's launcher is born in: the one whose window of it
-    /// survived longest.
+    /// Which capsule a process's launcher is born in — the one whose window of it
+    /// survived longest — and whether that capsule genuinely holds a slot for it.
     ///
-    /// `lastSeenAt` answers that directly within a session. Across a restart it is
-    /// empty and two capsules can both hold a stale slot for one application, with
-    /// nothing on disk to say which won — so the first in strip order takes it.
-    /// Accepted rather than persisted: it is rare, and it corrects itself the next
-    /// time a window of that application closes.
-    private func launcherBirthplace(of instance: AppInstance) -> UUID? {
+    /// `lastSeenAt` answers the first question directly within a session. Across a
+    /// restart it is empty and two capsules can both hold a stale slot for one
+    /// application, with nothing on disk to say which won — so the first in strip
+    /// order takes it. Accepted rather than persisted: it is rare, and it corrects
+    /// itself the next time a window of that application closes.
+    ///
+    /// `anchored` is the second question, and it decides whether rule 3 applies at
+    /// all. See `LauncherSlot.anchored`.
+    private func launcherBirthplace(of instance: AppInstance) -> (group: UUID, anchored: Bool)? {
         let live = Set(windows.map(\.id))
         var best: (id: UUID, seen: Date)?
 
@@ -539,10 +644,27 @@ final class AppStore {
             if best == nil || seen > best!.seen { best = (owner, seen) }
         }
 
-        // Nothing of this application has ever been seen — it was already running
-        // with no windows when WindowDeck started. Main is where a window lives
-        // when nothing else claims it, so that is where its launcher belongs.
-        return best?.id ?? main.id
+        if let best { return (best.id, true) }
+
+        // Nothing of it closed during this session, but a capsule may still hold
+        // a slot for it on disk. An unmatched `savedMembers` reference *is* "this
+        // capsule holds a slot for an application whose window is gone", which is
+        // what a launcher is — so reading it here is what gives a launcher its
+        // capsule back across a relaunch, with no field persisted for it. A
+        // matched reference is consumed at restore, and a capsule holding a live
+        // window of the application would not be asking for a launcher anyway.
+        if let saved = groups.first(where: { group in
+            !group.isMain && group.savedMembers.contains { $0.bundleID == instance.bundleID }
+        }) {
+            return (saved.id, true)
+        }
+
+        // Never seen and never filed — it was already running with no windows
+        // when WindowDeck started, or it is still drawing its first window. Main
+        // is where a window lives when nothing else claims it, so that is where
+        // the launcher goes, and unanchored, because no window of it left a slot
+        // there to hold.
+        return (main.id, false)
     }
 
     /// The launchers one capsule draws: the applications whose single launcher
@@ -1556,9 +1678,20 @@ final class AppStore {
 
         // The members reappear where the stack stood, in the order the strip was
         // showing them, rather than all falling to the end of the row.
+        //
+        // Their own keys are cleared first. A window that joined while the app
+        // was stacked used to be given one by `placeInArrangement` even though
+        // the stack's slot already stood for it, and a file written before that
+        // stopped still carries them — so putting the members back here would
+        // name the same window twice, and the stray copy, being later in the
+        // row, is the one `applyManualOrder` would rank by.
         let keys = stackKeys(bundleID, at: index)
-        if let slot = groups[index].order.firstIndex(of: "s\(bundleID)") {
-            groups[index].order.replaceSubrange(slot...slot, with: keys)
+        if groups[index].order.contains("s\(bundleID)") {
+            let owned = Set(keys)
+            groups[index].order.removeAll { owned.contains($0) }
+            if let slot = groups[index].order.firstIndex(of: "s\(bundleID)") {
+                groups[index].order.replaceSubrange(slot...slot, with: keys)
+            }
         }
 
         groups[index].stackedAppBundleIDs.remove(bundleID)
@@ -1866,6 +1999,13 @@ final class AppStore {
               let bundleID = windows.first(where: { $0.id == windowID })?.bundleID
                 ?? knownRefs[windowID]?.bundleID
         else { return }
+
+        // A stacked application already holds its one slot here, and `rankKey`
+        // draws every window of it there. Minting a second key would be a slot
+        // nothing ranks by — inert until the app is unstacked, at which point it
+        // names the window twice — and one more of them on every window opened.
+        guard !(groups[index].stackedAppBundleIDs.contains(bundleID)
+                && groups[index].order.contains("s\(bundleID)")) else { return }
 
         // Seeded from what the capsule draws right now, or this key would be the
         // only ranked item in it and would sort to the left of everything already
