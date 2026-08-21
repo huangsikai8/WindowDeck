@@ -336,7 +336,13 @@ struct DeckView: View {
                 isDragging: dragging == slot.item.orderKey,
                 isRunning: store.runningApps.all.contains(app.bundleID),
                 tint: sectionTint(section),
-                onOpen: { AppLauncher.open(app) },
+                // Clicking a launcher inside a capsule makes that capsule active,
+                // so the window it opens lands there by the ordinary placement
+                // rule rather than by an exception to it.
+                onOpen: {
+                    section.groupID.map(store.noteWorkingIn)
+                    AppLauncher.open(app)
+                },
                 onTogglePin: { store.togglePin(app.bundleID, in: $0) },
                 isPinnedIn: { store.isPinned(app.bundleID, in: $0) },
                 pinTargets: store.pinTargets(forApp: app.bundleID),
@@ -355,7 +361,10 @@ struct DeckView: View {
                 tint: sectionTint(section),
                 // The copy *this* process came from, so a second installation
                 // reopens itself rather than its namesake.
-                onOpen: { AppLauncher.open(url: instance?.url ?? app.url) },
+                onOpen: {
+                    section.groupID.map(store.noteWorkingIn)
+                    AppLauncher.open(url: instance?.url ?? app.url)
+                },
                 onTogglePin: { store.togglePin(app.bundleID, in: $0) },
                 isPinnedIn: { store.isPinned(app.bundleID, in: $0) },
                 pinTargets: store.pinTargets(forApp: app.bundleID),

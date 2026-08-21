@@ -97,7 +97,7 @@ final class WindowEngine {
         // Two cadences. The 0.5s tick only diffs CGWindowList, which is a single
         // cheap call — no Accessibility IPC — so window open/close is caught fast.
         // Every 6th tick (~3s) a full AX scan also picks up title changes.
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
         refresh()
@@ -118,6 +118,9 @@ final class WindowEngine {
     }
 
     /// Ticks between full Accessibility scans, which catch title changes.
+    /// How often the cheap probe runs. Also the width of "just now" for anyone
+    /// judging whether two events happened in the same pass.
+    static let tickInterval: TimeInterval = 0.5
     private let fullScanInterval = 6
 
     private func tick() {

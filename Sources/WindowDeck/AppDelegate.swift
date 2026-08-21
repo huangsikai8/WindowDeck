@@ -63,14 +63,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if windows != self.store.windows {
                 self.store.windows = windows
             }
-            // Unconditionally, and deliberately outside the equality guard above.
-            // `WindowInfo.==` ignores `frame` — on purpose, since a move or resize
-            // must not redraw the strip — so a window that was only moved never
-            // reached this call and `lastFrameOf` kept the pre-resize rectangle
-            // for ever. Tab matching is by identical frame, so resizing a tabbed
-            // window once was enough to make every later tab switch lose the
-            // group. Every field this touches is @ObservationIgnored, so it costs
-            // dictionary writes and no redraw.
+            // Unconditionally, and deliberately outside the equality guard above:
+            // `WindowInfo.==` ignores some fields, so a window that changed only in
+            // those never reaches this call. Every field this touches is
+            // @ObservationIgnored, so it costs dictionary writes and no redraw.
             self.store.noteWindowRefs(windows)
             // Recorded before focus is updated: a window that has just opened
             // already holds focus, so the group context has to come from what we
@@ -92,25 +88,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Groups rebuild themselves here, not at launch: after a reboot the
             // windows arrive gradually as applications reopen.
             //
-            // The order of these four is the whole of "which capsule does this
-            // window belong to", and each step exists because of a bug:
-            // restore first, so a window returning to a saved group is not
-            // treated as new; then the capture decision, computed *before*
-            // rebinding and handed to it, so a window opened while working in
-            // one capsule cannot be claimed by another's long-dead slot; then
-            // the appeared path for tab switches, which create nothing.
+            // Two steps, and the order still matters: restore first, so a window
+            // returning to a saved group is not then treated as brand new and
+            // filed wherever you happen to be standing.
+            //
+            // There used to be four. The two that are gone tried to work out
+            // which *previous* window an arriving one was replacing, and that
+            // question is no longer asked — a new window joins the capsule being
+            // worked in, full stop, and nothing reaches out to claim it back.
             let restored = self.store.restorePass(against: windows)
-            let intended = self.store.captureTarget(focusHint: previousFocus)
-            let rebound = self.store.rebindReopenedWindows(snapshot.created,
-                                                           preferring: intended)
-            // Windows that merely came into view rather than being created —
-            // which is what a tab switch looks like.
-            self.store.rebindAppearedWindows(excluding: snapshot.created)
             self.store.captureNewWindows(snapshot.created,
-                                         claimedByRestore: restored.union(rebound),
+                                         claimedByRestore: restored,
                                          focusHint: previousFocus)
             self.store.pruneClusters()
             self.store.pruneDeadMembers()
+            // After pruning, so a launcher is never born into a slot that is
+            // about to be swept away, and before the strip is built, because all
+            // three launcher rules are about transitions rather than the present.
+            self.store.updateLaunchers()
         }
 
         NSWorkspace.shared.notificationCenter.addObserver(

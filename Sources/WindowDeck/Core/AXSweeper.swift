@@ -52,12 +52,11 @@ final class AXSweeper {
         let standardWindowIDs: Set<CGWindowID>
         /// Describe every application even if it is being backed off.
         ///
-        /// Set when the window server has just reported a new window. A window
-        /// is claimed by a group within `AppStore.arrivalGrace` — 5 seconds —
-        /// of being created, and it can only be claimed once it has been
-        /// *described*. Left to the ordinary 10-second backoff, opening a
-        /// window in an application that happened to be slow would miss that
-        /// window entirely and land the window in the wrong capsule, which is
+        /// Set when the window server has just reported a new window. A new
+        /// window joins the capsule being worked in, and it can only be filed
+        /// once it has been *described*. Left to the ordinary 10-second backoff,
+        /// opening a window in an application that happened to be slow would miss
+        /// that window entirely and land the window in the wrong capsule, which is
         /// the exact failure the capture rules exist to prevent. Freshness wins
         /// over the budget at the one moment it matters, and it costs only
         /// background time now that the sweep is off the main thread.

@@ -20,6 +20,161 @@ capsule so you can see where the next window will go.
 
 ---
 
+## The window-placement model
+
+**Status: agreed and implemented 2026-08-21.** Where this section contradicts a note further down
+this document, this section wins and that note is history. Specifically, these entries under "Traps
+discovered the hard way" describe machinery that **no longer exists** and are kept only for the
+reasoning that produced them — do not treat them as descriptions of the code:
+
+* "A reopened window is a different window", "Order restore needs the same matcher as membership"
+* "Rebinding has two triggers, and they need different rules", "Capture must outrank rebinding"
+* "A tab's frame is live at the moment it appears", "A window replaces exactly one predecessor"
+* "Neither a create nor a disappearance reliably lands in one 0.5s pass"
+* "A vacated slot must be *required*, not merely preferred"
+* "`WindowInfo.==` ignores `frame`, so `lastFrameOf` went stale for ever"
+* "A test whose fixture leaves `frame` nil cannot test frame matching"
+
+`rebindReopenedWindows`, `rebindAppearedWindows`, `sharesFrame`, `vacantMemberID`, the side tables
+`lastFrameOf` / `previouslyVisible` / `createdAt` / `vanishedAt`, and the constants `rebindWindow`,
+`arrivalGrace` and `settledFocus` were all deleted — about 250 lines. The self-test went from 272
+checks to 258: the rebinding cases were removed because the behaviour they guarded is now
+unrepresentable rather than merely fixed, and cases for the new rules were added in their place.
+
+The whole point of the model is one property: **the app never has to work out which window just came
+back.** That question — is this arriving window the one that closed a minute ago, or a brand new one?
+— has no reliable answer on macOS, and answering it wrongly is what caused nearly every grouping bug
+this project has had. The model removes the question instead of improving the guess.
+
+### Where a new window goes
+
+**Always the active capsule — the one you are working in. Nothing competes with this.**
+
+A window **never** drifts back to a capsule it used to be in. There is no matching, no predecessor, no
+slot that reaches out and claims an arriving window. A capsule gets a window because you were standing
+in it, because you clicked something in it, or because you dragged the window there.
+
+Clicking a capsule's launcher **makes that capsule active**, so the window opens there. This is not an
+exception to the rule and must not be implemented as one: the click changes what is active, and the
+ordinary rule then does the rest. Stated by the user as *"work, i clicked work's launcher, so
+technically work becomes active. no inconsistency to rule"*, and that framing is the reason the rule
+stays absolute.
+
+When focus is on nothing that lives in a capsule — you clicked the desktop, or an app is launching and
+has not drawn its window yet — the **last capsule you were genuinely working in** stays active.
+Clicking the desktop is not an instruction to change capsules.
+
+### Where a new window is drawn in the row
+
+**Beside its own application if that application is already on this row; otherwise at the very end.**
+"Already on this row" means a window of it, a stack of it, a cluster holding one of its windows, or a
+launcher or pin for it — anything standing for that application. So a second TextEdit window joins the
+first, and a first TextEdit window appears at the right-hand end where you just made it appear.
+
+The end means the **end of the capsule**, past launchers included. Nothing is reserved for them.
+
+`applyManualOrder` has always done exactly this for an item it cannot rank, and it was still wrong,
+because it returns early on an empty `order` — a capsule with no saved arrangement fell through to the
+sweep's own sort, which is by application name. A new TextEdit window therefore landed wherever
+"TextEdit" sorted among the apps already there. This is invisible in a busy capsule, whose arrangement
+is rebuilt from `savedOrder` every session, and reliable in an empty one, which is the wrong way round
+and is why it survived.
+
+The window is given a key in the arrangement at the moment it **joins the capsule**, in
+`placeInArrangement`, rather than the layout being taught about arrival. That matters: "which windows
+are new" is precisely the bookkeeping this model exists to avoid, and it is not needed here. The key
+uses the existing `.window` `OrderRef`, so nothing about the state file changes.
+
+Two details that a change here must keep. A capsule with an empty `order` is **seeded from what it
+currently draws** before the key is inserted, or the new key would be the only ranked item and would
+sort to the left of everything — the same trap `moveItem` documents for the first drag. And a cluster
+is matched by looking inside it rather than by its order key: a cluster is ordered by its *first
+member's* window key, so a mixed-application cluster whose leading window belongs to something else
+would not match, and a window would be sent past its own siblings to the end of the row.
+
+### Launchers
+
+A launcher is an app's icon on the strip with no window behind it. Three rules, in order:
+
+1. **One is created when an app's last window anywhere closes**, in the capsule that window was in,
+   holding that window's exact position in the row.
+2. **If the app already has a launcher, no second one is ever created.** Closing a window of that app
+   in some other capsule changes nothing.
+3. **A launcher never moves and never disappears on its own.** It stays until that capsule gets a real
+   window of that app back, or until the app quits entirely.
+
+So an app has **at most one launcher at any moment**, and closing order decides where it lands — once.
+After that it sits still. Two consequences are deliberate and were confirmed directly:
+
+* Closing Work's Chrome window while Chrome still has windows in Main shows **nothing** in Work.
+  Chrome is still alive, so no launcher is created. Work simply has no Chrome on it.
+* A launcher in Main plus a live window in Study **at the same time** is correct and expected. Chrome
+  reopening somewhere else does not retract the launcher Main is holding.
+
+There is no special rule for Main. Main gets launchers exactly as Work and Study do, and the earlier
+idea that Main needed its own rule was a mistake — Main *did* hold those windows, it just happens not
+to write its membership down.
+
+**A launcher survives a WindowDeck restart, capsule and position intact.** This needs no new persisted
+field and must not be given one: a launcher *is* "this capsule holds a slot for an app whose window is
+gone", and both the slot and its place in the row are already on disk as a dead member reference plus
+its `OrderRef`. Deriving the launcher from what is already saved is what keeps this change free of the
+one category of edit that has wiped the state file before.
+
+The one thing that is genuinely lost across a restart is *which capsule closed its window last*. Within
+a session that is what decides where the single launcher goes; after a restart, if two capsules both
+hold a stale slot for the same app, the app cannot know which won and takes the first in strip order.
+Accepted: it is rare, self-corrects the next time a window of that app closes, and the alternative is
+persisting a fact solely to break a tie.
+
+### Tabs
+
+**A tabbed window is one window.** Filing it files the whole thing; every tab inside it belongs to
+that capsule, and switching tabs changes nothing at all. The strip draws **one tile per window**,
+titled with whatever tab is currently showing.
+
+This is the single largest simplification in the model. macOS reports every tab as its own window with
+its own id, which is why the previous model had to match windows by identical frame and why filing a
+tab used to lose it the moment you switched away. None of that machinery is needed once the window,
+not the tab, is the unit.
+
+The cost, accepted: two tabs of one window cannot be put in different capsules.
+
+This holds because a background tab is off screen and not minimised, which the sweep already drops —
+so one tile per tabbed window falls out of filtering that exists for another reason. It is therefore
+tied to **"Only show windows on the current Space"**. Turn that setting off and every tab of a window
+reappears as its own tile, which contradicts this rule. Left alone deliberately rather than special-cased:
+the setting is on by default, and making the sweep hide off-screen tabs regardless would mean the
+setting no longer does what its label says.
+
+### The other cases
+
+| Event | Behaviour |
+|---|---|
+| **⌘H** hides an app | Nothing changes. Tiles stay exactly where they are — hiding is a display state, not a grouping change |
+| **Minimise** | Nothing changes. The window still exists with the same identity; this was never a problem |
+| **⌘Q** quits an app | That app's launcher and its remembered slot are gone permanently |
+| **Reboot / relaunch** | Grouping is restored by **app + exact title**, and this is the only place in the app that matches anything |
+
+A ⌘Q during a session is destructive on purpose and only a restart restores from disk. The user was
+shown that trade-off explicitly and took it.
+
+### What this deletes
+
+Nothing in the list below has a replacement — the situations that needed them stop arising:
+
+* matching an arriving window to a dead predecessor, and the pool of candidate slots it chose from;
+* the precedence fight between "where you are working" and "where this window used to live";
+* frame matching, and with it the entire tab-switch path;
+* the distinction between a window that was *created* and one that merely *appeared*;
+* the timing constants that governed all of the above — how long a slot stays claimable, how long a
+  create or a vanish is remembered, how old a focus must be to count as deliberate.
+
+Only two things must still be remembered per window: **which capsule it is in**, and **where it sits
+in the row**. Both are facts the user set, not inferences the app made.
+
+---
+
 ## Build and run
 
 ```bash
@@ -561,6 +716,96 @@ been in. Both halves are needed and the self-test fails on either one alone. Ret
 persistence: `persisted(_ cluster:)` builds the on-disk `(app, title)` refs from `memberIDs` through
 `knownRefs`, so an id evicted while the app still ran was gone from the file as well, and no relaunch
 could restore it.
+
+**Activation raises an application's own window, and that raise is not intent.** Opening a document
+activates its application, which brings the window it *already had* forward — so for a few tens of
+milliseconds the focused window is that one rather than the one being worked in, and a spreadsheet
+opened from Finder was filed into whichever capsule held Excel's other window. The old code answered
+this with a 2-second "settled focus" walk back through the MRU list; that went with the rebinding, and
+the bug came back with it.
+
+Measured before choosing a replacement, because the obvious worry — that a large document would widen
+the gap — turns out to be wrong. Probing the window server at 25ms while opening files in TextEdit
+that already had a window:
+
+| File | App's own window raised | Document window appears | Gap |
+|---|---|---|---|
+| 18 KB | 2.100s | 2.148s | **48ms** |
+| 137 MB | 1.355s | 1.387s | **32ms** |
+
+The gap does not grow with the file, because the window is created *before* its contents are read —
+the slow part happens afterwards, into a window that already exists. So the threshold does not have to
+allow for a slow document, and `settledFocus`'s 2 seconds was always far wider than the thing it was
+catching.
+
+The refresh tick (0.5s) was tried first, on the reasoning that reusing a number already in the app
+beats inventing one. **It is too wide, and the self-test caught it**: a deliberate click followed by
+⌘N is a human action of 200ms or more, so half a second reaches well into the range of things the user
+genuinely meant, and three existing capture tests failed. `activationRaise` is 150ms — three times the
+measured raise, below deliberate action.
+
+Two things this must keep. It compares the *focus change*, not the focus itself, so pressing ⌘N in a
+window you have been working in is untouched: focus did not change, so nothing is discarded. And
+`activationRaiseIsNotIntent` asserts both directions — that a just-raised window does not capture, and
+that the same window *does* once its focus has stood for a moment — because a rule that refuses
+everything would pass the first assertion alone.
+
+The self-test needed `settleFocusForTesting` back for this. A fixture that sets focus and opens a
+window in the same instant is not "the user is working here"; it is precisely the signature of an
+application raising its own window, and is refused. Thirty-six focus assignments across the suite had
+to say which they meant.
+
+**A launcher belongs to a process, and every question about it must be asked per process.**
+`launcherHome` was first keyed by bundle id, which walks straight back into "a bundle id is not a
+running application" one level up from where that trap was fixed. Two copies of one app on disk share
+a bundle id and run as two processes; `runningApps.windowless` is already judged per process, so it is
+the whole test for "this one has no windows". An extra guard asking whether the *bundle* had a live
+window re-created the original defect exactly — the copy whose window was closed was suppressed by the
+other copy's window, and only one of the two could ever hold a slot in a dictionary keyed by bundle.
+The reclaim check (`does this capsule have a window of it again`) is per pid for the same reason.
+`RunningApps.livePIDs` exists because "has this application quit" cannot be asked of `all`, which
+still holds the bundle id while the second copy runs.
+
+**`pins(alongside:)` knows nothing about launchers, so the launcher has to know about pins.** A pin
+hides behind a live window of its own app, which is the rule that stops two identical icons appearing
+side by side — but a *launcher* for that app is built by a different function, and nothing connected
+them. Pin an app, close its window, and the capsule drew the pin and the launcher as two identical
+adjacent icons. Worse in Main, where a launcher has no member slot and falls back to `p<bundleID>` —
+the pin's own order key — so both ranked identically and `placeInArrangement` could seed that
+duplicate into the saved arrangement.
+
+**Main's arrangement needs pruning and used not to.** `pruneDeadMembers` walks `memberIDs`, and Main
+has none, so its `order` was never swept. That was survivable only because Main's keys were *reused*
+in place by the old rebinding pass; once that was deleted and `placeInArrangement` began minting a key
+per captured window, nothing removed them — one order key, one `knownRef` and one persisted `OrderRef`
+per window ever opened in Main, each holding the other alive (`pruneKnownRefs` deliberately keeps a
+ref the order still names).
+
+**A dead slot is chosen by recency, not by whichever the set yields first.** Dead member ids
+accumulate one per closed window while an application keeps running, so `slotFor` taking the first
+match put the launcher at the position of a long-gone window instead of the one just closed —
+contradicting the rule that a launcher holds *that window's* exact position.
+
+**The capsule you acted on outranks the window that holds focus.** `activeGroup` checked the focused
+window first, so clicking Work's launcher while focused on a Main window left Main active and the new
+window opened there — the spec's "clicking a capsule's launcher makes that capsule active" silently
+not implemented. The override is cleared by the next genuine focus change, including the focus the
+opened window itself takes, so it cannot outlive the click.
+
+**Store the last active *window*, not the capsule it was in.** Recording a resolved group id froze the
+answer: move that window to another capsule and the stored id still named the old one, so clicking the
+desktop sent the ring — and the next window opened — back to a capsule the window had left. Resolving
+`group(of:)` lazily makes it impossible. It must also not require the window to still be open, since
+"focus is on nothing" is precisely when it may have closed; membership outlives the window.
+
+**Seeding an empty arrangement must put hidden pins back.** `moveItem` documents this for the first
+drag and `placeInArrangement` reintroduced it for the first captured window: a pin behind a live
+window is not in the drawn row, so seeding from that row alone dropped it, and when the window closed
+the pin returned unranked and was appended to the far right. Both now seed through `seededOrder`.
+
+**A cluster's order key is its first *live* member.** Matching on `memberIDs.first` missed any cluster
+whose leading window had been closed, and the arriving window was sent past its own siblings to the
+end of the row.
 
 ## Design decisions and why
 

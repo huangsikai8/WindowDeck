@@ -124,16 +124,14 @@ struct DeckGroup: Identifiable, Hashable {
     /// `clusters`. Every window of a named app in this group is in its stack, so
     /// one opened later joins on its own and one closed leaves without anything
     /// having to notice. That is why this can be a bare bundle id: there are no
-    /// window ids to go stale, nothing to prune, and nothing for
-    /// `rebindReopenedWindows` to repair.
+    /// window ids to go stale and nothing to prune.
     var stackedAppBundleIDs: Set<String> = []
     /// The fallback group — "Main".
     ///
     /// Every window that no other group claims is drawn in it, so its membership
     /// is *implicit*: `memberIDs` stays empty and the strip computes the
     /// complement. That is what makes "if it isn't filed, it goes to Main" free
-    /// — a newly opened window needs no capture, no rebind and no bookkeeping to
-    /// land somewhere sensible. It cannot be deleted and always sorts first;
+    /// — a newly opened window needs no bookkeeping to land somewhere sensible. It cannot be deleted and always sorts first;
     /// unlike the retired "All" group it is otherwise ordinary, with its own
     /// name, colour, launchers, clusters and arrangement.
     let isMain: Bool

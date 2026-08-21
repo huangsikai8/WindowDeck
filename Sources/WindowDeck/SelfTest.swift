@@ -68,19 +68,20 @@ enum SelfTest {
         sections()
         layout()
         sectionsWithWindows()
-        reopening()
         clustering()
         clusterSurvivesClosing()
         edgeCases()
         runningState()
         closedWindowLauncher()
+        launcherIsUniqueAndStaysPut()
+        launcherRegressions()
+        activeCapsuleTracking()
+        activationRaiseIsNotIntent()
+        newWindowPlacement()
         twoInstancesOfOneApp()
         menuIconCaching()
         capturing()
-        appearedExcludesCreated()
-        tabSwitchKeepsItsOwnSlot()
-        lateDescribedWindowKeepsIntent()
-        arrivalWithNothingVacated()
+        aDeadSlotNeverClaimsANewWindow()
         reorderingInsideAFoldedGroup()
         allGroupsRowOrdering()
         pruning()
@@ -468,6 +469,7 @@ enum SelfTest {
         // entirely — which is the case that used to build the cluster in the
         // wrong group, where nothing looks for it.
         store.focusedWindowID = nil
+        store.settleFocusForTesting()
         check("the group being acted on is not the active one",
               store.activeGroup.id != group)
 
@@ -573,21 +575,23 @@ enum SelfTest {
         check("the closed members are still persisted",
               onDisk?.members.count == 3, "\(onDisk?.members.count ?? -1)")
 
-        // Reopened under new ids, which is what the red button produces.
+        // Reopened under new ids, which is what the red button produces — and
+        // under the one-capsule model *nothing claims it back*. The slot is
+        // retained so the launcher can hold its place, but the returning window
+        // is an ordinary new window and joins the capsule being worked in.
+        //
+        // Asserted rather than left implicit because it is a deliberate loss: a
+        // cluster decays as its windows are closed and reopened, and a test that
+        // only checked the retention would not say so.
         let b2 = WindowInfo.testInstance(id: 311, bundleID: "com.apple.finder", title: "build")
         store.windows = [a, b2]
         store.noteWindowRefs([a, b2])
-        store.rebindReopenedWindows([311])
-        check("a reopened window rejoins the group", store.isMember(311, of: group))
-        check("and rejoins its cluster", cluster()?.contains(311) == true,
+        check("a reopened window does not silently rejoin its old cluster",
+              cluster()?.contains(311) == false,
               "\(cluster()?.memberIDs.sorted() ?? [])")
-        check("the dead slot is released from the cluster",
-              cluster()?.contains(301) == false)
-
-        // Two live members again, so the strip draws it as a cluster once more.
-        check("the strip folds them back into one tile",
-              items(store, in: group).contains { $0.isCluster },
-              "\(items(store, in: group).count) items")
+        check("and the dead slot is still held for the launcher",
+              cluster()?.contains(301) == true,
+              "\(cluster()?.memberIDs.sorted() ?? [])")
 
         // Growth is still bounded: once the application is gone the slot goes.
         let orphan = freshStore()
@@ -611,166 +615,6 @@ enum SelfTest {
                   .clusters.contains { $0.contains(320) || $0.contains(321) } == false)
     }
 
-    // MARK: - Close and reopen
-
-    private static func reopening() {
-        let store = freshStore()
-        guard store.groups.count >= 2 else { return check("a group exists", false) }
-        let group = store.groups[1].id
-
-        let original = WindowInfo.testInstance(id: 20, bundleID: "com.app", title: "Doc")
-        store.windows = [original]
-        store.noteWindowRefs([original])
-        store.add(20, to: group)
-        store.setOrder(["w20", "w99"], in: group)
-
-        // Closed, then reopened under a new id — what the red button does.
-        let reopened = WindowInfo.testInstance(id: 21, bundleID: "com.app", title: "Doc")
-        store.windows = [reopened]
-        store.noteWindowRefs([reopened])
-        let claimed = store.rebindReopenedWindows([21])
-
-        check("a reopened window is claimed", claimed.contains(21))
-        check("it inherits the membership", store.isMember(21, of: group))
-        check("the dead id is released", !store.isMember(20, of: group))
-        check("it inherits the arrangement slot",
-              store.order(in: group).first == "w21", "\(store.order(in: group))")
-
-        // A *new* window of the same app must not seize a vacant slot: opening a
-        // browser window while working in one group had it claimed by a
-        // long-closed member of another.
-        let fresh = freshStore()
-        guard fresh.groups.count >= 3 else { return check("two groups exist", false) }
-        let owner = fresh.groups[1].id
-        let old = WindowInfo.testInstance(id: 70, bundleID: "com.browser", title: "Old Tab")
-        fresh.windows = [old]; fresh.noteWindowRefs([old])
-        fresh.add(70, to: owner)
-        fresh.windows = []                       // closed
-        let unrelated = WindowInfo.testInstance(id: 71, bundleID: "com.browser", title: "Something Else")
-        fresh.windows = [unrelated]; fresh.noteWindowRefs([unrelated])
-        check("a differently titled window does not seize the slot",
-              !fresh.rebindReopenedWindows([71]).contains(71))
-        check("and does not join that group", !fresh.isMember(71, of: owner))
-
-        // A slot whose window vanished long ago must not claim a new one, even
-        // when the app and title line up exactly — browsers reuse titles.
-        let stale = freshStore()
-        let staleGroup = stale.groups[1].id
-        let ancient = WindowInfo.testInstance(id: 80, bundleID: "com.browser", title: "New Tab")
-        stale.windows = [ancient]
-        stale.noteWindowRefs([ancient])
-        stale.add(80, to: staleGroup)
-        stale.forgetLastSeenForTesting(80)          // as if it closed long ago
-        stale.windows = []
-        let brandNew = WindowInfo.testInstance(id: 81, bundleID: "com.browser", title: "New Tab")
-        stale.windows = [brandNew]; stale.noteWindowRefs([brandNew])
-        check("a long-dead slot does not claim a new window",
-              !stale.rebindReopenedWindows([81]).contains(81))
-        check("so the new window is free to be captured elsewhere",
-              !stale.isMember(81, of: staleGroup))
-
-        // Where you are working beats a slot another group is holding.
-        let contest = freshStore()
-        let holder = contest.groups[1].id      // the group with a stale slot
-        let intended = contest.groups[2].id    // where you are actually working
-        let dead = WindowInfo.testInstance(id: 90, bundleID: "com.browser", title: "New Tab")
-        contest.windows = [dead]; contest.noteWindowRefs([dead])
-        contest.add(90, to: holder)
-        contest.windows = []
-        let opened = WindowInfo.testInstance(id: 91, bundleID: "com.browser", title: "New Tab")
-        contest.windows = [opened]; contest.noteWindowRefs([opened])
-
-        check("without an intent, the slot is reclaimed as before",
-              contest.rebindReopenedWindows([91]).contains(91))
-
-        let second = freshStore()
-        let holder2 = second.groups[1].id, intended2 = second.groups[2].id
-        let dead2 = WindowInfo.testInstance(id: 92, bundleID: "com.browser", title: "New Tab")
-        second.windows = [dead2]; second.noteWindowRefs([dead2])
-        second.add(92, to: holder2)
-        second.windows = []
-        let opened2 = WindowInfo.testInstance(id: 93, bundleID: "com.browser", title: "New Tab")
-        second.windows = [opened2]; second.noteWindowRefs([opened2])
-        check("a stated intent stops another group claiming it",
-              !second.rebindReopenedWindows([93], preferring: intended2).contains(93))
-        check("and it does not join the holding group",
-              !second.isMember(93, of: holder2))
-
-        // Switching a macOS tab swaps which window id is on screen. The outgoing
-        // and incoming tabs share a frame to the pixel, which is the only thing
-        // tying them together — titles differ, since each tab is a document.
-        let tabs = freshStore()
-        let tabGroup = tabs.groups[1].id
-        let box = CGRect(x: 100, y: 100, width: 757, height: 559)
-        let firstTab = WindowInfo.testInstance(id: 110, bundleID: "com.apple.TextEdit",
-                                               title: "Notes", frame: box)
-        tabs.windows = [firstTab]; tabs.noteWindowRefs([firstTab])
-        tabs.add(110, to: tabGroup)
-
-        let secondTab = WindowInfo.testInstance(id: 111, bundleID: "com.apple.TextEdit",
-                                                title: "Shopping list", frame: box)
-        tabs.windows = [secondTab]; tabs.noteWindowRefs([secondTab])
-        check("switching tabs keeps the group",
-              tabs.rebindReopenedWindows([111]).contains(111))
-        check("the shown tab is the member now", tabs.isMember(111, of: tabGroup))
-
-        // The path that actually runs on a tab switch: nothing is *created*, a
-        // window simply becomes visible while its sibling stops being visible.
-        let live = freshStore()
-        let liveGroup = live.groups[1].id
-        let tabA = WindowInfo.testInstance(id: 120, bundleID: "com.apple.TextEdit",
-                                           title: "First", frame: box)
-        live.windows = [tabA]; live.noteWindowRefs([tabA])
-        live.add(120, to: liveGroup)
-        live.rebindAppearedWindows()                    // establishes what is on show
-
-        let tabB = WindowInfo.testInstance(id: 121, bundleID: "com.apple.TextEdit",
-                                           title: "Second", frame: box)
-        live.windows = [tabB]; live.noteWindowRefs([tabB])
-        let switched = live.rebindAppearedWindows()
-        check("a tab that comes into view is claimed", switched.contains(121))
-        check("membership follows the visible tab", live.isMember(121, of: liveGroup))
-        check("and leaves the tab that went away", !live.isMember(120, of: liveGroup))
-
-        // A tab switch must not be refused because you were last working in some
-        // other group — that filter is for new windows only.
-        let across = freshStore()
-        let home = across.groups[1].id
-        let box2 = CGRect(x: 10, y: 10, width: 700, height: 500)
-        let t1 = WindowInfo.testInstance(id: 130, bundleID: "com.apple.TextEdit", title: "A", frame: box2)
-        across.windows = [t1]; across.noteWindowRefs([t1])
-        across.add(130, to: home)
-        across.rebindAppearedWindows()
-        let t2 = WindowInfo.testInstance(id: 131, bundleID: "com.apple.TextEdit", title: "B", frame: box2)
-        across.windows = [t2]; across.noteWindowRefs([t2])
-        check("a tab switch is not blocked by where you were working",
-              across.rebindAppearedWindows().contains(131))
-        check("the arriving tab is filed", across.isMember(131, of: home))
-
-        // A different window of the same app, at a different size, is not a tab.
-        let separate = freshStore()
-        let sepGroup = separate.groups[1].id
-        let doc = WindowInfo.testInstance(id: 112, bundleID: "com.apple.TextEdit",
-                                          title: "Doc", frame: box)
-        separate.windows = [doc]; separate.noteWindowRefs([doc])
-        separate.add(112, to: sepGroup)
-        let elsewhere = WindowInfo.testInstance(id: 113, bundleID: "com.apple.TextEdit",
-                                                title: "Other", frame: CGRect(x: 400, y: 80, width: 500, height: 400))
-        separate.windows = [elsewhere]; separate.noteWindowRefs([elsewhere])
-        check("a differently placed window is not treated as a tab",
-              !separate.rebindReopenedWindows([113]).contains(113))
-
-        // A window of an unrelated app must not steal the slot.
-        let other = freshStore()
-        let held = WindowInfo.testInstance(id: 30, bundleID: "com.one", title: "A")
-        other.windows = [held]; other.noteWindowRefs([held])
-        other.add(30, to: other.groups[1].id)
-        other.windows = []
-        let stranger = WindowInfo.testInstance(id: 31, bundleID: "com.two", title: "B")
-        other.windows = [stranger]; other.noteWindowRefs([stranger])
-        check("a different app does not claim the slot",
-              !other.rebindReopenedWindows([31]).contains(31))
-    }
 
     // MARK: - Edges
 
@@ -870,23 +714,344 @@ enum SelfTest {
               !store.windows.contains { $0.bundleID == "com.apple.finder" })
         check("running-app launchers are enabled", store.showRunningApps)
 
-        // The Accessibility answer: no window belongs to it, so the Dock would
-        // still draw it and so must the strip.
-        let drawn = items(store, in: main).contains { $0.launcherBundleID == "com.apple.finder" }
-        check("an app whose last window was closed keeps its icon", drawn,
+        // A launcher is born from a transition, so the strip cannot be asked
+        // about one until the transition has been processed.
+        store.updateLaunchers()
+        func drawnInMain() -> Bool {
+            items(store, in: main).contains { $0.launcherBundleID == "com.apple.finder" }
+        }
+        check("an app whose last window was closed keeps its icon", drawnInMain(),
               "\(items(store, in: main).map(\.id))")
 
-        // The window-server answer, which is what the bug was: phantom windows
-        // for a pid make the app look like it still has one, and the launcher
-        // disappears. Asserted so the check above cannot pass by accident.
+        // Sticky, and this is the rule rather than an oversight: a launcher goes
+        // when *its own* capsule gets a real window of that application back, and
+        // nothing else takes it away. The window server reporting windows for the
+        // pid — which happens for windows on another Space, and for the phantom
+        // layer-0 windows an application keeps after its last one is closed — is
+        // not that, so the icon stays put.
         store.sampleRunningApps(windowOwnerPIDs: [finder.processIdentifier], force: true)
-        let suppressed = items(store, in: main).contains { $0.launcherBundleID == "com.apple.finder" }
-        check("a pid set claiming windows is what removes it", !suppressed)
+        store.updateLaunchers()
+        check("a pid set claiming windows does not remove it", drawnInMain())
 
-        // And back, so the difference is the pid set and nothing else.
+        // What does remove it: a window of that application actually drawn here.
+        let real = WindowInfo.testInstance(id: 900, bundleID: "com.apple.finder",
+                                           title: "Documents", pid: finder.processIdentifier)
+        store.windows = [real]
+        store.noteWindowRefs([real])
+        store.updateLaunchers()
+        check("the capsule reclaiming the app removes its launcher", !drawnInMain(),
+              "\(items(store, in: main).map(\.id))")
+
+        // And it comes back once that window closes again, so the difference is
+        // the window and nothing else.
+        store.windows = []
         store.sampleRunningApps(windowOwnerPIDs: [], force: true)
-        check("dropping that claim brings the icon back",
-              items(store, in: main).contains { $0.launcherBundleID == "com.apple.finder" })
+        store.updateLaunchers()
+        check("closing it again brings the icon back", drawnInMain())
+    }
+
+    /// Where a newly opened window is drawn inside its capsule.
+    ///
+    /// Beside its own application if that application is already on this row, and
+    /// otherwise at the very end. The second half is the part that was broken:
+    /// `applyManualOrder` returns early on an empty `order`, so a capsule with no
+    /// saved arrangement fell back to the sweep's own sort — by application name —
+    /// and a new TextEdit window landed wherever "TextEdit" happened to sort.
+    ///
+    /// Both halves are asserted, and the empty-arrangement case is asserted with
+    /// the incoming window placed *first* in the window list, which is what the
+    /// app-name sort would produce. Without that the fixture would pass with the
+    /// fix reverted, exactly as the frame-nil fixture once did.
+    private static func newWindowPlacement() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a capsule exists", false) }
+        let group = store.groups[1].id
+        store.endLaunchGraceForTesting()
+
+        func keys() -> [String] { items(store, in: group).map(\.orderKey) }
+
+        // A capsule with no arrangement at all, holding one window. The arriving
+        // window's app sorts *before* it, so an app-name sort would draw it left.
+        let zoom = WindowInfo.testInstance(id: 400, bundleID: "com.zoom", title: "Zoom", pid: 1)
+        store.windows = [zoom]
+        store.noteWindowRefs(store.windows)
+        store.add(400, to: group)
+        check("the capsule starts with no arrangement", store.order(in: group).isEmpty,
+              "\(store.order(in: group))")
+
+        let text = WindowInfo.testInstance(id: 401, bundleID: "com.textedit",
+                                           title: "Untitled", pid: 2)
+        store.windows = [text, zoom]            // as the app-name sort would give it
+        store.noteWindowRefs(store.windows)
+        store.focusedWindowID = 400
+        store.settleFocusForTesting()
+        store.captureNewWindows([401], focusHint: 400)
+        check("a new app lands at the end even with no arrangement",
+              keys() == ["w400", "w401"], "\(keys())")
+
+        // A second window of an application already here goes beside the first,
+        // not at the end.
+        let text2 = WindowInfo.testInstance(id: 402, bundleID: "com.textedit",
+                                            title: "Notes", pid: 2)
+        let mail = WindowInfo.testInstance(id: 403, bundleID: "com.mail", title: "Inbox", pid: 3)
+        store.windows = [text, text2, zoom, mail]
+        store.noteWindowRefs(store.windows)
+        store.settleFocusForTesting()
+        store.captureNewWindows([403], focusHint: 400)   // a third app, to the end
+        store.settleFocusForTesting()
+        store.captureNewWindows([402], focusHint: 400)   // beside its sibling
+        check("a second window of a known app lands beside it",
+              keys() == ["w400", "w401", "w402", "w403"], "\(keys())")
+
+        // A pinned application is not a new one: its window takes the pin's place
+        // rather than the end of the row. This is the "provided not pinned" carve
+        // out, and without it a pinned app's window would jump to the far right
+        // the first time it opened.
+        let pinned = freshStore()
+        let pinGroup = pinned.groups[1].id
+        pinned.endLaunchGraceForTesting()
+        let other = WindowInfo.testInstance(id: 410, bundleID: "com.zoom", title: "Zoom", pid: 1)
+        pinned.windows = [other]
+        pinned.noteWindowRefs(pinned.windows)
+        pinned.add(410, to: pinGroup)
+        pinned.setOrder(["pcom.finder", "w410"], in: pinGroup)
+        let finderWindow = WindowInfo.testInstance(id: 411, bundleID: "com.finder",
+                                                   title: "Documents", pid: 4)
+        pinned.windows = [other, finderWindow]
+        pinned.noteWindowRefs(pinned.windows)
+        pinned.focusedWindowID = 410
+        pinned.settleFocusForTesting()
+        pinned.captureNewWindows([411], focusHint: 410)
+        check("a pinned app's window takes the pin's place, not the end",
+              pinned.order(in: pinGroup) == ["pcom.finder", "w411", "w410"],
+              "\(pinned.order(in: pinGroup))")
+    }
+
+    /// The three launcher rules, and the closing order that decides between them.
+    ///
+    /// One launcher per application, born in the capsule whose window of it
+    /// survived longest, and it does not move afterwards. Closing order is what
+    /// picks the capsule — it was the first thing asked about this design and it
+    /// is the only thing the rules are sensitive to, so it is asserted directly
+    /// rather than inferred from a single path.
+    /// The regressions a review caught in the launcher rules. Each of these is a
+    /// case the rest of the suite cannot reach, and each was a real defect.
+    private static func launcherRegressions() {
+        guard let finder = NSWorkspace.shared.runningApplications
+            .first(where: { $0.bundleIdentifier == "com.apple.finder" }) else {
+            return check("Finder is running to stand in for a closed-window app", false)
+        }
+        let pid = finder.processIdentifier
+
+        // A pinned application must not also draw a launcher. `pins(alongside:)`
+        // hides a pin behind a live window of its app, but it knows nothing about
+        // launchers — so the capsule drew the pin and the launcher as two
+        // identical adjacent icons. Worse in Main, where the launcher has no
+        // member slot and falls back to `p<bundleID>`, the pin's own order key.
+        let store = freshStore()
+        let work = store.groups[1].id
+        let window = WindowInfo.testInstance(id: 920, bundleID: "com.apple.finder",
+                                             title: "Doc", pid: pid)
+        store.windows = [window]
+        store.noteWindowRefs(store.windows)
+        store.add(920, to: work)
+        store.pinApp(bundleID: "com.apple.finder", in: work)
+        guard store.isPinned("com.apple.finder", in: work) else {
+            return check("the fixture really pinned Finder", false)
+        }
+        store.windows = []
+        store.noteWindowRefs([])
+        store.sampleRunningApps(windowOwnerPIDs: [], force: true)
+        store.updateLaunchers()
+        let icons = items(store, in: work).filter { $0.launcherBundleID == "com.apple.finder" }
+        check("a pinned app draws one icon, not a pin and a launcher",
+              icons.count == 1, "\(icons.count)")
+
+        // Main's arrangement must be pruned like everyone else's. Main has no
+        // membership, so the sweep that drops dead order keys never walked it —
+        // and `placeInArrangement` now mints a key for every window captured
+        // there, so nothing ever removed them.
+        let grow = freshStore()
+        grow.endLaunchGraceForTesting()
+        let mainID = grow.main.id
+        let gone = WindowInfo.testInstance(id: 930, bundleID: "com.nonexistent.app",
+                                           title: "Ghost", pid: 4242)
+        grow.windows = [gone]
+        grow.noteWindowRefs(grow.windows)
+        grow.focusedWindowID = 930
+        grow.settleFocusForTesting()
+        grow.captureNewWindows([930], focusHint: 930)
+        check("the window took a key in Main's arrangement",
+              grow.order(in: mainID).contains("w930"), "\(grow.order(in: mainID))")
+        grow.windows = []
+        grow.noteWindowRefs([])
+        grow.sampleRunningApps(windowOwnerPIDs: [], force: true)
+        grow.forcePruneForTesting()
+        check("Main's arrangement drops the key once the app is gone",
+              !grow.order(in: mainID).contains("w930"), "\(grow.order(in: mainID))")
+    }
+
+    /// A window raised by its own application activating is not a statement about
+    /// where the user is working.
+    ///
+    /// Opening a document activates its application, which brings that
+    /// application's *existing* window forward — so for a few tens of
+    /// milliseconds the focused window is that one rather than the one being
+    /// worked in, and the document was filed into whichever capsule held it.
+    /// Measured at 32ms (137 MB file) and 48ms (18 KB): the gap does not grow
+    /// with the document, because the window exists before its contents are read.
+    private static func activationRaiseIsNotIntent() {
+        let store = freshStore()
+        guard store.groups.count >= 3 else { return check("two capsules exist", false) }
+        let work = store.groups[1].id
+        store.endLaunchGraceForTesting()
+
+        let inMain = WindowInfo.testInstance(id: 500, bundleID: "com.reader",
+                                             title: "Reading", pid: 1)
+        let inWork = WindowInfo.testInstance(id: 501, bundleID: "com.editor",
+                                             title: "Spreadsheet", pid: 2)
+        store.windows = [inMain, inWork]
+        store.noteWindowRefs(store.windows)
+        store.add(501, to: work)
+
+        // Working in Main, settled.
+        store.focusedWindowID = 500
+        store.settleFocusForTesting()
+        check("the fixture is working in Main", store.captureTarget(focusHint: 500) == store.main.id)
+
+        // The document's application activates and raises its Work window. No
+        // settling: this focus is milliseconds old, which is the whole signal.
+        store.focusedWindowID = 501
+        check("a just-raised window does not capture the new document",
+              store.captureTarget(focusHint: 501) == store.main.id,
+              "\(store.groups.first { $0.id == store.captureTarget(focusHint: 501) }?.name ?? "?")")
+
+        // The same focus, once it has stood for a moment, is a real answer —
+        // otherwise clicking into a capsule could never take effect.
+        store.settleFocusForTesting()
+        check("the same window does capture once focus has settled",
+              store.captureTarget(focusHint: 501) == work)
+    }
+
+    /// The active capsule is a live answer, not one frozen when focus landed.
+    private static func activeCapsuleTracking() {
+        let store = freshStore()
+        guard store.groups.count >= 3 else { return check("two capsules exist", false) }
+        let work = store.groups[1].id
+        let study = store.groups[2].id
+
+        let window = WindowInfo.testInstance(id: 940, bundleID: "com.editor",
+                                             title: "Doc", pid: 7)
+        store.windows = [window]
+        store.noteWindowRefs(store.windows)
+        store.add(940, to: work)
+        store.focusedWindowID = 940
+        store.settleFocusForTesting()
+        check("the capsule of the focused window is active", store.activeGroupID == work)
+
+        // Move it. The stored answer used to be a group id resolved when focus
+        // landed, so it still named Work — and clicking the desktop sent the ring,
+        // and the next window, back to a capsule the window had left.
+        store.add(940, to: study)
+        store.windows = []
+        store.noteWindowRefs([])
+        check("the last capsule worked in follows the window that moved",
+              store.activeGroupID == study, "\(store.groups.first { $0.id == store.activeGroupID }?.name ?? "?")")
+
+        // Clicking a launcher inside a capsule makes that capsule active, which is
+        // what makes "the window opens in Work" true without an exception in the
+        // placement rule.
+        store.windows = [window]
+        store.noteWindowRefs(store.windows)
+        store.focusedWindowID = 940
+        store.settleFocusForTesting()
+        store.noteWorkingIn(work)
+        check("clicking a capsule's launcher makes it active", store.activeGroupID == work)
+        check("and a window opened after that click lands there",
+              store.captureTarget(focusHint: 940) == work)
+    }
+
+    private static func launcherIsUniqueAndStaysPut() {
+        let store = freshStore()
+        guard store.groups.count >= 3 else { return check("two capsules exist", false) }
+        let work = store.groups[1].id
+        let study = store.groups[2].id
+        let mainID = store.main.id
+
+        // A genuinely running, Dock-worthy application: the candidate list is
+        // filtered on `activationPolicy == .regular` and cannot be faked.
+        guard let finder = NSWorkspace.shared.runningApplications
+            .first(where: { $0.bundleIdentifier == "com.apple.finder" }) else {
+            check("Finder is running to stand in for a closed-window app", false)
+            return
+        }
+        let pid = finder.processIdentifier
+
+        func launcherCapsules() -> [UUID] {
+            store.groups
+                .map(\.id)
+                .filter { id in
+                    items(store, in: id).contains { $0.launcherBundleID == "com.apple.finder" }
+                }
+        }
+        func settle(hasWindows: Bool) {
+            store.sampleRunningApps(windowOwnerPIDs: hasWindows ? [pid] : [], force: true)
+            store.updateLaunchers()
+        }
+
+        let inWork = WindowInfo.testInstance(id: 910, bundleID: "com.apple.finder",
+                                             title: "Work doc", pid: pid)
+        let inMain = WindowInfo.testInstance(id: 911, bundleID: "com.apple.finder",
+                                             title: "Main doc", pid: pid)
+        store.windows = [inWork, inMain]
+        store.noteWindowRefs(store.windows)
+        store.add(910, to: work)
+        check("the fixture really is split across two capsules",
+              store.isMember(910, of: work) && !store.isMember(911, of: work))
+        settle(hasWindows: true)
+        check("no launcher while the application still has a window",
+              launcherCapsules().isEmpty, "\(launcherCapsules().count)")
+
+        // Close Work's. Main's window survives, so the application is still alive
+        // on the strip and *nothing* appears — Work simply has no Finder on it.
+        store.windows = [inMain]
+        store.noteWindowRefs(store.windows)
+        settle(hasWindows: true)
+        check("closing one window while another lives creates no launcher",
+              launcherCapsules().isEmpty, "\(launcherCapsules().count)")
+
+        // Close the last one. Main held it, so Main gets the launcher — not Work,
+        // which held a Finder window earlier and lost it first.
+        store.windows = []
+        settle(hasWindows: false)
+        check("the launcher is born where the last window lived",
+              launcherCapsules() == [mainID], "\(launcherCapsules().count) capsule(s)")
+
+        // Sticky: a window opening somewhere else does not retract it.
+        let inStudy = WindowInfo.testInstance(id: 912, bundleID: "com.apple.finder",
+                                              title: "Study doc", pid: pid)
+        store.windows = [inStudy]
+        store.noteWindowRefs(store.windows)
+        store.add(912, to: study)
+        settle(hasWindows: true)
+        check("a window opening elsewhere leaves the launcher alone",
+              launcherCapsules() == [mainID], "\(launcherCapsules().map { _ in "x" }.count)")
+
+        // Unique: closing that one makes Study the last capsule to hold a window,
+        // but Finder already has a launcher, so no second one is created.
+        store.windows = []
+        settle(hasWindows: false)
+        check("no second launcher is ever created",
+              launcherCapsules() == [mainID], "\(launcherCapsules().count) capsule(s)")
+
+        // Reclaimed only by its own capsule getting a real window back.
+        let backInMain = WindowInfo.testInstance(id: 913, bundleID: "com.apple.finder",
+                                                 title: "Main again", pid: pid)
+        store.windows = [backInMain]
+        store.noteWindowRefs(store.windows)
+        settle(hasWindows: true)
+        check("the launcher goes when its own capsule gets a window back",
+              launcherCapsules().isEmpty, "\(launcherCapsules().count)")
     }
 
     /// Two copies of one application installed side by side are two Dock icons,
@@ -955,8 +1120,11 @@ enum SelfTest {
         // Focus history: 12 first, then 10, then 11 — so most-recently-used is
         // 11, 10, 12 and is deliberately *not* the strip order.
         store.focusedWindowID = 12
+        store.settleFocusForTesting()
         store.focusedWindowID = 10
+        store.settleFocusForTesting()
         store.focusedWindowID = 11
+        store.settleFocusForTesting()
         return (store, group, [a, b, c, d])
     }
 
@@ -995,6 +1163,7 @@ enum SelfTest {
         // The property that matters: focus moves, the list does not. In
         // most-recently-used order this same sequence reorders the array.
         store.focusedWindowID = 13
+        store.settleFocusForTesting()
         let second = store.cycleCandidates(appOnly: false)
         check("the order is unchanged after focus moves",
               second.map(\.id) == first.map(\.id), "\(second.map(\.id))")
@@ -1015,6 +1184,7 @@ enum SelfTest {
         let candidates = store.cycleCandidates(appOnly: false)   // [10, 11, 12, 13]
 
         store.focusedWindowID = 11
+        store.settleFocusForTesting()
         check("a tap moves one along from where you are",
               store.cycleStartIndex(candidates, reversed: false) == 2)
         check("shift-tap moves one back",
@@ -1022,14 +1192,17 @@ enum SelfTest {
 
         // Wrapping, at both ends.
         store.focusedWindowID = 13
+        store.settleFocusForTesting()
         check("a tap from the last entry wraps to the first",
               store.cycleStartIndex(candidates, reversed: false) == 0)
         store.focusedWindowID = 10
+        store.settleFocusForTesting()
         check("shift-tap from the first wraps to the last",
               store.cycleStartIndex(candidates, reversed: true) == 3)
 
         // Cycling *into* a group you are not standing in has no current position.
         store.focusedWindowID = 999
+        store.settleFocusForTesting()
         check("with no position in the list it starts at the near end",
               store.cycleStartIndex(candidates, reversed: false) == 0)
     }
@@ -1045,6 +1218,7 @@ enum SelfTest {
 
         // Standing inside the group: its windows of this app, either way.
         store.focusedWindowID = 11
+        store.settleFocusForTesting()
         store.appCycleStaysInGroup = true
         check("in the group, app cycling is the group's windows of that app",
               store.cycleCandidates(appOnly: true).map(\.id) == [10, 11, 12],
@@ -1058,6 +1232,7 @@ enum SelfTest {
         store.windows = store.windows + [outside]
         store.noteWindowRefs(store.windows)
         store.focusedWindowID = 14
+        store.settleFocusForTesting()
 
         store.appCycleStaysInGroup = true
         check("staying put offers only the capsule's one window",
@@ -1072,6 +1247,7 @@ enum SelfTest {
         // With more than one of the app here, the setting must make no
         // difference at all — the capsule is the scope either way.
         store.focusedWindowID = 11
+        store.settleFocusForTesting()
         check("a capsule with several of the app ignores the setting",
               store.cycleCandidates(appOnly: true).map(\.id) == [10, 11, 12],
               "\(store.cycleCandidates(appOnly: true).map(\.id))")
@@ -1083,6 +1259,7 @@ enum SelfTest {
         store.windows = store.windows + [lonely]
         store.noteWindowRefs(store.windows)
         store.focusedWindowID = 15
+        store.settleFocusForTesting()
         check("an app with one window offers just that window",
               store.cycleCandidates(appOnly: true).map(\.id) == [15],
               "\(store.cycleCandidates(appOnly: true).map(\.id))")
@@ -1119,6 +1296,7 @@ enum SelfTest {
         store.add(40, to: work)
 
         store.focusedWindowID = 21
+        store.settleFocusForTesting()
         store.cycleOrder = .stripOrder
 
         let candidates = store.cycleCandidates(appOnly: true)
@@ -1131,6 +1309,7 @@ enum SelfTest {
 
         // Standing in the other capsule, the same key offers that capsule's three.
         store.focusedWindowID = 31
+        store.settleFocusForTesting()
         check("standing in the other capsule offers its three instead",
               store.cycleCandidates(appOnly: true).map(\.id) == [30, 31, 32],
               "\(store.cycleCandidates(appOnly: true).map(\.id))")
@@ -1138,6 +1317,7 @@ enum SelfTest {
         // And from Main, only what Main holds — the catch-all is a capsule like
         // any other, not a view of everything.
         store.focusedWindowID = 41
+        store.settleFocusForTesting()
         check("cycling from Main offers only Main's windows",
               store.cycleCandidates(appOnly: true).map(\.id) == [41],
               "\(store.cycleCandidates(appOnly: true).map(\.id))")
@@ -1169,6 +1349,7 @@ enum SelfTest {
 
         store.cycleOrder = .stripOrder
         store.focusedWindowID = 51
+        store.settleFocusForTesting()
 
         // ⌃`: every window in the capsule, across apps.
         check("cycling all windows is scoped to the focused capsule",
@@ -1181,6 +1362,7 @@ enum SelfTest {
 
         // Standing in the other capsule scopes to that one instead.
         store.focusedWindowID = 60
+        store.settleFocusForTesting()
         check("a different capsule scopes to itself",
               store.cycleCandidates(appOnly: false).map(\.id) == [60, 61],
               "\(store.cycleCandidates(appOnly: false).map(\.id))")
@@ -1188,6 +1370,7 @@ enum SelfTest {
         // Main is a capsule like any other, and the windows nothing claims are
         // exactly the ones it holds.
         store.focusedWindowID = 70
+        store.settleFocusForTesting()
         check("an unclaimed window cycles Main",
               store.cycleCandidates(appOnly: false).map(\.id) == [70, 71],
               "\(store.cycleCandidates(appOnly: false).map(\.id))")
@@ -1196,6 +1379,7 @@ enum SelfTest {
         // cycle to everything the moment a group was collapsed.
         store.setCollapsed(true, for: other)
         store.focusedWindowID = 60
+        store.settleFocusForTesting()
         check("a collapsed capsule still scopes the cycle",
               store.cycleCandidates(appOnly: false).map(\.id) == [60, 61],
               "\(store.cycleCandidates(appOnly: false).map(\.id))")
@@ -1342,7 +1526,9 @@ enum SelfTest {
         // that ignored the group would put it first — and clicking the tile would
         // open it.
         store.focusedWindowID = 901
+        store.settleFocusForTesting()
         store.focusedWindowID = 950
+        store.settleFocusForTesting()
 
         let ordered = store.stackWindowsByRecency(stack.windows)
         check("the stack's order never leaves the group",
@@ -1708,11 +1894,13 @@ enum SelfTest {
         // `orderedByRecency` guards a race the harness cannot produce, since
         // every focus change here updates `mruOrder` before anything reads it.
         store.focusedWindowID = 410
+        store.settleFocusForTesting()
         check("the entry you are in leads",
               store.switchEntries().first?.windows.first?.id == 410,
               "\(store.switchEntries().first?.title ?? "-")")
         // Focus inside a stack promotes the *stack*, not one of its windows.
         store.focusedWindowID = 403
+        store.settleFocusForTesting()
         let promoted = store.switchEntries().first
         check("focusing a window inside a stack promotes the stack",
               promoted?.count == 5 && promoted?.groupID == work,
@@ -1758,7 +1946,9 @@ enum SelfTest {
         store.combine(503, into: 502, in: group)
         // 501 is the most recently used of the stack's two windows.
         store.focusedWindowID = 500
+        store.settleFocusForTesting()
         store.focusedWindowID = 501
+        store.settleFocusForTesting()
 
         let entries = store.switchEntries()
         guard let stack = entries.first(where: { $0.item.isStack }),
@@ -1850,9 +2040,15 @@ enum SelfTest {
         let third = IconCache.menuIcon(pid: pid)
         check("forgetting a pid drops its menu icon too", third !== first)
     }
-
     // MARK: - Where a new window lands
 
+    /// The single placement rule: a new window joins the capsule being worked in.
+    ///
+    /// There is deliberately no notion of a focus being "settled" any more. That
+    /// existed to arbitrate against dead slots that tried to claim windows back,
+    /// and nothing claims windows back — so the walk back through recent focus,
+    /// and the two-second age threshold that decided which focus counted, are
+    /// both gone. `focusHint` is simply the focus from before this pass.
     private static func capturing() {
         let store = freshStore()
         guard store.groups.count >= 3 else { return check("two groups exist", false) }
@@ -1866,234 +2062,108 @@ enum SelfTest {
         store.add(100, to: working)
         store.add(101, to: other)
 
-        // Focus decides — and focus that only just changed is treated as the app
-        // being activated rather than as where you were working. Opening a
-        // document activates its application, which raises that app's *other*
-        // window a moment before the new one exists.
-        store.focusedWindowID = 100                 // settled: you were here
-        store.settleFocusForTesting(100)
-        store.focusedWindowID = 101                 // just now raised by a launch
-        check("a window that just took focus is not trusted",
-              store.captureTarget(focusHint: 101) == working,
-              "\(String(describing: store.captureTarget(focusHint: 101)))")
-
-        // But a window you have genuinely been using is.
-        store.settleFocusForTesting(101)
-        check("a settled window is trusted",
+        store.focusedWindowID = 100
+        store.settleFocusForTesting()
+        check("the capsule of the focused window is the target",
+              store.captureTarget(focusHint: 100) == working,
+              "\(String(describing: store.captureTarget(focusHint: 100)))")
+        check("and it follows focus to another capsule",
               store.captureTarget(focusHint: 101) == other)
 
-        // Main is a real answer, not the absence of one. Returning "no target"
-        // here would mean "no intent", and no intent is exactly what lets a
-        // stale slot in another capsule seize the window.
+        // Main is a real answer, not the absence of one.
         let loose = WindowInfo.testInstance(id: 102, bundleID: "com.reader", title: "In Main")
         store.windows = [mine, theirs, loose]
         store.noteWindowRefs([mine, theirs, loose])
         store.focusedWindowID = 102
-        store.settleFocusForTesting(102)
+        store.settleFocusForTesting()
         check("working in Main files new windows into Main",
               store.captureTarget(focusHint: 102) == store.main.id,
               "\(String(describing: store.captureTarget(focusHint: 102)))")
 
-        // The whole point of the derived active group, asserted end to end: a
-        // window created while a Work window is focused is filed into Work, and
-        // one created from Main stays in Main. Both directions, because a test
-        // of one alone passes with the derivation hardcoded.
-        // Auto-capture is paused for 20s after launch, which is the whole
-        // lifetime of this process — without lifting it, nothing below captures
-        // anything and both checks pass vacuously.
+        // Focus on something the strip does not draw — a desktop click, or an
+        // application that is frontmost before it has a window. The last capsule
+        // genuinely worked in stands; without this a desktop click would quietly
+        // move you to Main and the next window opened would land there.
+        store.focusedWindowID = 100
+        store.settleFocusForTesting()
+        check("the last real capsule is remembered", store.activeGroup.id == working)
+        store.focusedWindowID = 999           // not a window on the strip
+        check("focus on nothing keeps the last capsule active",
+              store.activeGroup.id == working, "\(store.activeGroup.name)")
+        check("and a window opened then still lands there",
+              store.captureTarget(focusHint: 999) == working,
+              "\(String(describing: store.captureTarget(focusHint: 999)))")
+
+        // End to end, both directions — a test of one alone passes with the
+        // derivation hardcoded. Auto-capture is paused for 20s after launch,
+        // which is this whole process, so it has to be lifted first.
         store.endLaunchGraceForTesting()
         store.focusedWindowID = 100
-        store.settleFocusForTesting(100)
+        store.settleFocusForTesting()
         let born = WindowInfo.testInstance(id: 103, bundleID: "com.editor", title: "New")
         store.windows = [mine, theirs, loose, born]
         store.noteWindowRefs(store.windows)
+        store.settleFocusForTesting()
         store.captureNewWindows([103], focusHint: 100)
         check("a window opened from Work joins Work", store.isMember(103, of: working),
               "\(store.group(of: 103).name)")
 
         store.focusedWindowID = 102
-        store.settleFocusForTesting(102)
+        store.settleFocusForTesting()
         let born2 = WindowInfo.testInstance(id: 104, bundleID: "com.editor", title: "New 2")
         store.windows = store.windows + [born2]
         store.noteWindowRefs(store.windows)
+        store.settleFocusForTesting()
         store.captureNewWindows([104], focusHint: 102)
         check("a window opened from Main stays in Main", store.isMember(104, of: store.main.id),
               "\(store.group(of: 104).name)")
     }
 
-    /// A window the server reports as *created* must not be re-claimed by the
-    /// appeared path, which carries no capture intent. The created path refuses
-    /// a foreign group's stale slot; without the exclusion the very next call
-    /// handed the window over anyway.
+    /// The guarantee the whole change exists for: a dead slot in another capsule
+    /// cannot take a newly opened window, however well it matches.
     ///
-    /// The frames matter: `sharesFrame` is what makes the claim possible, and an
-    /// earlier version of this test left them nil, so it passed while proving
-    /// nothing — the claim could never have happened either way.
-    private static func appearedExcludesCreated() {
-        let rect = CGRect(x: 100, y: 100, width: 757, height: 559)
-
-        func scenario(excludeCreated: Bool) -> AppStore {
-            let store = freshStore()
-            guard store.groups.count >= 3 else { return store }
-            let relic = store.groups[2].id
-
-            let dead = WindowInfo.testInstance(id: 200, bundleID: "com.browser",
-                                               title: "Old tab", frame: rect)
-            let here = WindowInfo.testInstance(id: 201, bundleID: "com.editor",
-                                               title: "Working here", frame: rect)
-            store.windows = [dead, here]
-            store.noteWindowRefs([dead, here])
-            store.add(200, to: relic)
-
-            store.rebindAppearedWindows()          // baseline of what is visible
-            store.windows = [here]                 // the relic's window closes
-            store.rebindAppearedWindows()
-
-            // A brand-new window of the same app, same size, arrives.
-            let fresh = WindowInfo.testInstance(id: 202, bundleID: "com.browser",
-                                                title: "New tab", frame: rect)
-            store.windows = [here, fresh]
-            store.noteWindowRefs([here, fresh])
-            store.rebindAppearedWindows(excluding: excludeCreated ? [202] : [])
-            return store
-        }
-
-        // The control: without the exclusion the seizure really does happen, so
-        // the assertion below is testing something.
-        let unguarded = scenario(excludeCreated: false)
-        guard unguarded.groups.count >= 3 else { return check("two groups exist", false) }
-        check("the seizure is reachable without the exclusion",
-              unguarded.isMember(202, of: unguarded.groups[2].id))
-
-        let guarded = scenario(excludeCreated: true)
-        check("a created window is not claimed by the appeared path",
-              !guarded.isMember(202, of: guarded.groups[2].id))
-    }
-
-    /// Switching a tab must only ever reclaim the slot that tab *just* vacated.
-    /// Two TextEdit windows of equal size made every other dead same-app slot a
-    /// valid match, because `sharesFrame` compares geometry alone — so a tab
-    /// switch in one window moved it into whichever group held a stale slot for
-    /// the other, sometimes into several groups at once.
-    private static func tabSwitchKeepsItsOwnSlot() {
+    /// This is the bug that took three wrong fixes and fed itself — a seized
+    /// window died in the wrong capsule, leaving a fresh slot for the next one.
+    /// It is now unrepresentable rather than arbitrated, so the test is short.
+    private static func aDeadSlotNeverClaimsANewWindow() {
         let store = freshStore()
         guard store.groups.count >= 3 else { return check("two groups exist", false) }
-        let mine = store.groups[1].id      // where the tabbed window lives
-        let other = store.groups[2].id     // holds a stale slot for the *other* window
-
-        // Both TextEdit windows are exactly the same size — the normal case.
-        let rect = CGRect(x: 0, y: 0, width: 757, height: 559)
-        let tabA = WindowInfo.testInstance(id: 300, bundleID: "com.textedit",
-                                           title: "Notes", frame: rect)
-        let windowB = WindowInfo.testInstance(id: 301, bundleID: "com.textedit",
-                                              title: "Draft", frame: rect)
-        store.windows = [tabA, windowB]
-        store.noteWindowRefs([tabA, windowB])
-        store.add(300, to: mine)
-        store.add(301, to: other)
-        store.rebindAppearedWindows()
-
-        // Window B closes, leaving a stale slot in `other`. Then a tab switch in
-        // the first window: 300 goes off screen, 302 comes on at the same rect.
-        //
-        // `noteWindowRefs` on each pass because that is what the app does — it
-        // was moved outside the equality guard precisely so every tick refreshes
-        // `lastSeenAt` and `lastFrameOf`. Without it here both dead slots carry
-        // the same timestamp and the most-recently-seen tiebreak has nothing to
-        // work with, which is a defect in the fixture, not in the rule.
-        store.windows = [tabA]
-        store.noteWindowRefs([tabA])
-        store.rebindAppearedWindows()
-
-        let tabB = WindowInfo.testInstance(id: 302, bundleID: "com.textedit",
-                                           title: "Shopping list", frame: rect)
-        store.windows = [tabB]
-        store.noteWindowRefs([tabB])
-        store.rebindAppearedWindows()
-
-        check("the arriving tab keeps its own group", store.isMember(302, of: mine))
-        check("the arriving tab does not join the other window's group",
-              !store.isMember(302, of: other),
-              "302 is in \(store.group(of: 302).name)")
-    }
-
-    /// A new window is usually *not* in `windows` on the tick it is reported
-    /// created — Accessibility describes it a beat later. It therefore appears on
-    /// the following tick, when `created` is empty, and the appeared path (which
-    /// carries no capture intent) claimed it for whatever group held a stale slot.
-    private static func lateDescribedWindowKeepsIntent() {
-        let store = freshStore()
-        guard store.groups.count >= 3 else { return check("two groups exist", false) }
+        let working = store.groups[1].id
         let relic = store.groups[2].id
-        let rect = CGRect(x: 40, y: 40, width: 757, height: 559)
+        store.endLaunchGraceForTesting()
 
-        let dead = WindowInfo.testInstance(id: 600, bundleID: "com.browser",
+        // An identical window of the same app, same title, same frame, filed in
+        // another capsule and closed a moment ago. Every signal the old matcher
+        // used points at `relic`.
+        let rect = CGRect(x: 40, y: 40, width: 757, height: 559)
+        let dead = WindowInfo.testInstance(id: 700, bundleID: "com.browser",
                                            title: "New Tab", frame: rect)
-        let here = WindowInfo.testInstance(id: 601, bundleID: "com.editor",
+        let here = WindowInfo.testInstance(id: 701, bundleID: "com.editor",
                                            title: "Working here", frame: rect)
         store.windows = [dead, here]
         store.noteWindowRefs([dead, here])
-        store.add(600, to: relic)
-        store.rebindAppearedWindows()
+        store.add(700, to: relic)
+        store.add(701, to: working)
+        check("the relic slot really is set up", store.isMember(700, of: relic))
 
-        store.windows = [here]                  // the relic's window closes
-        store.rebindAppearedWindows()
+        store.windows = [here]                      // the relic's window closes
+        store.focusedWindowID = 701                 // you are working in `working`
 
-        // Tick N: the server reports 602 created, but AX has not described it yet
-        // so it is absent from `windows`.
-        store.rebindAppearedWindows(excluding: [602])
-
-        // Tick N+1: it is described, and `created` is empty this time.
-        let fresh = WindowInfo.testInstance(id: 602, bundleID: "com.browser",
+        let fresh = WindowInfo.testInstance(id: 702, bundleID: "com.browser",
                                             title: "New Tab", frame: rect)
         store.windows = [here, fresh]
         store.noteWindowRefs([here, fresh])
-        store.rebindAppearedWindows()
+        store.settleFocusForTesting()
+        store.captureNewWindows([702], focusHint: 701)
 
-        check("a late-described new window is not seized by a relic group",
-              !store.isMember(602, of: relic),
-              "602 is in \(store.group(of: 602).name)")
+        check("a new window joins the capsule being worked in",
+              store.isMember(702, of: working), "702 is in \(store.group(of: 702).name)")
+        check("and is not seized by the matching dead slot",
+              !store.isMember(702, of: relic))
+        check("it lands in exactly one capsule",
+              store.groups.filter { !$0.isMain && $0.memberIDs.contains(702) }.count == 1)
     }
 
-    /// A window coming into view with nothing recently vacated has no slot to
-    /// inherit. The restriction used to be inferred from `vanished` being empty,
-    /// which silently meant "any dead slot, in every group" — reachable just by
-    /// returning from a fullscreen app.
-    ///
-    /// Pins the behaviour, not one mechanism: two things now enforce it (the
-    /// early-out in `rebindAppearedWindows` and the candidate pool in
-    /// `rebindReopenedWindows`), so removing either alone leaves this passing.
-    /// Measured, not assumed.
-    private static func arrivalWithNothingVacated() {
-        let store = freshStore()
-        guard store.groups.count >= 3 else { return check("two groups exist", false) }
-        let a = store.groups[1].id
-        let b = store.groups[2].id
-        let rect = CGRect(x: 10, y: 10, width: 900, height: 600)
-
-        let ghostA = WindowInfo.testInstance(id: 700, bundleID: "com.app", title: "Doc", frame: rect)
-        let anchor = WindowInfo.testInstance(id: 701, bundleID: "com.other", title: "Anchor", frame: rect)
-        store.windows = [ghostA, anchor]
-        store.noteWindowRefs([ghostA, anchor])
-        store.add(700, to: a)
-        store.rebindAppearedWindows()
-
-        // 700 closes and its disappearance ages out of the grace window.
-        store.windows = [anchor]
-        store.rebindAppearedWindows()
-        store.forgetArrivalsForTesting()
-
-        // Now a window appears with nothing having vanished alongside it.
-        let arriving = WindowInfo.testInstance(id: 702, bundleID: "com.app", title: "Doc", frame: rect)
-        store.windows = [anchor, arriving]
-        store.noteWindowRefs([anchor, arriving])
-        store.rebindAppearedWindows()
-
-        check("an arrival with nothing vacated claims nothing",
-              store.group(of: 702).isMain,
-              "702 is in \(store.group(of: 702).name)")
-        check("and the other capsule did not take it either", !store.isMember(702, of: b))
-    }
 
     /// A folded group is absent from `sections`, so seeding a fresh arrangement
     /// from there gave it an empty row and the first drag did nothing visible
