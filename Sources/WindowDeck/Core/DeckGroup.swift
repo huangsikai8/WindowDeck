@@ -72,6 +72,45 @@ enum OrderRef: Codable, Hashable {
     /// changed under you. Adding a case is safe (an old file has none of them);
     /// changing one is what wipes a file.
     case stacked(String)
+    /// A hand-made cluster, by its own id — which is persisted and stable across
+    /// relaunches, so it means the same thing after one as before.
+    ///
+    /// The cluster used to have no case here because it borrowed its *first live
+    /// member's* window key. That is a key which changes under it: close the
+    /// window at the front of a cluster and the whole tile re-keys to the next
+    /// member, landing wherever that window happened to sit in the arrangement —
+    /// or, if the cluster fell below two live members and unfolded, the survivor
+    /// was drawn at its own old position. Either way the tile jumped across the
+    /// capsule on a close, which is exactly the failure `.stacked` exists to
+    /// prevent for an application. A cluster is a slot the user made by hand, so
+    /// it holds one position for its whole life.
+    case cluster(String)
+}
+
+/// One slot of a saved arrangement while that arrangement is being restored.
+///
+/// The slot exists because a saved arrangement comes back in pieces. Windows
+/// reappear over tens of seconds after a reboot, and even a rebuild has apps
+/// that time out on Accessibility for a tick or two — so restore is spread over
+/// many passes, and it used to *append* each entry as it matched. The row was
+/// then in the sequence the windows happened to arrive rather than the sequence
+/// they were left in. Keeping the whole saved list, and recording which order
+/// key each entry bound to, is what lets a late arrival be put back in its own
+/// place instead of on the end.
+///
+/// Runtime only: this never reaches the file. `AppStore.orderSnapshot` renders
+/// it back to `[OrderRef]`, which is the persisted shape and is unchanged.
+struct RestoreSlot: Hashable {
+    let ref: OrderRef
+    /// The `DeckGroup.order` key this slot bound to once its item was back, or
+    /// nil while it is still waiting. A bound slot holds the position of its
+    /// still-waiting neighbours; it is dropped when its key leaves the row.
+    var key: String?
+
+    init(_ ref: OrderRef, key: String? = nil) {
+        self.ref = ref
+        self.key = key
+    }
 }
 
 /// A named arrangement of windows — "Work", "Study", and so on.
@@ -108,9 +147,15 @@ struct DeckGroup: Identifiable, Hashable {
     /// Snapshot for restore. Entries are removed as they are matched, so a
     /// window the user later removes by hand is never silently re-added.
     var savedMembers: [MemberRef]
-    /// The manual arrangement, saved the same way membership is. Consumed as it
-    /// is matched, so the restored order is rebuilt in the sequence it was left.
-    var savedOrder: [OrderRef]
+    /// The manual arrangement, saved the same way membership is — one slot per
+    /// saved position, each binding to an order key as its item comes back.
+    ///
+    /// Entries are *not* consumed as they match. They were, and the position
+    /// went with them: a pin or a stack binds on the first pass, having nothing
+    /// to wait for, while every window waits for its application, so appending
+    /// as they matched sent every launcher to the far left of its capsule on
+    /// every relaunch. See `RestoreSlot`.
+    var savedOrder: [RestoreSlot]
     /// Windows collapsed into single icons within this group. Group-scoped by
     /// construction: clustering in one group leaves the others untouched.
     var clusters: [WindowCluster]
@@ -172,7 +217,7 @@ struct DeckGroup: Identifiable, Hashable {
         self.customColorHex = customColorHex
         self.isCollapsed = isCollapsed
         self.savedMembers = savedMembers
-        self.savedOrder = savedOrder
+        self.savedOrder = savedOrder.map { RestoreSlot($0) }
         self.clusters = clusters
         self.isMain = isMain
     }

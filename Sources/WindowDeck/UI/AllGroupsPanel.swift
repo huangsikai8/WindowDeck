@@ -141,7 +141,8 @@ final class AllGroupsModel {
                 // Through the store, so Main's implicit membership — everything
                 // no other capsule claims — is answered the same way here as on
                 // the strip rather than being worked out a second time.
-                windows: Self.ordered(store.windows(in: group), by: store.order(in: group.id)))
+                windows: Self.ordered(store.windows(in: group), by: store.order(in: group.id),
+                                      slot: { store.slotKey(forWindow: $0, in: group.id) }))
         }
     }
 
@@ -157,7 +158,11 @@ final class AllGroupsModel {
     /// Windows only, so the app is the window's own. The strip's version has to
     /// answer for clusters, stacks and launchers as well, which is why the
     /// identity lives on `DeckItem` there rather than being shared with this.
-    static func ordered(_ windows: [WindowInfo], by order: [String]) -> [WindowInfo] {
+    /// `slot` answers which key a window ranks by, which is its own unless it is
+    /// in a cluster — a cluster holds one slot for its whole life and its members
+    /// rank there, exactly as the strip ranks them.
+    static func ordered(_ windows: [WindowInfo], by order: [String],
+                        slot: (CGWindowID) -> String = { "w\($0)" }) -> [WindowInfo] {
         let rank = Dictionary(order.enumerated().map { ($1, $0) },
                               uniquingKeysWith: { first, _ in first })
 
@@ -168,10 +173,10 @@ final class AllGroupsModel {
         // anything observable. It stays because the contract, not the
         // implementation, is what a future toolchain will honour.
         var placed = windows.enumerated()
-            .filter { rank["w\($0.element.id)"] != nil }
+            .filter { rank[slot($0.element.id)] != nil }
             .sorted { a, b in
-                let ra = rank["w\(a.element.id)"] ?? Int.max
-                let rb = rank["w\(b.element.id)"] ?? Int.max
+                let ra = rank[slot(a.element.id)] ?? Int.max
+                let rb = rank[slot(b.element.id)] ?? Int.max
                 return ra == rb ? a.offset < b.offset : ra < rb
             }
             .map(\.element)
@@ -181,7 +186,7 @@ final class AllGroupsModel {
             return a.appName == b.appName
         }
 
-        for window in windows where rank["w\(window.id)"] == nil {
+        for window in windows where rank[slot(window.id)] == nil {
             if let anchor = placed.lastIndex(where: { sameApp($0, window) }) {
                 placed.insert(window, at: anchor + 1)
             } else {

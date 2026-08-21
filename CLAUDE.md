@@ -92,6 +92,24 @@ is matched by looking inside it rather than by its order key: a cluster is order
 member's* window key, so a mixed-application cluster whose leading window belongs to something else
 would not match, and a window would be sent past its own siblings to the end of the row.
 
+**"Already on this row" is a question about what the capsule draws, never about what its arrangement
+still names.** The two come apart because a closed window's order key is kept on purpose — it is what
+holds a launcher's slot while the application runs — so resolving order keys through `knownRefs`
+matched windows that are *gone* and dropped the arriving window where they used to sit. Measured on
+the live state file: Actelligent's arrangement held Terminal keys at index 6 and index 20 of 21, both
+dead, and a Terminal opened there with no Terminal drawn on that row landed inside the row. Reported
+as "it popped up in one of the positions inside, remembering its previous pos".
+
+The same applies to a pin's key, which `unpin` deliberately leaves behind, so an unpinned app's key
+stands for nothing and must not attract a window either. Three kinds of key qualify: a window drawn in
+this capsule, a stack or pin that still exists, and — the one dead key that counts — the window whose
+slot a **launcher** is currently holding, because rule 1 gave the launcher that exact position and the
+arriving window is what replaces it. `updateLaunchers` retracts that launcher later in the same tick.
+
+The restore pass is the one thing that legitimately gives a window a remembered position, and it was
+deliberately left alone: it matches by same-boot window id, then app + exact title, for five minutes
+after launch, and putting a returning window back where it was is its entire job.
+
 ### Launchers
 
 A launcher is an app's icon on the strip with no window behind it. Three rules, in order:
@@ -100,16 +118,19 @@ A launcher is an app's icon on the strip with no window behind it. Three rules, 
    holding that window's exact position in the row.
 2. **If the app already has a launcher, no second one is ever created.** Closing a window of that app
    in some other capsule changes nothing.
-3. **A launcher never moves and never disappears on its own.** It stays until that capsule gets a real
-   window of that app back, or until the app quits entirely.
+3. **A launcher never moves, and it lasts exactly as long as its app owns no window anywhere.** It
+   does not migrate between capsules while it stands; it goes the moment that app has a window again,
+   in this capsule or any other, or when the app quits entirely.
 
-So an app has **at most one launcher at any moment**, and closing order decides where it lands — once.
-After that it sits still. Two consequences are deliberate and were confirmed directly:
+So an app has **at most one launcher at any moment**, closing order decides where it lands, and a
+launcher and a live window of the same app are **never on the strip together**. Two consequences are
+deliberate and were confirmed directly:
 
 * Closing Work's Chrome window while Chrome still has windows in Main shows **nothing** in Work.
   Chrome is still alive, so no launcher is created. Work simply has no Chrome on it.
-* A launcher in Main plus a live window in Study **at the same time** is correct and expected. Chrome
-  reopening somewhere else does not retract the launcher Main is holding.
+* Chrome going windowless gives Work a launcher; the next Chrome window, wherever it opens, takes that
+  launcher away. Closing every window again mints the single launcher afresh, in whichever capsule
+  held a window of it last.
 
 There is no special rule for Main. Main gets launchers exactly as Work and Study do, and the earlier
 idea that Main needed its own rule was a mistake — Main *did* hold those windows, it just happens not
@@ -131,15 +152,36 @@ That saved slot is read by `launcherBirthplace`, and it is an **unmatched `saved
 which is exactly "this capsule holds a slot for an app whose window is gone" written down. Nothing
 else on disk says it, and nothing else needs to.
 
-**Rule 3 only applies to a launcher a window left behind.** An app that was already running with no
-windows when WindowDeck started, or one still drawing its first window, has left no slot in any
-capsule: it falls back to Main *unanchored*, and it is retracted the moment its process owns a window
-again, wherever that window lands. Standing still there is what produced the one duplicate the rules
-are supposed to make impossible — measured on Slack, whose process started, sat windowless for a few
-seconds, took a launcher in Main, then drew its single window in Actelligent, leaving Main drawing a
-second Slack for the rest of the session. The distinction is only between a launcher that stands for a
-closed window and one that stands for nothing; the "launcher in Main plus a live window in Study"
-case above is the first kind and is untouched.
+**Rule 3 was once narrower, and the narrow version is what the rule now exists to prevent.**
+A launcher a closing window had left a slot behind for — an *anchored* one — used to stand still until
+its own capsule got a window of that app back, on the argument that a launcher in Main beside a live
+window in Study was a slot being held rather than a duplicate. Two measurements killed it, and both
+are the same shape: an app is windowless for a few seconds while it draws its first window, takes a
+launcher, and then opens that window somewhere else.
+
+* **Slack.** Process started, sat windowless, took a launcher in Main, drew its single window in
+  Actelligent. Main drew a second Slack for the rest of the session. Patched at the time by calling
+  that launcher *unanchored* — nothing had closed to leave it a slot — and retracting it as soon as
+  the process owned a window anywhere.
+* **VS Code.** The same thing through the one branch the patch could not cover. VS Code was relaunched
+  at 16:37; the outgoing process drained 4 → 1 → 0 windows, the incoming one sat windowless for
+  **eleven seconds**, and `launcherBirthplace` matches dead windows by *bundle id*, which spans
+  processes — so the new process inherited the departed one's last capsule and the slot counted as
+  anchored. Four real windows opened in Main eleven seconds later and nothing could retract the
+  launcher Actelligent held. Reported as "4 windows of vscode in main and 1 launcher in actelligent.
+  clearly wrong."
+
+Delaying the birth cannot fix the second one — the gap was eleven seconds — so the distinction went
+instead of being guarded again, and `LauncherSlot.anchored` with it. What is left is one rule with no
+cases in it, which is why it is stated in the present tense: a launcher means "this app is running
+with nothing open", and it lasts exactly as long as that is true.
+
+It also makes a whole class of misreading self-healing. The sweep reports zero windows for an app that
+timed out on Accessibility — **279 such moments in one session's log**, across Excel, Ice, Telegram,
+Word and more — and a launcher born from one now lasts a tick instead of the session.
+
+The cost, accepted: closing an app's last window in Work and then opening one in Main takes Work's
+launcher away rather than holding that slot for you.
 
 ### Tabs
 
@@ -786,7 +828,7 @@ a bundle id and run as two processes; `runningApps.windowless` is already judged
 the whole test for "this one has no windows". An extra guard asking whether the *bundle* had a live
 window re-created the original defect exactly — the copy whose window was closed was suppressed by the
 other copy's window, and only one of the two could ever hold a slot in a dictionary keyed by bundle.
-The reclaim check (`does this capsule have a window of it again`) is per pid for the same reason.
+The retraction check (`does this process own a window now`) is per pid for the same reason.
 `RunningApps.livePIDs` exists because "has this application quit" cannot be asked of `all`, which
 still holds the bundle id while the second copy runs.
 
@@ -833,9 +875,110 @@ drag and `placeInArrangement` reintroduced it for the first captured window: a p
 window is not in the drawn row, so seeding from that row alone dropped it, and when the window closed
 the pin returned unranked and was appended to the far right. Both now seed through `seededOrder`.
 
-**A cluster's order key is its first *live* member.** Matching on `memberIDs.first` missed any cluster
-whose leading window had been closed, and the arriving window was sent past its own siblings to the
-end of the row.
+**A cluster's order key used to be its first *live* member, and that key moves under the tile.**
+Two separate jumps came out of it, and both were reported as one thing — "2 stacked together, I close
+one, and it jumps from one position to the other in the capsule". Closing the window at the *front* of
+a cluster re-keyed the whole tile to the next member, so it was drawn wherever that window happened to
+sit in the arrangement. And a cluster that falls below the two live windows `foldClusters` needs
+unfolds into a plain entry, which ranked at the survivor's own pre-cluster position — or, if the
+survivor never had one, at the far right of the capsule.
+
+A cluster is a slot the user made by hand, so it now holds **one key for its whole life**: `c<uuid>`,
+its own id, which is already persisted and means the same thing after a relaunch as before one. This
+is the same rule `.appStack` has and for the same reason. Four halves are load-bearing and the
+self-test fails on each alone:
+
+* **`combine` claims the slot** (`claimClusterSlot`), taking **its lead member's** place and dropping
+  the members' own keys, because a cluster with no key is unranked and `applyManualOrder` has nowhere
+  to put an unranked item but the end of the row. Dissolving, detaching and pruning hand it back
+  (`releaseClusterSlot`), or the windows it was holding are unranked and swept to the end.
+
+  **Which member's place is not a detail, and `stackApp`'s answer is the wrong one to copy.** A stack
+  takes its *leftmost* member's slot because a stack has no lead. A cluster has one: `combine` puts
+  the drop target first precisely because it is "the one that stays put", and `DeckItem.orderKey`
+  drew the tile at that member's slot for as long as clusters existed. Copying the leftmost rule
+  moved the tile — dropping a window onto a target further along the row rebuilt the cluster back at
+  the first window's place, and every cluster already on disk was swept to its leftmost member's
+  position the first time it adopted a slot. Reported immediately, as the cluster looking wrong on
+  the strip. `clusterStandsWhereItsLeadDoes` asserts both the making and the adoption, and it needs a
+  fixture of its own: the two rules agree whenever the lead happens to be the leftmost tile, which is
+  every other cluster fixture in the suite.
+
+  The position adoption gets wrong is **not recoverable** — it consumes the member keys that recorded
+  it — which is the argument for getting a one-shot conversion right rather than iterating on it.
+* **`rankKey` aliases a loose member to the cluster's key**, which is what keeps the survivor of an
+  unfolded cluster where the cluster stood. Checked *before* the stack rule, the same precedence
+  `foldAppStacks` gets by running over `foldClusters`' output.
+* **`draggedKey` translates it too**, or dragging that survivor writes `w<id>` while the row goes on
+  ranking `c<id>` and the tile snaps back.
+* **`OrderRef.cluster` carries it to disk.** Without a case there `orderSnapshot` silently drops the
+  key and the cluster comes back on the far right — the loss is invisible until one relaunch later,
+  which is exactly how the app-stack version of this hid.
+
+**And a cluster on disk today names its lead member, so it needs adopting rather than migrating.**
+Every existing file describes a cluster's position as a `.window` ref for its leading window, because
+that was the key. Once the cluster ranks by its own id that restored `w<lead>` key stands for a window
+drawn *inside* the cluster and therefore ranks nothing — so every existing cluster would have gone to
+the end of its capsule on the first relaunch after this change. `adoptClusterSlots` swaps the key the
+arrangement already holds, in place, which makes it a no-op instead of a migration with a shape of its
+own. It only fires when the arrangement genuinely names one of the cluster's windows: a cluster it
+says nothing about has no slot today either — mid-restore, most obviously — and appending one would
+freeze it at the end of the row, which is the thing being prevented. Verified against a copy of the
+live state file: both clusters adopted, every group, pin, stack and setting unchanged.
+
+**A window filed by hand was never given a place, so it followed its siblings around for ever.**
+`flushPendingCaptures` gives a slot to a window that *opened* in a capsule; nothing gave one to a
+window moved there from the tile menu or dragged in from another capsule, so `add(_:to:)` wrote
+membership and stopped. An unranked item is drawn beside whichever of its own application's windows
+are on the row — so it moved whenever they did, and went to the far right of the capsule the moment
+the last of them closed. It did not survive a relaunch either: `orderSnapshot` only describes keys
+that are in `order`. `add` now places the window on arrival and drops the key it held in the capsule
+it left. A *closed* window's key still stays behind, deliberately — that is what holds a launcher's
+position — but a window that is alive and drawn elsewhere leaves nothing.
+
+The rule this settles, stated by the user: **decide once, then freeze.** A window is placed beside its
+own application's windows at the moment it arrives, however it arrived, and never moves again unless
+it is dragged.
+
+**`stackApp` never seeded the arrangement its own comment said it seeded.** It looked for the leftmost
+member key in `order` and, finding none in an empty arrangement, inserted the rule with no slot at
+all — and a stack with no slot is the same unranked item, swept to the end of the row when it drops
+to one window and unfolds.
+
+**A cluster's order key is its first *live* member.** *(Retired: see above. Kept for the failure it
+records.)* Matching on `memberIDs.first` missed any cluster whose leading window had been closed, and
+the arriving window was sent past its own siblings to the end of the row.
+
+**A saved arrangement comes back in pieces, so consuming it destroys it.** `restorePass` appended
+each saved entry as it matched, and `orderSnapshot` wrote `live + savedOrder` — between them the row
+ended up in the order the windows happened to *arrive* rather than the order they were left in, and a
+save landing mid-restore wrote that arrival order to disk. The next launch restored the scramble
+faithfully, so this presented as an arrangement drifting a little further every session rather than
+failing outright, and it survived a rewrite of the placement rules because the one existing test
+restored every window in a single pass, which is the one case that works.
+
+The two halves are not symmetrical, and that is the tell. A pin or a stack is a *rule* the group
+already carries, so it binds on the very first pass with nothing to wait for; every window waits for
+its application to be described. So each relaunch swept a capsule's launchers to the far left and
+strung its windows out behind them in start-up order. Measured on the live state file: Main's saved
+order led with three pins, a stack and three more pins, and all 49 of its windows followed.
+
+`DeckGroup.savedOrder` is `[RestoreSlot]` now — the whole saved list, each slot recording the order
+key it bound to — so a late arrival is *inserted* beside the nearest saved neighbour already standing
+in the row rather than appended, and `orderSnapshot` walks `order` with a cursor into those slots so
+an entry still waiting for its window is described in its own place. Three things this must keep:
+
+* **`savedOrder` is runtime only.** `OrderRef` is still exactly what reaches the file, which is why a
+  change of this size costs no migration — the one edit that has silently wiped the file is changing
+  a *persisted* field's type, and this is not one.
+* **A bound slot is dropped when its key leaves `order`.** That is what stops a deliberate removal
+  being undone on the next pass, and it is the same rule membership already follows.
+* **The snapshot's cursor only moves forward.** A window dragged during the five-minute restore window
+  consumes its own slot early and does not carry its still-absent neighbours along with it.
+
+`orderSurvivesAStaggeredRestore` and `arrangementDoesNotDriftAcrossRelaunches` cover it, and each half
+was verified by A/B — reverting the placement fails nine checks, reverting the snapshot fails two.
+The reverse-arrival case is the sharpest of them: appending gets it exactly backwards.
 
 ## Design decisions and why
 
@@ -1355,7 +1498,7 @@ an empty group showing nothing looks like a badge that failed to render.
 WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
 ```
 
-~336 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
+~383 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
 field type degrading rather than wiping the file, round-trips), ordering, restore matching, membership
 moves, capture of new windows, pruning, clustering, app stacks, switcher candidate ordering and scope,
 section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never

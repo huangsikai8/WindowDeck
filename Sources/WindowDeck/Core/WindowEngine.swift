@@ -382,8 +382,17 @@ final class WindowEngine {
                 return abs(frame.minX - visible.minX) <= 12 && abs(frame.minY - topInAX) <= 6
             }) else { continue }
 
+            // When the real Dock is showing, `visibleFrame` already stops above
+            // it — and the strip sits at the screen's actual bottom edge, hidden
+            // beneath that Dock, so no further reservation is owed for it. Only
+            // the sliver (if any) by which the strip's own band would poke above
+            // the Dock's height still needs to be reserved. Subtracting the full
+            // band unconditionally double-reserved: the Dock's clearance plus
+            // the strip's own, so a zoomed window stopped well above the Dock
+            // with visible empty space between them.
             let visible = screen.visibleFrame
-            let allowedHeight = visible.height - reservedBandHeight
+            let dockReservation = visible.minY - screen.frame.minY
+            let allowedHeight = visible.height - max(0, reservedBandHeight - dockReservation)
 
             guard frame.width >= visible.width - 12 else { continue }
             guard frame.height > allowedHeight + 2 else { continue }

@@ -54,16 +54,24 @@ enum DeckItem: Identifiable {
     var orderKey: String {
         switch self {
         case .window(let window): "w\(window.id)"
-        case .cluster(_, let members): members.first.map { "w\($0.id)" } ?? id
+        // The cluster itself, never its leading member. Keying on
+        // `members.first` is a key that moves under the tile: close the front
+        // window of a cluster and the whole thing re-keys to the next member and
+        // is drawn wherever *that* window sat in the arrangement, and a cluster
+        // that falls below two live members unfolds and draws its survivor at the
+        // survivor's own old position. Both jump the tile across the capsule on a
+        // close. A cluster is a slot the user made by hand, so — exactly like
+        // `.appStack` below — its key is good for its whole life however its
+        // windows come and go.
+        case .cluster(let cluster, _): "c\(cluster.id.uuidString)"
         case .pinned(let app): "p\(app.bundleID)"
         // The closed window's own key, so the slot keeps the position it held in
         // the manual arrangement instead of jumping when the window closes.
         case .running(let app, let windowID, _):
             windowID.map { "w\($0)" } ?? "p\(app.bundleID)"
-        // The application, not its leftmost member. A cluster keys its
-        // arrangement on `members.first`, which goes stale the moment that
-        // window closes; a stack's identity *is* the app, so this key is good
-        // for the stack's whole life however its windows come and go.
+        // The application, not its leftmost member: a stack's identity *is* the
+        // app, so this key is good for the stack's whole life however its windows
+        // come and go. A cluster now holds its slot the same way, by its own id.
         case .appStack(let bundleID, _): "s\(bundleID)"
         }
     }

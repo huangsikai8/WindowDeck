@@ -70,6 +70,11 @@ enum SelfTest {
         sectionsWithWindows()
         clustering()
         clusterSurvivesClosing()
+        clusterHoldsOneSlot()
+        clusterSlotSurvivesRelaunch()
+        clusterAdoptsItsSlot()
+        clusterStandsWhereItsLeadDoes()
+        handFiledWindowKeepsItsPlace()
         edgeCases()
         runningState()
         closedWindowLauncher()
@@ -99,6 +104,8 @@ enum SelfTest {
         appStackOpensItsOwnWindows()
         appStackOrdering()
         appStackOrderSurvivesRelaunch()
+        orderSurvivesAStaggeredRestore()
+        arrangementDoesNotDriftAcrossRelaunches()
         loneStackedWindowKeepsTheStacksSlot()
         appStackInteractions()
         appStackPersistence()
@@ -271,17 +278,36 @@ enum SelfTest {
               items(store, in: group).map(\.orderKey) == ["w900", "w901", "w902"],
               "\(items(store, in: group).map(\.orderKey))")
 
-        // A second Finder window opens. Nothing gives it a key.
+        /// Makes a window a member of the capsule while leaving the arrangement
+        /// silent about it — which is the only state this rule speaks for.
+        ///
+        /// It takes two steps because every path a window can *arrive* by now
+        /// gives it a slot: `flushPendingCaptures` for one that opened here,
+        /// `add` for one filed by hand. What is left unranked is a window the
+        /// capsule is merely drawing — one that was open before the arrangement
+        /// existed, or that auto-capture never claimed.
+        func fileUnranked(_ id: CGWindowID) {
+            let before = store.order(in: group)
+            store.add(id, to: group)
+            store.setOrder(before, in: group)
+        }
+
+        // A second Finder window. Nothing has given it a key.
         let second = WindowInfo.testInstance(id: 903, bundleID: "com.finder",
                                              title: "Downloads", pid: 1)
         live.append(second)
         store.windows = live
         store.noteWindowRefs(live)
         store.add(903, to: group)
+        check("filing a window by hand writes it a slot beside its own app's",
+              store.order(in: group) == ["w900", "w903", "w901", "w902"],
+              "\(store.order(in: group))")
+
+        store.setOrder(["w900", "w901", "w902"], in: group)
         check("a new window is drawn beside its own app's",
               items(store, in: group).map(\.orderKey) == ["w900", "w903", "w901", "w902"],
               "\(items(store, in: group).map(\.orderKey))")
-        check("and nothing is written to the arrangement",
+        check("and an unranked window writes nothing to the arrangement",
               store.order(in: group) == ["w900", "w901", "w902"],
               "\(store.order(in: group))")
 
@@ -292,7 +318,7 @@ enum SelfTest {
         live.append(third)
         store.windows = live
         store.noteWindowRefs(live)
-        store.add(904, to: group)
+        fileUnranked(904)
         check("several new windows of one app keep their order",
               items(store, in: group).map(\.orderKey) == ["w900", "w903", "w904", "w901", "w902"],
               "\(items(store, in: group).map(\.orderKey))")
@@ -303,7 +329,7 @@ enum SelfTest {
         live.append(stranger)
         store.windows = live
         store.noteWindowRefs(live)
-        store.add(905, to: group)
+        fileUnranked(905)
         check("a window with no sibling here still trails",
               items(store, in: group).map(\.orderKey).last == "w905",
               "\(items(store, in: group).map(\.orderKey))")
@@ -535,6 +561,261 @@ enum SelfTest {
     /// member id the moment its window left the visible list, so the cluster fell
     /// below two members and deleted itself — and nothing put a reopened window
     /// back into a cluster even when it did survive.
+    /// A cluster holds **one slot for its whole life**, and closing a member —
+    /// including the one at its front — does not move it.
+    ///
+    /// Reported as a tile that "jumps from one position to the other in the
+    /// capsule": two windows stacked together, one closed, and the survivor
+    /// appeared somewhere else entirely. Two separate keys were moving under it.
+    /// `DeckItem.orderKey` borrowed the cluster's *first live member's* window
+    /// key, so closing the front window re-keyed the whole tile to wherever the
+    /// next member happened to sit; and a cluster that falls below the two live
+    /// windows `foldClusters` needs unfolds into a plain entry, which used to
+    /// rank at the survivor's own pre-cluster position — or, if it never had one,
+    /// at the far right of the capsule.
+    ///
+    /// Both halves are asserted here, and the second is the one from the report.
+    private static func clusterHoldsOneSlot() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        func keys() -> [String] { items(store, in: group).map(\.orderKey) }
+
+        let a = WindowInfo.testInstance(id: 500, bundleID: "com.finder", title: "Docs", pid: 1)
+        let b = WindowInfo.testInstance(id: 501, bundleID: "com.mail", title: "Inbox", pid: 2)
+        let c = WindowInfo.testInstance(id: 502, bundleID: "com.notes", title: "Notes", pid: 3)
+        let d = WindowInfo.testInstance(id: 503, bundleID: "com.finder", title: "Downloads", pid: 1)
+        store.windows = [a, b, c, d]
+        store.noteWindowRefs(store.windows)
+        for id: CGWindowID in [500, 501, 502, 503] { store.add(id, to: group) }
+        store.setOrder(["w500", "w501", "w502", "w503"], in: group)
+
+        // The two Finder windows are stacked together, at the leftmost one's
+        // place. Its position is the whole point: a cluster with no slot of its
+        // own is unranked, and `applyManualOrder` has nowhere to put an unranked
+        // item but the end of the row.
+        store.combine(503, into: 500, in: group)
+        guard let cluster = store.groups.first(where: { $0.id == group })?.clusters.first
+        else { return check("the cluster was made", false) }
+        let clusterKey = "c\(cluster.id.uuidString)"
+
+        check("the cluster takes the leftmost member's slot",
+              store.order(in: group) == [clusterKey, "w501", "w502"],
+              "\(store.order(in: group))")
+        check("and it is drawn there",
+              keys() == [clusterKey, "w501", "w502"], "\(keys())")
+
+        // The front window closes. The cluster is down to one live member, so it
+        // unfolds — and the survivor must be drawn exactly where the cluster was.
+        store.windows = [b, c, d]
+        check("a cluster that unfolds leaves its survivor in the cluster's place",
+              keys() == ["w503", "w501", "w502"], "\(keys())")
+        check("and the arrangement still names the cluster, not the survivor",
+              store.order(in: group) == [clusterKey, "w501", "w502"],
+              "\(store.order(in: group))")
+
+        // Dragging that survivor has to write the key the row *ranks* by, or the
+        // tile snaps straight back — the same rule the lone stacked window needs.
+        // Dropping on a tile while moving *rightwards* lands past it, which is
+        // what makes the last position in a row reachable at all.
+        store.moveItem("w503", before: "w502", in: group)
+        check("dragging the unfolded survivor moves it",
+              keys() == ["w501", "w502", "w503"], "\(keys())")
+        store.moveItem("w503", before: "w501", in: group)
+        check("and it can be dragged back",
+              keys() == ["w503", "w501", "w502"], "\(keys())")
+
+        // Dissolving hands the slot back to the windows it was holding rather
+        // than leaving them unranked at the end of the row.
+        store.windows = [a, b, c, d]
+        store.dissolveCluster(cluster.id, in: group)
+        check("dissolving puts the members back where the cluster stood",
+              keys() == ["w500", "w503", "w501", "w502"], "\(keys())")
+    }
+
+    /// The cluster's slot has to reach disk, or the arrangement comes back with
+    /// the cluster on the far right — the same silent loss `.stacked` was added
+    /// to `OrderRef` to stop, and invisible until one relaunch later.
+    private static func clusterSlotSurvivesRelaunch() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        let lead = WindowInfo.testInstance(id: 520, bundleID: "com.editor", title: "Editor")
+        let a = WindowInfo.testInstance(id: 521, bundleID: "com.finder", title: "Docs")
+        let b = WindowInfo.testInstance(id: 522, bundleID: "com.finder", title: "Downloads")
+        let tail = WindowInfo.testInstance(id: 523, bundleID: "com.mail", title: "Inbox")
+        let all = [lead, a, b, tail]
+        store.windows = all
+        store.noteWindowRefs(all)
+        for window in all { store.add(window.id, to: group) }
+        store.setOrder(["w520", "w521", "w522", "w523"], in: group)
+        store.combine(522, into: 521, in: group)
+        guard let cluster = store.groups.first(where: { $0.id == group })?.clusters.first
+        else { return check("the cluster was made", false) }
+        let clusterKey = "c\(cluster.id.uuidString)"
+        check("the cluster sits in the middle",
+              store.order(in: group) == ["w520", clusterKey, "w523"],
+              "\(store.order(in: group))")
+        store.saveNow()
+
+        let saved = StateStore.load().groups.first { $0.id == group.uuidString }
+        check("the cluster's position is described on disk",
+              saved?.order.contains { if case .cluster = $0 { true } else { false } } == true,
+              "\(saved?.order.count ?? -1)")
+
+        let relaunched = AppStore()
+        relaunched.windows = all
+        relaunched.noteWindowRefs(all)
+        _ = relaunched.restorePass(against: all)
+        check("and it comes back in the middle, not at the end",
+              relaunched.order(in: group) == ["w520", clusterKey, "w523"],
+              "\(relaunched.order(in: group))")
+        check("so the capsule draws it there",
+              items(relaunched, in: group).map(\.orderKey) == ["w520", clusterKey, "w523"],
+              "\(items(relaunched, in: group).map(\.orderKey))")
+    }
+
+    /// A cluster stands where its **lead member** stands, not where its leftmost
+    /// member does.
+    ///
+    /// `combine` puts the drop target first because it is "the one that stays
+    /// put", and the tile has always been drawn at that member's slot. Claiming
+    /// the leftmost member's slot instead — which is right for a stack, since a
+    /// stack has no lead — moves the tile: dropping a window on a target further
+    /// along the row builds the cluster back at the first window's place, and
+    /// every cluster already on disk is swept to its leftmost member's position
+    /// the first time it adopts a slot. Both directions are asserted, because the
+    /// two rules agree whenever the lead happens to be leftmost, which is most
+    /// fixtures and is why this needs one of its own.
+    private static func clusterStandsWhereItsLeadDoes() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        func keys() -> [String] { items(store, in: group).map(\.orderKey) }
+
+        let editor = WindowInfo.testInstance(id: 540, bundleID: "com.editor", title: "Editor")
+        let left = WindowInfo.testInstance(id: 541, bundleID: "com.finder", title: "Docs")
+        let mail = WindowInfo.testInstance(id: 542, bundleID: "com.mail", title: "Inbox")
+        let right = WindowInfo.testInstance(id: 543, bundleID: "com.finder", title: "Downloads")
+        let all = [editor, left, mail, right]
+        store.windows = all
+        store.noteWindowRefs(all)
+        for window in all { store.add(window.id, to: group) }
+        store.setOrder(["w540", "w541", "w542", "w543"], in: group)
+
+        // The left-hand window is dropped onto the right-hand one, so the
+        // right-hand one leads and the cluster belongs at *its* place.
+        store.combine(541, into: 543, in: group)
+        guard let cluster = store.groups.first(where: { $0.id == group })?.clusters.first
+        else { return check("the cluster was made", false) }
+        let clusterKey = "c\(cluster.id.uuidString)"
+        check("the cluster is made at its target's place, not its leftmost member's",
+              store.order(in: group) == ["w540", "w542", clusterKey],
+              "\(store.order(in: group))")
+        check("and is drawn there",
+              keys() == ["w540", "w542", clusterKey], "\(keys())")
+
+        // The same question asked of a cluster that is adopting a slot: the
+        // arrangement names both its members, and the lead is the later of them.
+        store.setOrder(["w540", "w541", "w542", "w543"], in: group)
+        store.pruneClusters()
+        check("adoption takes the lead member's slot too",
+              store.order(in: group) == ["w540", "w542", clusterKey],
+              "\(store.order(in: group))")
+    }
+
+    /// A cluster that predates cluster keys keeps the position it already has.
+    ///
+    /// Every file on disk describes a cluster's slot as a `.window` ref naming
+    /// its lead member, since that is the key the tile used to rank by. Left
+    /// alone, that key ranks nothing once the cluster ranks by its own id — the
+    /// lead window is drawn inside the cluster, not loose — so the tile would go
+    /// to the far right of the capsule on the first relaunch after the change.
+    /// The precondition is asserted, because a migration test that cannot show
+    /// the broken state is not testing the migration.
+    private static func clusterAdoptsItsSlot() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        func keys() -> [String] { items(store, in: group).map(\.orderKey) }
+
+        let editor = WindowInfo.testInstance(id: 530, bundleID: "com.editor", title: "Editor")
+        let lead = WindowInfo.testInstance(id: 531, bundleID: "com.finder", title: "Docs")
+        let other = WindowInfo.testInstance(id: 532, bundleID: "com.finder", title: "Downloads")
+        let mail = WindowInfo.testInstance(id: 533, bundleID: "com.mail", title: "Inbox")
+        let all = [editor, lead, other, mail]
+        store.windows = all
+        store.noteWindowRefs(all)
+        for window in all { store.add(window.id, to: group) }
+        store.combine(532, into: 531, in: group)
+        guard let cluster = store.groups.first(where: { $0.id == group })?.clusters.first
+        else { return check("the cluster was made", false) }
+        let clusterKey = "c\(cluster.id.uuidString)"
+
+        // The arrangement as an older version wrote it: both members' own keys,
+        // and nothing naming the cluster.
+        store.setOrder(["w530", "w531", "w532", "w533"], in: group)
+        check("the old shape really does lose the cluster's place",
+              keys() == ["w530", "w533", clusterKey], "\(keys())")
+
+        store.pruneClusters()
+        check("the cluster adopts the slot its lead member was holding",
+              store.order(in: group) == ["w530", clusterKey, "w533"],
+              "\(store.order(in: group))")
+        check("so it is drawn where it always was",
+              keys() == ["w530", clusterKey, "w533"], "\(keys())")
+    }
+
+    /// A window filed by hand is placed once, at the moment it is filed, and does
+    /// not move again.
+    ///
+    /// `flushPendingCaptures` has always given a slot to a window that *opened*
+    /// in a capsule; nothing gave one to a window moved here from the tile menu
+    /// or dragged in from another capsule, so a hand-filed window stayed unranked
+    /// for the rest of its life. An unranked item is drawn beside whichever of
+    /// its own application's windows are on the row — so it followed them around,
+    /// and went to the far right of the capsule the moment the last one closed.
+    private static func handFiledWindowKeepsItsPlace() {
+        let store = freshStore()
+        guard store.groups.count >= 3 else { return check("two groups exist", false) }
+        let work = store.groups[1].id
+        let study = store.groups[2].id
+
+        func keys() -> [String] { items(store, in: work).map(\.orderKey) }
+
+        let finder = WindowInfo.testInstance(id: 600, bundleID: "com.finder",
+                                             title: "Docs", pid: 1)
+        let mail = WindowInfo.testInstance(id: 601, bundleID: "com.mail",
+                                           title: "Inbox", pid: 2)
+        let second = WindowInfo.testInstance(id: 602, bundleID: "com.finder",
+                                             title: "Downloads", pid: 1)
+        store.windows = [finder, mail, second]
+        store.noteWindowRefs(store.windows)
+        store.add(600, to: work)
+        store.add(601, to: work)
+        store.setOrder(["w600", "w601"], in: work)
+
+        // Filed into Study first, then moved across — a drag between capsules,
+        // which is the path that leaves nothing behind to hold a place.
+        store.add(602, to: study)
+        store.add(602, to: work)
+        check("filing by hand writes a slot beside the app already here",
+              store.order(in: work) == ["w600", "w602", "w601"],
+              "\(store.order(in: work))")
+        check("and the capsule it left keeps no key for it",
+              store.order(in: study) == [], "\(store.order(in: study))")
+
+        // The sibling it arrived beside closes. Nothing else about the row has
+        // changed, so nothing else about the row may move.
+        store.windows = [mail, second]
+        check("the hand-filed window does not move when its sibling closes",
+              keys() == ["w602", "w601"], "\(keys())")
+    }
+
     private static func clusterSurvivesClosing() {
         let store = freshStore()
         guard store.groups.count >= 2 else { return check("a group exists", false) }
@@ -738,17 +1019,28 @@ enum SelfTest {
         check("an app whose last window was closed keeps its icon", drawnInMain(),
               "\(items(store, in: main).map(\.id))")
 
-        // Sticky, and this is the rule rather than an oversight: a launcher goes
-        // when *its own* capsule gets a real window of that application back, and
-        // nothing else takes it away. The window server reporting windows for the
-        // pid — which happens for windows on another Space, and for the phantom
-        // layer-0 windows an application keeps after its last one is closed — is
-        // not that, so the icon stays put.
+        // A launcher lasts exactly as long as its process owns no window
+        // anywhere, so a pid set claiming windows retracts it — and that set is
+        // the *Accessibility* answer, not the window server's. The distinction is
+        // the ChatGPT trap: the server keeps listing phantom layer-0 windows for
+        // an application whose last window was closed with the red button, and
+        // believing those would suppress the launcher for ever. `windowOwnerPIDs`
+        // comes from `AXSweeper.Output.pidsWithWindows` precisely so that a pid in
+        // it means Accessibility really described a window.
         store.sampleRunningApps(windowOwnerPIDs: [finder.processIdentifier], force: true)
         store.updateLaunchers()
-        check("a pid set claiming windows does not remove it", drawnInMain())
+        check("a pid owning a window anywhere removes it", !drawnInMain(),
+              "\(items(store, in: main).map(\.id))")
 
-        // What does remove it: a window of that application actually drawn here.
+        store.sampleRunningApps(windowOwnerPIDs: [], force: true)
+        store.updateLaunchers()
+        check("it comes back once the pid owns nothing again", drawnInMain())
+
+        // The other half of the retraction rule, and not redundant: `runningApps`
+        // is re-sampled at most every 1.5s, so a window that has just been
+        // described has to take the launcher away on the tick it arrives rather
+        // than whenever the sample next catches up. Here the sample still says
+        // "windowless" and the window list disagrees.
         let real = WindowInfo.testInstance(id: 900, bundleID: "com.apple.finder",
                                            title: "Documents", pid: finder.processIdentifier)
         store.windows = [real]
@@ -791,6 +1083,11 @@ enum SelfTest {
         store.windows = [zoom]
         store.noteWindowRefs(store.windows)
         store.add(400, to: group)
+        // Cleared deliberately: filing by hand gives a window a slot, and this
+        // case is about a capsule that has no arrangement at all — the state a
+        // fresh install is in, and the one `applyManualOrder`'s early return
+        // used to fall through to the sweep's app-name sort in.
+        store.setOrder([], in: group)
         check("the capsule starts with no arrangement", store.order(in: group).isEmpty,
               "\(store.order(in: group))")
 
@@ -829,7 +1126,14 @@ enum SelfTest {
         pinned.windows = [other]
         pinned.noteWindowRefs(pinned.windows)
         pinned.add(410, to: pinGroup)
+        // A real pin, not just its order key. The two are separable — `unpin`
+        // removes the app and leaves the key behind — and a key standing for a
+        // pin that no longer exists must not attract a window any more than a
+        // dead window's key does, which is asserted below.
+        pinned.pin(PinnedApp(bundleID: "com.finder", name: "Finder"), in: pinGroup)
         pinned.setOrder(["pcom.finder", "w410"], in: pinGroup)
+        check("the fixture really pinned the app",
+              pinned.isPinned("com.finder", in: pinGroup))
         let finderWindow = WindowInfo.testInstance(id: 411, bundleID: "com.finder",
                                                    title: "Documents", pid: 4)
         pinned.windows = [other, finderWindow]
@@ -840,15 +1144,79 @@ enum SelfTest {
         check("a pinned app's window takes the pin's place, not the end",
               pinned.order(in: pinGroup) == ["pcom.finder", "w411", "w410"],
               "\(pinned.order(in: pinGroup))")
+
+        // Unpinned, the key stays in the arrangement and stands for nothing, so
+        // the next window of that app belongs at the end of the row.
+        pinned.unpin("com.finder", in: pinGroup)
+        check("unpinning leaves the key behind",
+              pinned.order(in: pinGroup).contains("pcom.finder"),
+              "\(pinned.order(in: pinGroup))")
+        let second = WindowInfo.testInstance(id: 412, bundleID: "com.finder",
+                                             title: "Downloads", pid: 4)
+        pinned.windows = [other, finderWindow, second]
+        pinned.noteWindowRefs(pinned.windows)
+        pinned.settleFocusForTesting()
+        pinned.captureNewWindows([412], focusHint: 410)
+        check("but a window of that app still lands beside its own sibling",
+              pinned.order(in: pinGroup) == ["pcom.finder", "w411", "w412", "w410"],
+              "\(pinned.order(in: pinGroup))")
+
+        // A key left behind by a *closed* window is not its application being on
+        // the row, and it must not attract the next window of that application.
+        // The key stays in the arrangement deliberately — it is what holds a
+        // launcher's slot while the app runs — so the affinity scan resolved it
+        // through `knownRefs`, found the application it used to belong to, and
+        // dropped the new window into the middle of the row. Measured on the live
+        // state file: Actelligent's arrangement held two dead Terminal keys, one
+        // at index 6 of 21, and a Terminal opened with nothing of Terminal drawn
+        // there landed inside the row rather than at the end.
+        //
+        // Asserted with the dead key placed *first*, so a scan that still matches
+        // it puts the new window at index 1 — nowhere near the end, whatever else
+        // changes about the row.
+        let stale = freshStore()
+        let staleGroup = stale.groups[1].id
+        stale.endLaunchGraceForTesting()
+        let closed = WindowInfo.testInstance(id: 420, bundleID: "com.terminal",
+                                             title: "Old shell", pid: 5)
+        let neighbour = WindowInfo.testInstance(id: 421, bundleID: "com.zoom",
+                                                title: "Zoom", pid: 1)
+        stale.windows = [closed, neighbour]
+        stale.noteWindowRefs(stale.windows)
+        stale.add(420, to: staleGroup)
+        stale.add(421, to: staleGroup)
+        stale.setOrder(["w420", "w421"], in: staleGroup)
+
+        // The Terminal window closes. Its key stays — that is the point — and
+        // `knownRefs` still remembers which application it belonged to.
+        stale.windows = [neighbour]
+        stale.noteWindowRefs(stale.windows)
+        check("the dead key really is still in the arrangement",
+              stale.order(in: staleGroup) == ["w420", "w421"], "\(stale.order(in: staleGroup))")
+
+        let reopened = WindowInfo.testInstance(id: 422, bundleID: "com.terminal",
+                                               title: "New shell", pid: 5)
+        stale.windows = [neighbour, reopened]
+        stale.noteWindowRefs(stale.windows)
+        stale.focusedWindowID = 421
+        stale.settleFocusForTesting()
+        stale.captureNewWindows([422], focusHint: 421)
+        check("a dead key does not attract the next window of its app",
+              stale.order(in: staleGroup) == ["w420", "w421", "w422"],
+              "\(stale.order(in: staleGroup))")
+        check("and the strip draws it at the end of the capsule",
+              items(stale, in: staleGroup).map(\.orderKey) == ["w421", "w422"],
+              "\(items(stale, in: staleGroup).map(\.orderKey))")
     }
 
     /// The three launcher rules, and the closing order that decides between them.
     ///
     /// One launcher per application, born in the capsule whose window of it
-    /// survived longest, and it does not move afterwards. Closing order is what
-    /// picks the capsule — it was the first thing asked about this design and it
-    /// is the only thing the rules are sensitive to, so it is asserted directly
-    /// rather than inferred from a single path.
+    /// survived longest, standing still there for as long as the application has
+    /// no window anywhere. Closing order is what picks the capsule — it was the
+    /// first thing asked about this design and it is the only thing the rules are
+    /// sensitive to, so it is asserted directly rather than inferred from a
+    /// single path.
     /// The regressions a review caught in the launcher rules. Each of these is a
     /// case the rest of the suite cannot reach, and each was a real defect.
     private static func launcherRegressions() {
@@ -906,20 +1274,21 @@ enum SelfTest {
               !grow.order(in: mainID).contains("w930"), "\(grow.order(in: mainID))")
     }
 
-    /// A launcher with no closed window behind it does not stand still.
+    /// Where a launcher is born when nothing closed during this session.
     ///
-    /// Rule 3 keeps a launcher where it is until *its own* capsule gets a window
-    /// of the application back, which is what makes a launcher in Main beside a
-    /// live window in Study correct. It is a rule about a slot a closed window
-    /// left behind — and an application that was already running with no windows
-    /// when WindowDeck started left none. It falls back to Main, and standing
-    /// still there meant Main drew a launcher for it for ever while its real
-    /// window lived somewhere else entirely: reported as "1 Slack in Main, 1 in
-    /// Actelligent, only 1 Slack open", with the launcher born in the seconds
-    /// between Slack's process starting and its first window appearing.
+    /// Two answers, and the capsule differs. An application WindowDeck never saw
+    /// with a window — already running with none when the strip started, or still
+    /// drawing its first — falls back to Main, because Main is where anything
+    /// nothing else claims belongs. A capsule holding an unmatched `savedMembers`
+    /// reference *is* "this capsule holds a slot for an application whose window
+    /// is gone", which is exactly what a launcher restored across a relaunch is,
+    /// so that capsule takes it instead.
     ///
-    /// Both directions are asserted, because a rule that simply retracted every
-    /// launcher would pass the first half alone.
+    /// Both then obey the same retraction rule, which is asserted here in the
+    /// harder direction — the window opens in a capsule that is *not* the one
+    /// holding the launcher. Standing still there is what drew Main a permanent
+    /// phantom Slack beside its real window in Actelligent, and later drew
+    /// Actelligent a permanent VS Code launcher beside four real windows in Main.
     private static func launcherWithNoSlotBehindIt() {
         let store = freshStore()
         guard store.groups.count >= 2 else { return check("a capsule exists", false) }
@@ -961,10 +1330,9 @@ enum SelfTest {
         check("and it goes the moment the app has a window anywhere",
               launcherCapsules(store).isEmpty, "\(launcherCapsules(store))")
 
-        // The other direction. A capsule holding a saved reference for the app is
-        // holding a slot for it — that is what a launcher restored across a
-        // relaunch *is* — so the launcher is born there rather than in Main, and
-        // it stays put when a window opens elsewhere.
+        // A capsule holding a saved reference for the app is holding a slot for
+        // it — that is what a launcher restored across a relaunch *is* — so the
+        // launcher is born there rather than in Main.
         let restored = freshStore()
         guard restored.groups.count >= 2 else { return check("a capsule exists", false) }
         let savedHome = restored.groups[1].id
@@ -974,14 +1342,17 @@ enum SelfTest {
         check("a capsule holding a saved slot takes the launcher, not Main",
               launcherCapsules(restored) == [savedHome], "\(launcherCapsules(restored))")
 
-        // A window in Main is not that capsule reclaiming it, so nothing moves.
+        // A window opening in Main is not that capsule reclaiming it, and it
+        // retracts the launcher all the same: the application is no longer
+        // running with nothing open, whichever capsule the window landed in.
+        // This is the assertion that fails with the old rule restored.
         let elsewhere = WindowInfo.testInstance(id: 941, bundleID: "com.apple.finder",
                                                 title: "Opened in Main", pid: pid)
         restored.windows = [elsewhere]
         restored.noteWindowRefs(restored.windows)
         settle(restored, hasWindows: true)
-        check("an anchored launcher still stands still",
-              launcherCapsules(restored) == [savedHome], "\(launcherCapsules(restored))")
+        check("a saved slot does not keep a launcher beside a live window",
+              launcherCapsules(restored).isEmpty, "\(launcherCapsules(restored))")
     }
 
     /// The icon frame may overhang its tile, but the *ink* may never leave it.
@@ -1175,30 +1546,45 @@ enum SelfTest {
         check("the launcher is born where the last window lived",
               launcherCapsules() == [mainID], "\(launcherCapsules().count) capsule(s)")
 
-        // Sticky: a window opening somewhere else does not retract it.
+        // It stands still while the application stays windowless: nothing about
+        // repeated refreshes may migrate it to another capsule.
+        settle(hasWindows: false)
+        settle(hasWindows: false)
+        check("a windowless application's launcher does not migrate",
+              launcherCapsules() == [mainID], "\(launcherCapsules().count) capsule(s)")
+
+        // A window opening *anywhere* retracts it, and this is the case that was
+        // reported: VS Code relaunched, the new process sat windowless for eleven
+        // seconds while it drew its first window, inherited the departed
+        // process's capsule — the launcher was born in Actelligent — and then
+        // opened four windows in Main. The old rule kept the launcher in
+        // Actelligent for the rest of the session, so the strip drew a launcher
+        // for an application with four live windows on it.
         let inStudy = WindowInfo.testInstance(id: 912, bundleID: "com.apple.finder",
                                               title: "Study doc", pid: pid)
         store.windows = [inStudy]
         store.noteWindowRefs(store.windows)
         store.add(912, to: study)
         settle(hasWindows: true)
-        check("a window opening elsewhere leaves the launcher alone",
-              launcherCapsules() == [mainID], "\(launcherCapsules().map { _ in "x" }.count)")
+        check("a window opening elsewhere retracts the launcher",
+              launcherCapsules().isEmpty, "\(launcherCapsules().count) capsule(s)")
 
-        // Unique: closing that one makes Study the last capsule to hold a window,
-        // but Finder already has a launcher, so no second one is created.
+        // Unique: closing that one leaves Study as the capsule whose window of it
+        // survived longest, so the single launcher is born there — one capsule,
+        // never two.
         store.windows = []
         settle(hasWindows: false)
-        check("no second launcher is ever created",
-              launcherCapsules() == [mainID], "\(launcherCapsules().count) capsule(s)")
+        check("the one launcher is reborn where the last window closed",
+              launcherCapsules() == [study], "\(launcherCapsules().count) capsule(s)")
 
-        // Reclaimed only by its own capsule getting a real window back.
+        // And a window back in Main takes it away again, from a capsule that is
+        // not the one holding it.
         let backInMain = WindowInfo.testInstance(id: 913, bundleID: "com.apple.finder",
                                                  title: "Main again", pid: pid)
         store.windows = [backInMain]
         store.noteWindowRefs(store.windows)
         settle(hasWindows: true)
-        check("the launcher goes when its own capsule gets a window back",
+        check("the launcher goes when the application has a window again",
               launcherCapsules().isEmpty, "\(launcherCapsules().count)")
     }
 
@@ -1872,6 +2258,185 @@ enum SelfTest {
               "\(items(relaunched, in: group).map(\.orderKey))")
     }
 
+    /// The arrangement must come back the way it was left even though the
+    /// windows come back *out of order* — which, after a reboot or a rebuild, is
+    /// the normal case rather than the exceptional one.
+    ///
+    /// `restorePass` used to *append* each saved entry as it matched, so the
+    /// restored row was in the sequence the windows happened to arrive rather
+    /// than the sequence they were saved in. Two things made that permanent
+    /// instead of merely momentary. A pin and a stack bind on the very first
+    /// pass — they are rules the group already carries, with nothing to wait for
+    /// — while every window has to wait for its application, so every launcher
+    /// in a capsule migrated to the far left on every relaunch. And
+    /// `orderSnapshot` wrote `live + savedOrder`, so a save taken mid-restore
+    /// baked the arrival order onto disk and the original arrangement was gone
+    /// for good. Measured on the live state file: Main's saved order led with
+    /// three pins, a stack and three more pins, and every one of its 49 windows
+    /// followed them.
+    private static func orderSurvivesAStaggeredRestore() {
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+
+        let editor = WindowInfo.testInstance(id: 940, bundleID: "com.editor", title: "Editor")
+        let a = WindowInfo.testInstance(id: 941, bundleID: "com.browser", title: "A")
+        let b = WindowInfo.testInstance(id: 942, bundleID: "com.browser", title: "B")
+        let mail = WindowInfo.testInstance(id: 943, bundleID: "com.mail", title: "Mail")
+        let all = [editor, a, b, mail]
+        store.windows = all
+        store.noteWindowRefs(all)
+        for window in all { store.add(window.id, to: group) }
+        store.setOrder(["w940", "w941", "w942", "w943"], in: group)
+        store.stackApp(bundleID: "com.browser", in: group)
+        check("the arrangement starts editor, stack, mail",
+              store.order(in: group) == ["w940", "scom.browser", "w943"],
+              "\(store.order(in: group))")
+        store.saveNow()
+
+        // The relaunch. Mail is back first and the editor is still starting —
+        // the stack, being a rule, is ready immediately.
+        let relaunched = AppStore()
+        relaunched.windows = [mail]
+        relaunched.noteWindowRefs([mail])
+        _ = relaunched.restorePass(against: [mail])
+        check("a slot is held for the window that has not come back",
+              relaunched.order(in: group).firstIndex(of: "scom.browser").map { index in
+                  relaunched.order(in: group).firstIndex(of: "w943").map { $0 > index } ?? false
+              } == true,
+              "\(relaunched.order(in: group))")
+
+        // A save here is what used to make the scramble permanent: the strip
+        // saves on a debounce and on every membership edit, so a save landing
+        // mid-restore is ordinary.
+        relaunched.saveNow()
+        let midway = StateStore.load().groups.first { $0.id == group.uuidString }
+        check("a save mid-restore still describes the editor before the stack",
+              midway.map { saved -> Bool in
+                  let editorIndex = saved.order.firstIndex { if case .window(let ref) = $0 { ref.bundleID == "com.editor" } else { false } }
+                  let stackIndex = saved.order.firstIndex { if case .stacked = $0 { true } else { false } }
+                  guard let editorIndex, let stackIndex else { return false }
+                  return editorIndex < stackIndex
+              } == true,
+              "\(midway?.order ?? [])")
+
+        // The editor finishes launching.
+        relaunched.windows = all
+        relaunched.noteWindowRefs(all)
+        _ = relaunched.restorePass(against: all)
+        check("the late window lands in its own slot, not at the end",
+              relaunched.order(in: group) == ["w940", "scom.browser", "w943"],
+              "\(relaunched.order(in: group))")
+        check("so the capsule draws it where it was left",
+              items(relaunched, in: group).map(\.orderKey) == ["w940", "scom.browser", "w943"],
+              "\(items(relaunched, in: group).map(\.orderKey))")
+
+        // And the recovered arrangement is what reaches disk.
+        relaunched.saveNow()
+        let after = StateStore.load().groups.first { $0.id == group.uuidString }
+        check("the restored arrangement round-trips",
+              after.map { saved -> Bool in
+                  let editorIndex = saved.order.firstIndex { if case .window(let ref) = $0 { ref.bundleID == "com.editor" } else { false } }
+                  let stackIndex = saved.order.firstIndex { if case .stacked = $0 { true } else { false } }
+                  let mailIndex = saved.order.firstIndex { if case .window(let ref) = $0 { ref.bundleID == "com.mail" } else { false } }
+                  guard let editorIndex, let stackIndex, let mailIndex else { return false }
+                  return editorIndex < stackIndex && stackIndex < mailIndex
+              } == true,
+              "\(after?.order ?? [])")
+    }
+
+    /// The general form of the staggered restore, and the shape the user
+    /// actually reported: an arrangement that came back a little more scrambled
+    /// after every rebuild.
+    ///
+    /// Two properties are asserted that the single-scenario case above cannot
+    /// reach. Windows returning in *reverse* order must still land in their own
+    /// slots — appending gets that exactly backwards, so it is the sharpest
+    /// single test of the placement rule. And the arrangement must survive being
+    /// saved and reloaded *repeatedly* while half of it is still missing, since
+    /// the drift was cumulative: each session wrote its own arrival order down
+    /// and the next session restored that faithfully, one step further from what
+    /// had been arranged.
+    private static func arrangementDoesNotDriftAcrossRelaunches() {
+        let apps = ["com.f", "com.e", "com.d", "com.c", "com.b", "com.a"]
+        let windows = apps.enumerated().map { index, bundleID in
+            WindowInfo.testInstance(id: CGWindowID(960 + index), bundleID: bundleID,
+                                    title: "W\(index)", pid: pid_t(960 + index))
+        }
+        // Deliberately the reverse of the app-name sort the sweep falls back to,
+        // so a case that quietly stopped honouring the arrangement would show up
+        // rather than agreeing with the default by accident.
+        let arrangement = windows.map { "w\($0.id)" }
+
+        let store = freshStore()
+        guard store.groups.count >= 2 else { return check("a group exists", false) }
+        let group = store.groups[1].id
+        store.windows = windows
+        store.noteWindowRefs(windows)
+        for window in windows { store.add(window.id, to: group) }
+        store.setOrder(arrangement, in: group)
+        store.saveNow()
+
+        // Relaunch one: the windows come back last-first, one per pass, and the
+        // strip saves in between as it does after any membership edit.
+        let reversed = AppStore()
+        for count in 1...windows.count {
+            let back = Array(windows.suffix(count))
+            reversed.windows = back
+            reversed.noteWindowRefs(back)
+            _ = reversed.restorePass(against: back)
+            reversed.saveNow()
+        }
+        check("windows returning last-first still land in their own slots",
+              reversed.order(in: group) == arrangement,
+              "\(reversed.order(in: group))")
+        check("and the capsule draws them that way",
+              items(reversed, in: group).map(\.orderKey) == arrangement,
+              "\(items(reversed, in: group).map(\.orderKey))")
+
+        // Relaunch two and three, each seeing only part of the row before it
+        // saves — which is what made the drift cumulative.
+        var previous = reversed
+        for round in 0..<2 {
+            let partial = round == 0 ? Array(windows.prefix(2)) : Array(windows.dropFirst(3))
+            let next = AppStore()
+            next.windows = partial
+            next.noteWindowRefs(partial)
+            _ = next.restorePass(against: partial)
+            next.saveNow()
+
+            next.windows = windows
+            next.noteWindowRefs(windows)
+            _ = next.restorePass(against: windows)
+            next.saveNow()
+            check("round \(round + 1): the arrangement is unchanged",
+                  next.order(in: group) == arrangement,
+                  "\(next.order(in: group))")
+            previous = next
+        }
+        check("nothing was dropped along the way",
+              Set(previous.order(in: group)) == Set(arrangement),
+              "\(previous.order(in: group))")
+
+        // A window that never comes back holds its place rather than collapsing
+        // the row around it: the remaining five stay in their saved sequence.
+        let withoutMiddle = windows.filter { $0.id != windows[2].id }
+        let gapped = AppStore()
+        gapped.windows = withoutMiddle
+        gapped.noteWindowRefs(withoutMiddle)
+        _ = gapped.restorePass(against: withoutMiddle)
+        check("a window that never returns leaves the rest in order",
+              gapped.order(in: group) == withoutMiddle.map { "w\($0.id)" },
+              "\(gapped.order(in: group))")
+        gapped.saveNow()
+        let held = StateStore.load().groups.first { $0.id == group.uuidString }
+        check("and its slot is still described on disk, in place",
+              held?.order.compactMap { ref -> String? in
+                  if case .window(let member) = ref { return member.bundleID } else { return nil }
+              } == apps,
+              "\(held?.order.count ?? -1) entries")
+    }
+
     /// A stacked app's launcher must still stand aside, and its windows must stop
     /// competing for titles.
     private static func appStackInteractions() {
@@ -2463,6 +3028,17 @@ enum SelfTest {
         check("an unarranged window joins its own app in the panel",
               beside.map(\.id) == [1, 4, 2, 3],
               "\(beside.map(\.id))")
+
+        // A clustered window ranks at its *cluster's* slot, not its own — the
+        // cluster took that key when it was made. Without this the panel calls
+        // every clustered window unranked and drifts it to its application's
+        // others while the strip draws the cluster in place, so the two describe
+        // two different arrangements of one capsule.
+        let clustered = AllGroupsModel.ordered([a, b, c], by: ["w2", "cX"],
+                                               slot: { $0 == 2 ? "w2" : "cX" })
+        check("a clustered window ranks at its cluster's slot in the panel",
+              clustered.map(\.id) == [2, 1, 3],
+              "\(clustered.map(\.id))")
     }
 
     // MARK: - Pruning
