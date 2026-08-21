@@ -249,7 +249,8 @@ Sources/WindowDeck/
 ├── UI/
 │   ├── DeckPanel.swift       the strip's NSPanel (borderless, non-activating)
 │   ├── DeckController.swift  panel lifecycle, sizing, fullscreen hide, edge reveal
-│   ├── DeckView.swift        strip contents + DeckMetrics
+│   ├── DeckView.swift        strip contents
+│   ├── DeckMetrics.swift     every size the strip draws with, derived from one scale
 │   ├── DeckLayout.swift      the sizing algorithm — read this before touching widths
 │   ├── EntryTile / ClusterTile / PinnedTile / GroupSelector (the groups menu)
 │   ├── AppStackTile.swift    one app's windows behind its own icon, with a count
@@ -451,6 +452,15 @@ so the net still catches the case it exists for, within ten seconds of the key a
 **Clamping a width *up* to a floor causes overflow.** The strip once computed a fair share of 23pt
 then clamped to a 24pt minimum, producing 1275pt of content in a 1240pt bar. Widths may only ever be
 clamped *down*.
+
+It came straight back when the strip was given a size setting, in a form that looks obviously correct:
+every other number in `DeckMetrics` scales, so `hardMinimumWidth` and `minimumIconSize` were scaled
+too. They are the only two the layout clamps *up* to, so a fair share of 15.75pt met a floor of 17.5pt
+and sixty tiles were each 1.75pt too wide — 1251pt in a 1240pt bar, at 1.25x. Both stay absolute, and
+the cost is nothing the setting was offering: a larger scale still fills the row sooner because every
+other width grew, it simply bottoms out in the same place, so capacity is the same at every size
+rather than shrinking exactly when the row is most crowded. `deckSizing` in the self-test asserts the
+fit at four scales on a 60-window row and failed on this immediately.
 
 **Early returns must run the same post-processing.** An early return for groups with no clusters
 skipped the rest of the pipeline, so a signal that was supposed to appear never did — twice, for two
@@ -910,6 +920,14 @@ fixed tile width, which meant they held 40pt while windows compressed to ~24pt a
 looked absurdly spaced because they were not taking part in the layout. They are `DeckItem.pinned`
 now, sized by the same pass, draggable among windows, and **scoped per capsule**.
 
+**The pin menu names capsules, and only capsules.** It used to lead with an "All" row above the real
+ones — a leftover from the built-in group of that name, which has not existed since the strip became a
+row of capsules. It was not inert: it pinned to Main, so it was a second, differently-labelled way to
+do exactly what the Main row below it already did, and it made the menu claim a group that is not on
+the strip. The store's pin functions took the optional that entry needed, and the optional meant two
+opposite things — `isPinned`/`togglePin`/`pinApp` read nil as Main while `pin`/`unpin` read it as the
+*active* capsule. All of them name the capsule now, so that reading cannot be picked wrongly.
+
 **A launcher hides while its app has a window in the capsule.** Showing both put two identical icons
 side by side with nothing to tell them apart — the launcher and the window it launched. Since the
 pin's only job is "open this", the window entry takes over that job and the pin steps aside, returning
@@ -971,6 +989,26 @@ titled entries from the leftover width, collapses to icon-only when titles would
 behaviour), then tightens spacing 6→2 and shrinks icons. Fits to ~72 windows on a 1280pt display.
 Tile is 44pt tall and 40pt wide inside a 56pt strip, with a 36pt icon in it.
 
+**The strip's size is one setting, and `DeckMetrics` is a value rather than a namespace.** The Dock
+has a single size slider and everything about it follows — a bigger tile means a bigger icon, a taller
+bar and a longer row — so the strip copies that shape. Separate controls for height, tile and icon
+were considered and rejected: the relationships between those three are the whole reason the row reads
+as a Dock, and exposing them lets the three be set to combinations that cannot look right.
+
+`DeckMetrics` therefore holds a `scale` and derives every size from it, and it is passed rather than
+looked up. That is not style. A global `DeckMetrics.scale` would need something to keep it in step with
+the store, and SwiftUI would not redraw when it changed — a strip is redrawn because a property it
+*read* changed. Building the value from `store.deckScale` makes the read the subscription: `DeckView`
+does it in `body`, `DeckController` does it in `layout()`, and neither can be measuring one scale while
+the other draws another, which is the failure that clips the last icons. Tiles get it from the SwiftUI
+environment, so a stack, a cluster and a launcher all draw with exactly what the layout pass measured.
+
+Two things it deliberately does not scale, beyond the two floors above. `dividerWidth` stays a
+hairline — scaling it turns separators into bars, and it is charged to the width budget, so growing it
+costs tiles. `edgeInset` and `screenMargin` are distances to something *outside* the strip; the zoom
+clamp reserves exactly `height + edgeInset`, and `reservedBandHeight` is now re-read on every settings
+change, since reading it once at launch would leave zoomed windows behind a strip that has grown.
+
 **A bigger icon comes out of the tile's slack, not out of the tile.** At 30pt in the same tile the
 strip read as a row of thumbnails beside the Dock, and the obvious fix — a taller strip and wider
 tiles — is the wrong one twice over: the strip's height is screen the user does not get back, and the
@@ -986,7 +1024,8 @@ anything:
   contiguous space instead of two useless ones. Every tile kind pads by it, or its dot lands on its
   icon while the rest of the row's does not.
 
-Capacity is unchanged by any of this: the ceiling is `hardMinimumWidth`, not the preferred tile.
+Capacity is unchanged by any of this — and by the size setting, for the same reason: the ceiling is
+`hardMinimumWidth`, not the preferred tile.
 `minimumTitledWidth` does track `preferredIconSize` — a titled tile spends its width on 7pt of padding
 a side, the icon, and the 6pt gap before the text, so raising the icon without raising that leaves no
 room for the title it exists to guarantee.
@@ -1226,7 +1265,7 @@ an empty group showing nothing looks like a badge that failed to render.
 WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
 ```
 
-~272 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
+~304 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
 field type degrading rather than wiping the file, round-trips), ordering, restore matching, membership
 moves, capture of new windows, pruning, clustering, app stacks, switcher candidate ordering and scope,
 section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never

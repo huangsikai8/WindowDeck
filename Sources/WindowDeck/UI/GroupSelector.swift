@@ -56,6 +56,10 @@ struct GroupSelector: View {
     @State private var controller = SelectorMenuController()
     @State private var isHovering = false
 
+    /// Sizes come from the strip that is drawing this tile, so every tile in the
+    /// row is built from the same scale the layout pass measured with.
+    @Environment(\.deckMetrics) private var metrics
+
     var body: some View {
         // Icon over count, not side by side: the strip is 56pt tall and 40pt
         // wide per tile, so stacking keeps this the same width as everything
@@ -68,21 +72,21 @@ struct GroupSelector: View {
         // the space it needed was already reserved. Nothing here got wider.
         VStack(spacing: -1) {
             Image(systemName: "rectangle.3.group")
-                .font(.system(size: 17, weight: .medium))
+                .font(.system(size: metrics.selectorGlyphSize, weight: .medium))
                 .foregroundStyle(.secondary)
             // How many windows the strip is showing in total — the one number
             // that is not visible anywhere else, since each capsule shows only
             // its own and a busy session runs to dozens.
             Text("\(store.windows.count)")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: metrics.selectorCountSize, weight: .semibold))
                 // Monospaced so the button does not twitch as windows open and
                 // close, which it does several times a minute.
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
         }
-        .frame(width: DeckMetrics.selectorWidth, height: DeckMetrics.tileHeight)
+        .frame(width: metrics.selectorWidth, height: metrics.tileHeight)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: metrics.tileCornerRadius, style: .continuous)
                 .fill(.primary.opacity(isHovering ? 0.18 : 0.10))
         )
         .background(MenuAnchorView(controller: controller))

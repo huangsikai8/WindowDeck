@@ -1,9 +1,10 @@
 import AppKit
 import ApplicationServices
 
-/// A launcher in the "All" group. Unlike window entries these are static — they
+/// A launcher a capsule holds. Unlike window entries these are static — they
 /// exist whether or not the app is running, which is the one piece of ordinary
-/// Dock behaviour WindowDeck keeps.
+/// Dock behaviour WindowDeck keeps. Each capsule keeps its own, so the same app
+/// can be pinned in several.
 struct PinnedApp: Identifiable, Hashable, Codable {
     let bundleID: String
     var name: String

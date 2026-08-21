@@ -131,6 +131,13 @@ struct PersistedState: Codable {
     var autoAddNewWindows: Bool = true
     var clampZoomedWindows: Bool = true
     var hideInFullscreen: Bool = true
+    /// How large the strip draws, 1 being the original size.
+    ///
+    /// Stored as a `Double` rather than a `CGFloat` on purpose. The two encode
+    /// identically today, but the type of a persisted field is the one thing
+    /// that wipes this file when it changes, and a plain `Double` is what every
+    /// other number here already is.
+    var deckScale: Double = 1
     var switcherHoldDelay: TimeInterval = 0.18
     /// What order the window switcher lists candidates in.
     var cycleOrder: CycleOrder = .recentlyUsed
@@ -170,6 +177,7 @@ struct PersistedState: Codable {
         autoAddNewWindows: Bool,
         clampZoomedWindows: Bool,
         hideInFullscreen: Bool,
+        deckScale: Double = 1,
         switcherHoldDelay: TimeInterval,
         cycleOrder: CycleOrder = .recentlyUsed,
         appCycleStaysInGroup: Bool = true,
@@ -185,6 +193,7 @@ struct PersistedState: Codable {
         self.appCycleStaysInGroup = appCycleStaysInGroup
         self.clampZoomedWindows = clampZoomedWindows
         self.hideInFullscreen = hideInFullscreen
+        self.deckScale = deckScale
         self.shortcuts = shortcuts
         self.shortcutSeedVersion = shortcutSeedVersion
         self.groups = groups
@@ -260,6 +269,8 @@ struct PersistedState: Codable {
             ?? fallback.hideInFullscreen
         shortcuts = container.lenient([String: Shortcut].self, .shortcuts)
             ?? fallback.shortcuts
+        deckScale = container.lenient(Double.self, .deckScale)
+            ?? fallback.deckScale
         switcherHoldDelay = container.lenient(TimeInterval.self, .switcherHoldDelay)
             ?? fallback.switcherHoldDelay
         cycleOrder = container.lenient(CycleOrder.self, .cycleOrder) ?? fallback.cycleOrder
@@ -349,6 +360,7 @@ struct PersistedState: Codable {
         try container.encode(clampZoomedWindows, forKey: .clampZoomedWindows)
         try container.encode(hideInFullscreen, forKey: .hideInFullscreen)
         try container.encode(shortcuts, forKey: .shortcuts)
+        try container.encode(deckScale, forKey: .deckScale)
         try container.encode(switcherHoldDelay, forKey: .switcherHoldDelay)
         try container.encode(cycleOrder, forKey: .cycleOrder)
         try container.encode(appCycleStaysInGroup, forKey: .appCycleStaysInGroup)
@@ -361,7 +373,7 @@ struct PersistedState: Codable {
         case groups
         case currentSpaceOnly, showTitles, previewMode, hoverTimings
         case autoAddNewWindows, clampZoomedWindows, hideInFullscreen
-        case shortcuts, switcherHoldDelay, shortcutSeedVersion
+        case shortcuts, switcherHoldDelay, shortcutSeedVersion, deckScale
         case cycleOrder, appCycleStaysInGroup
         case bootTime, showRunningApps
         /// Retired in favour of `groups`; still read so existing files migrate.

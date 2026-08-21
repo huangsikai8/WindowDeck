@@ -20,14 +20,19 @@ struct PinnedTile: View {
     /// The capsule's colour, for the running dot.
     let tint: Color
     let onOpen: () -> Void
-    /// Toggles the pin in a capsule; nil means Main.
-    var onTogglePin: ((UUID?) -> Void)?
-    var isPinnedIn: ((UUID?) -> Bool)?
-    /// Capsules offered in the pin submenu.
+    /// Toggles the pin in one capsule.
+    var onTogglePin: ((UUID) -> Void)?
+    var isPinnedIn: ((UUID) -> Bool)?
+    /// Capsules offered in the pin submenu. Real capsules only — see the note on
+    /// `EntryTile.pinTargets` about the "All" entry this used to lead with.
     var pinTargets: [DeckGroup] = []
     let onUnpin: () -> Void
 
     @State private var isHovering = false
+
+    /// Sizes come from the strip that is drawing this tile, so every tile in the
+    /// row is built from the same scale the layout pass measured with.
+    @Environment(\.deckMetrics) private var metrics
 
     var body: some View {
         Button(action: onOpen) {
@@ -42,8 +47,8 @@ struct PinnedTile: View {
                         .opacity(isRunning ? 1 : (isHovering ? 0.85 : 0.5))
                 }
             }
-            .padding(.bottom, DeckMetrics.dotClearance)
-            .frame(width: width, height: DeckMetrics.tileHeight)
+            .padding(.bottom, metrics.dotClearance)
+            .frame(width: width, height: metrics.tileHeight)
             // Anchored to the *tile* and drawn by the shared `StatusDot`, so it
             // lines up with every other dot in the row. It used to hang off the
             // bottom of the icon inside a ZStack, which put it 2.5pt higher than
@@ -59,7 +64,7 @@ struct PinnedTile: View {
                 if isRunning { StatusDot(tint: tint) }
             }
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: metrics.tileCornerRadius, style: .continuous)
                     .fill(.primary.opacity(plateOpacity(isRunning: isRunning)))
             )
         }
@@ -75,8 +80,6 @@ struct PinnedTile: View {
                 // app is pinned and changes it — rather than a one-way "remove"
                 // that says nothing about the other groups.
                 Menu("Pin \(app.name) to") {
-                    pinItem("All", groupID: nil, onTogglePin: onTogglePin)
-                    if !pinTargets.isEmpty { Divider() }
                     ForEach(pinTargets) { group in
                         pinItem(group.name, groupID: group.id, onTogglePin: onTogglePin)
                     }
@@ -88,8 +91,8 @@ struct PinnedTile: View {
     }
 
     @ViewBuilder
-    private func pinItem(_ name: String, groupID: UUID?,
-                         onTogglePin: @escaping (UUID?) -> Void) -> some View {
+    private func pinItem(_ name: String, groupID: UUID,
+                         onTogglePin: @escaping (UUID) -> Void) -> some View {
         Button {
             onTogglePin(groupID)
         } label: {

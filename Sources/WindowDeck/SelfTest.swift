@@ -101,6 +101,8 @@ enum SelfTest {
         appStackPersistence()
         appStackHover()
         switchEntries()
+        deckSizing()
+        deckSizePersistence()
         tracing()
 
         print("\n=== self-test: \(passes) passed, \(failures.count) failed ===")
@@ -2312,6 +2314,103 @@ enum SelfTest {
               store.groups[index].savedMembers.contains { $0.title == "Never comes back" })
         check("a matched reference is consumed",
               !store.groups[index].savedMembers.contains { $0.title == "Exact" })
+    }
+
+    // MARK: - Deck size
+
+    /// The size setting must not be able to break the one property the layout
+    /// guarantees: everything fits, at every scale, however crowded.
+    ///
+    /// The failure this is aimed at has happened before in a different form —
+    /// "clamping a width *up* to a floor causes overflow" — and scaling
+    /// `hardMinimumWidth` is exactly that shape of change, since it raises a
+    /// floor the fair share can be pushed below. A busy strip at the largest
+    /// scale is where that shows.
+    private static func deckSizing() {
+        let windows = (1...60).map {
+            WindowInfo.testInstance(id: CGWindowID($0), bundleID: "com.x", title: "W\($0)")
+        }
+        let items = windows.map { DeckItem.window($0) }
+
+        for scale in [DeckMetrics.minScale, 1, 1.25, DeckMetrics.maxScale] {
+            let metrics = DeckMetrics(scale: scale)
+            let result = DeckLayout.compute(items: items, pinnedCount: 0,
+                                            titlesEnabled: true, maxWidth: 1240,
+                                            pillCount: 3, sectionCount: 3,
+                                            metrics: metrics)
+            check("a crowded strip fits at \(scale)x", result.totalWidth <= 1240,
+                  "\(result.totalWidth)")
+            let content = result.slots.reduce(0) { $0 + $1.width }
+                + CGFloat(max(result.slots.count - 3, 0)) * result.spacing
+            check("its contents fit at \(scale)x", content <= 1240, "\(content)")
+            check("every window still gets a slot at \(scale)x",
+                  result.slots.count == items.count)
+            check("no slot collapses to nothing at \(scale)x",
+                  result.slots.allSatisfy { $0.width > 0 && $0.iconSize > 0 })
+        }
+
+        // The point of the setting: bigger really is bigger, on a row with room
+        // to spare. Asserted on a *short* row, because a crowded one is capped by
+        // the display and both scales would come back at maxWidth — which would
+        // make this pass with the scale ignored entirely.
+        let few = Array(items.prefix(4))
+        let small = DeckLayout.compute(items: few, pinnedCount: 0, titlesEnabled: false,
+                                       maxWidth: 1240, metrics: DeckMetrics(scale: 0.7))
+        let large = DeckLayout.compute(items: few, pinnedCount: 0, titlesEnabled: false,
+                                       maxWidth: 1240, metrics: DeckMetrics(scale: 1.6))
+        check("a larger scale draws wider tiles",
+              large.slots[0].width > small.slots[0].width)
+        check("a larger scale draws bigger icons",
+              large.slots[0].iconSize > small.slots[0].iconSize)
+        check("a larger scale needs more of the strip",
+              large.totalWidth > small.totalWidth)
+        check("a larger scale is taller",
+              DeckMetrics(scale: 1.6).height > DeckMetrics(scale: 0.7).height)
+
+        // Out of range is clamped rather than honoured. `lenient` degrades a bad
+        // *shape* to the default and says nothing about range, so a hand-edited
+        // file is the one way an absurd value reaches this — and a strip taller
+        // than the screen puts the slider that fixes it out of reach.
+        check("an absurd scale is clamped", DeckMetrics(scale: 40).scale == DeckMetrics.maxScale)
+        check("a zero scale is clamped", DeckMetrics(scale: 0).scale == DeckMetrics.minScale)
+        check("a negative scale is clamped", DeckMetrics(scale: -3).scale == DeckMetrics.minScale)
+
+        let store = freshStore()
+        store.deckScale = 99
+        check("the store clamps what it is given", store.deckScale == DeckMetrics.maxScale)
+        store.deckScale = 1.1
+        check("and keeps a value in range", store.deckScale == 1.1)
+    }
+
+    /// Adding a field is the safe kind of persistence change — but "safe" has
+    /// been wrong before, so assert both directions.
+    private static func deckSizePersistence() {
+        var state = PersistedState()
+        state.deckScale = 1.3
+        guard let data = try? JSONEncoder().encode(state),
+              let back = try? JSONDecoder().decode(PersistedState.self, from: data)
+        else { return check("the deck size round-trips", false) }
+        check("the deck size round-trips", back.deckScale == 1.3)
+
+        let legacy = """
+        {"groups":[{"id":"A","name":"Old","colorIndex":1,
+          "members":[{"bundleID":"x","title":"t"}]}]}
+        """
+        guard let old = try? JSONDecoder().decode(PersistedState.self, from: Data(legacy.utf8))
+        else { return check("a file predating the deck size decodes", false) }
+        check("a file predating the deck size decodes", old.groups.count == 1)
+        check("its group survives", old.groups.first?.members.count == 1)
+        check("the deck size defaults to 1", old.deckScale == 1)
+
+        // A wrong *shape* must degrade to the default rather than take the file
+        // down — the failure that once replaced every group, pin and shortcut.
+        let broken = """
+        {"groups":[{"id":"A","name":"Keep","colorIndex":1,"members":[]}],"deckScale":"large"}
+        """
+        let salvaged = try? JSONDecoder().decode(PersistedState.self, from: Data(broken.utf8))
+        check("a deck size of the wrong type does not fail the file", salvaged != nil)
+        check("groups survive it", salvaged?.groups.first?.name == "Keep")
+        check("and it falls back to the default", salvaged?.deckScale == 1)
     }
 
     // MARK: - Layout

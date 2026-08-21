@@ -122,6 +122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.engine.currentSpaceOnly = self.store.currentSpaceOnly
             self.engine.clampZoomedWindows = self.store.clampZoomedWindows
+            // The strip's height is a setting now, and the band a zoomed window
+            // must stop above is exactly that height. Read once at launch, a
+            // resized strip would either overlap zoomed windows or leave a band
+            // of desktop above itself.
+            self.engine.reservedBandHeight = self.deck.reservedBandHeight
         }
 
         deck.show()

@@ -22,6 +22,14 @@ struct DeckView: View {
     /// window between groups rather than merely reordering it.
     @State private var draggingFromGroup: UUID?
 
+    /// Every size in the strip, from the one setting that governs them.
+    ///
+    /// Read through the store rather than held as a global, so a change to the
+    /// scale is an observed access and redraws the strip like any other setting
+    /// — and so the panel, which measures with its own copy, can never be sizing
+    /// itself from a different number than the one being drawn with.
+    private var metrics: DeckMetrics { DeckMetrics(scale: store.deckScale) }
+
     var body: some View {
         // Computed once and threaded through: the spacing it chooses has to be
         // the spacing actually rendered, or the width it reserved won't match
@@ -35,7 +43,7 @@ struct DeckView: View {
                 permissionPrompt
             }
         }
-        .frame(height: DeckMetrics.height)
+        .frame(height: metrics.height)
         // The frosted material samples whatever is behind the strip, so a
         // wallpaper that is bright on one side and dark on the other drags the
         // bar's contrast with it and icons get lost. A solid layer on top of the
@@ -47,18 +55,21 @@ struct DeckView: View {
                 Color(nsColor: .windowBackgroundColor).opacity(0.62)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: DeckMetrics.cornerRadius, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: metrics.cornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: DeckMetrics.cornerRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: metrics.cornerRadius, style: .continuous)
                 .strokeBorder(.white.opacity(0.12), lineWidth: 1)
         )
+        // Handed to every tile below, so the row draws with exactly the sizes
+        // the layout pass above measured with.
+        .environment(\.deckMetrics, metrics)
     }
 
     private func content(_ layout: DeckLayout.Result) -> some View {
         HStack(spacing: layout.spacing) {
             GroupSelector(store: store, onNewGroup: onNewGroup, onEditGroups: onEditGroups)
 
-            Divider().frame(height: 26)
+            Divider().frame(height: metrics.dividerHeight)
 
             // Nothing animates here. The row used to slide when the group
             // changed, which is the one event that no longer exists — every
@@ -67,7 +78,7 @@ struct DeckView: View {
             pills(layout)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.horizontal, DeckMetrics.padding)
+        .padding(.horizontal, metrics.padding)
     }
 
     /// The strip: one capsule per group, Main first.
@@ -83,7 +94,7 @@ struct DeckView: View {
         HStack(spacing: layout.spacing) {
             ForEach(drawnSections(layout), id: \.section.id) { entry in
                 if entry.section.dividerBefore {
-                    Divider().frame(height: 22)
+                    Divider().frame(height: metrics.sectionDividerHeight)
                 }
                 pill(entry.section, slots: entry.slots, spacing: layout.spacing)
             }
@@ -93,7 +104,7 @@ struct DeckView: View {
         .overlay(alignment: .leading) {
             if layout.slots.isEmpty {
                 Text("No open windows")
-                    .font(.system(size: 11.5))
+                    .font(.system(size: metrics.hintFontSize))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -110,11 +121,11 @@ struct DeckView: View {
         let collapsed = store.collapsedGroups
         let hiddenWindows = collapsed.reduce(0) { $0 + $1.count }
         if !collapsed.isEmpty {
-            Divider().frame(height: 22)
+            Divider().frame(height: metrics.sectionDividerHeight)
             Button {
                 onShowAllGroups()
             } label: {
-                HStack(spacing: DeckLayout.collapsedGap) {
+                HStack(spacing: metrics.collapsedGap) {
                     // Overlapping circles, one per folded group — count them for
                     // groups, read the number for windows. Each carries a ring in
                     // the bar's own colour so neighbours stay separable where they
@@ -123,8 +134,8 @@ struct DeckView: View {
                         ForEach(collapsed) { group in
                             Circle()
                                 .fill(group.color)
-                                .frame(width: DeckLayout.collapsedDotSize,
-                                       height: DeckLayout.collapsedDotSize)
+                                .frame(width: metrics.collapsedDotSize,
+                                       height: metrics.collapsedDotSize)
                                 .overlay(
                                     Circle().strokeBorder(
                                         Color(nsColor: .windowBackgroundColor), lineWidth: 1.5)
@@ -133,17 +144,17 @@ struct DeckView: View {
                     }
 
                     Text("\(hiddenWindows)")
-                        .font(.system(size: 11.5, weight: .medium))
+                        .font(.system(size: metrics.hintFontSize, weight: .medium))
                         .foregroundStyle(.secondary)
                         // Exactly as wide as its digits, so the number sits
                         // against the dots instead of floating in a reserved slot.
-                        .frame(width: DeckLayout.collapsedCountWidth(hiddenWindows),
+                        .frame(width: metrics.collapsedCountWidth(hiddenWindows),
                                alignment: .trailing)
                 }
-                .padding(.horizontal, DeckLayout.collapsedPadding)
-                .frame(height: DeckMetrics.tileHeight + 6)
+                .padding(.horizontal, metrics.collapsedPadding)
+                .frame(height: metrics.pillHeight)
                 .background(
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    RoundedRectangle(cornerRadius: metrics.pillCornerRadius, style: .continuous)
                         .fill(.primary.opacity(0.06))
                 )
             }
@@ -183,8 +194,8 @@ struct DeckView: View {
                 draggableSlot(slot, section: section)
             }
         }
-        .padding(.horizontal, section.isPill ? DeckLayout.pillInset : 0)
-        .frame(height: DeckMetrics.tileHeight + 6)
+        .padding(.horizontal, section.isPill ? metrics.pillInset : 0)
+        .frame(height: metrics.pillHeight)
         .background(pillBackground(section))
         .contextMenu {
             if let groupID = section.groupID,
@@ -207,10 +218,10 @@ struct DeckView: View {
     private func pillBackground(_ section: DeckSection) -> some View {
         if let color = section.color {
             let isActive = section.groupID == store.activeGroupID
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
+            RoundedRectangle(cornerRadius: metrics.pillCornerRadius, style: .continuous)
                 .fill(color.opacity(isActive ? 0.22 : 0.13))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    RoundedRectangle(cornerRadius: metrics.pillCornerRadius, style: .continuous)
                         .strokeBorder(color.opacity(isActive ? 0.75 : 0.30),
                                       lineWidth: isActive ? 1.5 : 1)
                 )
@@ -436,7 +447,8 @@ struct DeckView: View {
             collapsedCount: store.collapsedGroups.count,
             collapsedWindows: store.collapsedGroups.reduce(0) { $0 + $1.count },
             sectionCount: sections.count,
-            dividerCount: sections.filter(\.dividerBefore).count
+            dividerCount: sections.filter(\.dividerBefore).count,
+            metrics: metrics
         )
     }
 
@@ -449,50 +461,6 @@ struct DeckView: View {
                 .foregroundStyle(.orange)
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, DeckMetrics.padding)
-    }
-}
-
-enum DeckMetrics {
-    static let height: CGFloat = 56
-    static let cornerRadius: CGFloat = 16
-    static let padding: CGFloat = 10
-    // 44 inside a 56pt strip: the icon carries the information, so the bar
-    // should not be mostly padding. Neither number may grow to make icons
-    // bigger — the strip's height is screen the user does not get back, and the
-    // tile's width is how many windows fit before the layout tightens. The way
-    // the Dock gets a large icon is not a large tile, it is a tile that is
-    // almost entirely icon, so growth comes out of this tile's own slack.
-    static let tileHeight: CGFloat = 44
-    static let pinnedTileWidth: CGFloat = 40
-    static let tileSpacing: CGFloat = 6
-    /// The groups button. Narrow because it no longer names a current group —
-    /// there is nothing to switch, so it is a menu and not a selector.
-    static let selectorWidth: CGFloat = 40
-    /// Status dots — group membership on a window tile, running state on a
-    /// launcher. Shared so the two kinds line up along the bottom of the row.
-    static let statusDotSize: CGFloat = 4
-    static let statusDotInset: CGFloat = 1.5
-    /// Space kept clear at the bottom of a tile for the dot, so the icon can
-    /// take everything above it.
-    ///
-    /// Centring the icon in the whole tile is what wasted the room: it split the
-    /// slack evenly top and bottom and then the dot had to be drawn *over* the
-    /// bottom half of it, so the icon could never grow into either. Reserving
-    /// the dot's band explicitly gives the icon one contiguous space instead of
-    /// two useless margins, which is the arrangement the Dock has — icon, then a
-    /// thin strip with the indicator in it, and nothing else.
-    static let dotClearance: CGFloat = 5
-    static let dividerWidth: CGFloat = 1
-    /// Gap between the strip and the screen edge.
-    static let edgeInset: CGFloat = 8
-    /// Breathing room so the strip never spans the full display.
-    static let screenMargin: CGFloat = 40
-    /// Width reserved for the "nothing here yet" hint.
-    static let emptyHintWidth: CGFloat = 380
-
-    static func maxWidth(screen: NSScreen? = NSScreen.main) -> CGFloat {
-        guard let screen else { return 1200 }
-        return screen.frame.width - screenMargin
+        .padding(.horizontal, metrics.padding)
     }
 }

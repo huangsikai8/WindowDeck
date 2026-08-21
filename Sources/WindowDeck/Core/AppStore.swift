@@ -46,6 +46,22 @@ final class AppStore {
     var clampZoomedWindows: Bool = true { didSet { onSettingsChanged?(); scheduleSave() } }
     /// Hide the strip while an app is genuinely fullscreen.
     var hideInFullscreen: Bool = true { didSet { scheduleSave() } }
+    /// How large the strip draws, 1 being the original size. Everything follows
+    /// from it — see `DeckMetrics`. Clamped on the way in as well as inside
+    /// `DeckMetrics`, so the value that reaches disk is already sane and a file
+    /// hand-edited to 40 cannot survive a round trip.
+    ///
+    /// `onSettingsChanged` because the zoom clamp reserves a band the height of
+    /// the strip; leaving that at the old height puts zoomed windows behind a
+    /// taller strip or above a shorter one.
+    var deckScale: CGFloat = DeckMetrics.defaultScale {
+        didSet {
+            let clamped = DeckMetrics.clamped(deckScale)
+            if clamped != deckScale { deckScale = clamped; return }
+            onSettingsChanged?()
+            scheduleSave()
+        }
+    }
     /// How long a cycle shortcut must be held before the switcher is drawn.
     /// Below this, a tap-and-release just switches with no interface at all.
     var switcherHoldDelay: TimeInterval = 0.18 { didSet { scheduleSave() } }
@@ -1274,19 +1290,24 @@ final class AppStore {
         return targets.sorted { position($0.windowID) < position($1.windowID) }
     }
 
-    /// Whether an app is pinned in a capsule. Nil means Main.
-    func isPinned(_ bundleID: String, in groupID: UUID?) -> Bool {
-        let target = groupID ?? main.id
-        return groups.first { $0.id == target }?
+    /// Whether an app is pinned in a capsule.
+    ///
+    /// The capsule is named rather than defaulted. These three took an optional
+    /// meaning Main while `pin`/`unpin` took one meaning the *active* capsule —
+    /// two opposite readings of the same nil, kept alive only by the pin menu's
+    /// "All" entry, which named a group the strip has not had since it became a
+    /// row of capsules.
+    func isPinned(_ bundleID: String, in groupID: UUID) -> Bool {
+        groups.first { $0.id == groupID }?
             .pinnedApps.contains { $0.bundleID == bundleID } ?? false
     }
 
     /// Pin or unpin, so one menu shows the state and changes it — the same shape
     /// as the group-membership menu, rather than a one-way "remove" that cannot
     /// tell you where the app is currently pinned.
-    func togglePin(_ bundleID: String, in groupID: UUID?) {
+    func togglePin(_ bundleID: String, in groupID: UUID) {
         if isPinned(bundleID, in: groupID) {
-            unpin(bundleID, in: groupID ?? main.id)
+            unpin(bundleID, in: groupID)
         } else {
             pinApp(bundleID: bundleID, in: groupID)
         }
@@ -1304,11 +1325,11 @@ final class AppStore {
         return targets
     }
 
-    /// Pins the application a window belongs to. `groupID` nil means Main.
-    func pinApp(bundleID: String, in groupID: UUID?) {
+    /// Pins the application a window belongs to, in a named capsule.
+    func pinApp(bundleID: String, in groupID: UUID) {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
               let app = PinnedApp(url: url) else { return }
-        pin(app, in: groupID ?? main.id)
+        pin(app, in: groupID)
     }
 
     func pin(_ app: PinnedApp, in groupID: UUID? = nil) {
@@ -2134,6 +2155,7 @@ final class AppStore {
         autoAddNewWindows = state.autoAddNewWindows
         clampZoomedWindows = state.clampZoomedWindows
         hideInFullscreen = state.hideInFullscreen
+        deckScale = CGFloat(state.deckScale)
         switcherHoldDelay = state.switcherHoldDelay
         cycleOrder = state.cycleOrder
         appCycleStaysInGroup = state.appCycleStaysInGroup
@@ -2271,6 +2293,7 @@ final class AppStore {
             autoAddNewWindows: autoAddNewWindows,
             clampZoomedWindows: clampZoomedWindows,
             hideInFullscreen: hideInFullscreen,
+            deckScale: Double(deckScale),
             switcherHoldDelay: switcherHoldDelay,
             cycleOrder: cycleOrder,
             appCycleStaysInGroup: appCycleStaysInGroup,

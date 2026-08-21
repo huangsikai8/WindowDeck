@@ -14,6 +14,10 @@ import AppKit
 ///    closes up and tiles shrink — the way the Dock does it. Widths are never
 ///    clamped *up* to a floor: doing that is what made a busy strip spill past
 ///    its own edge and clip the last icons.
+///
+/// Every size it works from comes in as `DeckMetrics`, so the user's size
+/// setting needs nothing here: a bigger tile simply reaches the point where the
+/// row tightens sooner, which is rule 3 doing its job rather than a special case.
 enum DeckLayout {
 
     struct Slot: Identifiable {
@@ -40,70 +44,25 @@ enum DeckLayout {
         let totalWidth: CGFloat
     }
 
-    static let iconOnlyWidth: CGFloat = 40
-    static let preferredTitledWidth: CGFloat = 150
-    /// Below this a title is just an ellipsis, so entries collapse to icon-only
-    /// instead — the same thing Chrome does when tabs get too narrow.
-    ///
-    /// It tracks `preferredIconSize`: a titled tile spends its width on padding
-    /// (7 a side), the icon and the 6pt gap before the text, so raising the icon
-    /// without raising this leaves literally no room for the title it is
-    /// supposed to be guaranteeing.
-    static let minimumTitledWidth: CGFloat = 64
-    /// Absolute floor. Only reached on a genuinely extreme strip; the fair share
-    /// governs long before this does.
-    static let hardMinimumWidth: CGFloat = 14
-    /// Close to `iconOnlyWidth` on purpose. The Dock's tile is very nearly all
-    /// icon, and matching that is the only way to draw a Dock-sized icon without
-    /// a Dock-sized tile — the margins are the thing that was making the strip
-    /// look like a row of thumbnails. What is left, 2pt a side at full width, is
-    /// the separation between neighbouring icons and nothing more.
-    static let preferredIconSize: CGFloat = 36
-    static let minimumIconSize: CGFloat = 10
-    static let preferredSpacing: CGFloat = 6
-
     /// A cluster is charged this many entry-widths. Expressing it as a multiple
     /// rather than a fixed size is what keeps the exact-fit guarantee: whatever
     /// the fair share works out to, a cluster stays proportionally wider and the
-    /// row still totals the space available.
+    /// row still totals the space available. It is scale-free for the same
+    /// reason, which is why it lives here and not in `DeckMetrics`.
     static let clusterWidthUnits: CGFloat = 1.4
 
     /// Gaps close up before tiles start shrinking — the same order of sacrifice
-    /// the Dock makes, and it buys a surprising amount of room.
-    static func spacing(forCount count: Int) -> CGFloat {
+    /// the Dock makes, and it buys a surprising amount of room. The tightened
+    /// steps are fractions of the preferred gap rather than fixed points, so a
+    /// larger strip closes up by the same proportion instead of slamming shut.
+    static func spacing(forCount count: Int, metrics: DeckMetrics) -> CGFloat {
+        let preferred = metrics.preferredSpacing
         switch count {
-        case ..<16: preferredSpacing
-        case ..<24: 4
-        case ..<32: 3
-        default: 2
+        case ..<16: return preferred
+        case ..<24: return max(1, (preferred * 4 / 6).rounded())
+        case ..<32: return max(1, (preferred * 3 / 6).rounded())
+        default: return max(1, (preferred * 2 / 6).rounded())
         }
-    }
-
-    /// Width a capsule adds around its contents, per side.
-    static let pillInset: CGFloat = 5
-    // The overflow control's geometry, defined once and read by both the layout
-    // and the view. Estimating it here and drawing something else there made the
-    // panel wider than its contents, and the surplus showed as dead space on the
-    // right that the left edge did not have.
-    static let collapsedPadding: CGFloat = 8
-    static let collapsedDotSize: CGFloat = 11
-    /// Each further dot overlaps its neighbour, so folding six groups costs about
-    /// a tile rather than six.
-    static let collapsedDotStep: CGFloat = 7
-    static let collapsedGap: CGFloat = 5
-
-    /// Sized to the digits actually shown rather than reserving room for three.
-    /// A fixed slot left the number floating away from the dots with a gap on
-    /// both sides — the count is the last thing in the control, so any surplus
-    /// reads as the whole thing being badly spaced.
-    static func collapsedCountWidth(_ total: Int) -> CGFloat {
-        CGFloat(String(total).count) * 7 + 2
-    }
-
-    static func collapsedControlWidth(groups: Int, windows: Int) -> CGFloat {
-        collapsedPadding * 2
-            + collapsedDotSize + CGFloat(max(groups - 1, 0)) * collapsedDotStep
-            + collapsedGap + collapsedCountWidth(windows)
     }
 
     static func compute(
@@ -115,10 +74,11 @@ enum DeckLayout {
         collapsedCount: Int = 0,
         collapsedWindows: Int = 0,
         sectionCount: Int = 1,
-        dividerCount: Int = 0
+        dividerCount: Int = 0,
+        metrics: DeckMetrics = DeckMetrics()
     ) -> Result {
 
-        let spacing = spacing(forCount: items.count)
+        let spacing = spacing(forCount: items.count, metrics: metrics)
         // Gaps *within* sections. The row draws one between neighbouring items in
         // the same section and one between sections — counting N-1 of the former
         // double-counts the joins, and since the row is leading-aligned the
@@ -129,25 +89,25 @@ enum DeckLayout {
         // anything else — unaccounted, it pushes the row past the edge.
         // Each separator costs width like anything else — unaccounted, the row
         // runs past the strip's edge and the last icons clip.
-        let dividerChrome = CGFloat(dividerCount) * (DeckMetrics.dividerWidth + spacing)
+        let dividerChrome = CGFloat(dividerCount) * (metrics.dividerWidth + spacing)
         // Each capsule costs its own padding on both sides plus the gap to its
         // neighbour. Unaccounted, a bucketed All runs past the strip's edge —
         // the same failure separators caused before they were charged for.
         // Only the capsules' own padding: the gaps between them are counted once,
         // above, as inter-section gaps.
-        let pillChrome = CGFloat(pillCount) * (pillInset * 2)
+        let pillChrome = CGFloat(pillCount) * (metrics.pillInset * 2)
         // The overflow cluster and the rule before it are chrome like anything
         // else — uncharged, the row runs past the strip's edge.
         let overflowChrome = collapsedCount > 0
-            ? collapsedControlWidth(groups: collapsedCount, windows: collapsedWindows)
-                + DeckMetrics.dividerWidth + spacing * 2
+            ? metrics.collapsedControlWidth(groups: collapsedCount, windows: collapsedWindows)
+                + metrics.dividerWidth + spacing * 2
             : 0
-        let chrome = chromeWidth(pinnedCount: pinnedCount, spacing: spacing)
+        let chrome = chromeWidth(pinnedCount: pinnedCount, spacing: spacing, metrics: metrics)
             + dividerChrome + pillChrome + overflowChrome + interSectionGaps
 
         guard !items.isEmpty else {
             return Result(slots: [], spacing: spacing,
-                          totalWidth: min(chrome + DeckMetrics.emptyHintWidth, maxWidth))
+                          totalWidth: min(chrome + metrics.emptyHintWidth, maxWidth))
         }
         guard maxWidth > chrome else {
             return Result(slots: [], spacing: spacing, totalWidth: maxWidth)
@@ -175,9 +135,9 @@ enum DeckLayout {
 
         // Total cost in entry-widths, with clusters charged more.
         let units = items.reduce(CGFloat(0)) { $0 + ($1.isCluster ? clusterWidthUnits : 1) }
-        let fairUnit = min(iconOnlyWidth, available / max(units, 1))
+        let fairUnit = min(metrics.iconOnlyWidth, available / max(units, 1))
 
-        var titledWidth = preferredTitledWidth
+        var titledWidth = metrics.preferredTitledWidth
         var baseWidth = fairUnit
         var showTitles = wantsTitle
 
@@ -185,20 +145,20 @@ enum DeckLayout {
             let untitledUnits = zip(items, wantsTitle).reduce(CGFloat(0)) { total, pair in
                 pair.1 ? total : total + (pair.0.isCluster ? clusterWidthUnits : 1)
             }
-            let fairTitled = (available - untitledUnits * iconOnlyWidth) / CGFloat(titledCount)
+            let fairTitled = (available - untitledUnits * metrics.iconOnlyWidth) / CGFloat(titledCount)
 
-            if fairTitled < minimumTitledWidth {
+            if fairTitled < metrics.minimumTitledWidth {
                 // Not enough room to say anything useful — drop to icon-only
                 // across the board rather than render a row of ellipses.
                 showTitles = Array(repeating: false, count: items.count)
                 baseWidth = fairUnit
             } else {
-                titledWidth = min(preferredTitledWidth, fairTitled)
-                baseWidth = iconOnlyWidth
+                titledWidth = min(metrics.preferredTitledWidth, fairTitled)
+                baseWidth = metrics.iconOnlyWidth
             }
         }
 
-        baseWidth = max(hardMinimumWidth, baseWidth)
+        baseWidth = max(metrics.hardMinimumWidth, baseWidth)
 
         let slots = zip(items, showTitles).map { item, showsTitle -> Slot in
             let width: CGFloat = showsTitle
@@ -208,7 +168,8 @@ enum DeckLayout {
                 item: item,
                 width: width,
                 showsTitle: showsTitle,
-                iconSize: iconSize(forEntryWidth: width, showsTitle: showsTitle, isCluster: item.isCluster)
+                iconSize: iconSize(forEntryWidth: width, showsTitle: showsTitle,
+                                   isCluster: item.isCluster, metrics: metrics)
             )
         }
 
@@ -223,28 +184,31 @@ enum DeckLayout {
     private static func iconSize(
         forEntryWidth width: CGFloat,
         showsTitle: Bool,
-        isCluster: Bool
+        isCluster: Bool,
+        metrics: DeckMetrics
     ) -> CGFloat {
-        guard !showsTitle else { return preferredIconSize }
+        guard !showsTitle else { return metrics.preferredIconSize }
         if isCluster {
-            return max(minimumIconSize, min(preferredIconSize - 4, width * 0.42))
+            return max(metrics.minimumIconSize,
+                       min(metrics.preferredIconSize - 4, width * 0.42))
         }
-        return max(minimumIconSize, min(preferredIconSize, width - 4))
+        return max(metrics.minimumIconSize, min(metrics.preferredIconSize, width - 4))
     }
 
     /// Everything that isn't an item: padding, selector, dividers, pins.
-    private static func chromeWidth(pinnedCount: Int, spacing: CGFloat) -> CGFloat {
+    private static func chromeWidth(pinnedCount: Int, spacing: CGFloat,
+                                    metrics: DeckMetrics) -> CGFloat {
         let pinned = pinnedCount == 0
             ? 0
-            : CGFloat(pinnedCount) * DeckMetrics.pinnedTileWidth
+            : CGFloat(pinnedCount) * metrics.pinnedTileWidth
                 + CGFloat(pinnedCount - 1) * 2
                 + spacing * 2
-                + DeckMetrics.dividerWidth
+                + metrics.dividerWidth
 
-        return DeckMetrics.padding * 2
-            + DeckMetrics.selectorWidth
+        return metrics.padding * 2
+            + metrics.selectorWidth
             + spacing * 2
-            + DeckMetrics.dividerWidth
+            + metrics.dividerWidth
             + pinned
     }
 }

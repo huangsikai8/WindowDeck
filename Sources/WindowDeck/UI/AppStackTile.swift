@@ -34,16 +34,20 @@ struct AppStackTile: View {
     @State private var isHovering = false
     @State private var frame: CGRect = .zero
 
+    /// Sizes come from the strip that is drawing this tile, so every tile in the
+    /// row is built from the same scale the layout pass measured with.
+    @Environment(\.deckMetrics) private var metrics
+
     var body: some View {
         Button(action: onActivate) {
             iconLayer
-                .padding(.bottom, DeckMetrics.dotClearance)
-                .frame(width: width, height: DeckMetrics.tileHeight)
+                .padding(.bottom, metrics.dotClearance)
+                .frame(width: width, height: metrics.tileHeight)
                 .overlay(alignment: .topTrailing) { badge }
                 // One dot, not one per window: the badge already says how many.
                 .overlay(alignment: .bottom) { StatusDot(tint: tint, isFocused: isFocused) }
                 .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    RoundedRectangle(cornerRadius: metrics.tileCornerRadius, style: .continuous)
                         .fill(plateFill)
                 )
                 .background(frameReader)
@@ -97,11 +101,11 @@ struct AppStackTile: View {
     /// panel open for a stack the pointer was only near.
     private var badge: some View {
         Text("\(count)")
-            .font(.system(size: 8, weight: .bold))
+            .font(.system(size: metrics.badgeFontSize, weight: .bold))
             .monospacedDigit()
             .foregroundStyle(.background)
-            .padding(.horizontal, 3)
-            .frame(minWidth: 12, minHeight: 12)
+            .padding(.horizontal, metrics.badgePadding)
+            .frame(minWidth: metrics.badgeMinSize, minHeight: metrics.badgeMinSize)
             .background(Capsule().fill(.primary.opacity(0.75)))
             .padding(.top, 1)
             .padding(.trailing, 1)
