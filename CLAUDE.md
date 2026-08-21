@@ -1210,9 +1210,104 @@ Three things this must keep, and the first is the one that will look wrong to a 
   opposite of the goal. Draw the standard canvas larger instead.
 
 `minimumTitledWidth` rose 64 → 71, by exactly the icon's growth, so the text allowance at the
-collapse threshold is unchanged. `clusterIconCap` was pinned to 32 — the value it previously derived
-from `preferredIconSize` — because a cluster stacks several icons in one tile and should not have
-been enlarged along with everything else.
+collapse threshold is unchanged.
+
+**A cluster draws one icon per window it holds, and the icon is what pays for the depth.** Three
+separate faults lived in that one tile, and the middle one is the instructive one.
+
+It drew its icons at a flat `width * 0.42`, a number that predates `inkHeadroom` and was never
+re-derived when plain tiles moved to bounding their ink. A cluster is charged `clusterWidthUnits` —
+1.4 tiles — so at 1.15x a **64.4pt tile drew 27pt icons whose stack spanned 40.5pt**. Three fifths of
+the width it was charged for was empty, which reads as a tiny icon rather than as a tile going to
+waste, and it is why it was reported as the cluster being small next to tiles that look fine.
+
+**Sizing it to the no-spill ceiling instead is the opposite mistake, and was reported as one.** That
+ceiling — `width / clusterSpan(depth:ink: 1 / inkHeadroom)`, worst-case ink — is *defined* as the
+width at which the artwork touches the edge, so the stack ran into the tile's own border with 1.2pt of
+margin against a plain tile's 2.3pt. The rule that actually governs is `roomy`: the stack takes the
+same share of its tile that a plain icon's ink takes of its own (`plainInkShare`, about 0.90 at every
+step of the slider). It is measured against `medianInk`, because **the worst case is what guarantees
+nothing spills and the median is what the row looks like** — two ratios for two different questions,
+and collapsing them into one is the whole of this bug.
+
+**And it always drew three icons, so the depth was a constant everything else was written against.**
+`stackDepth(of:)` asks the item now, capped at `clusterStackDepth` (6) — past that the badge alone
+carries the count, since a seventh icon in a tile of fixed width is a sliver of a sliver. Two
+consequences, one in the sizing and one in the drawing:
+
+* **The icon shrinks as the cluster fills up**, because nothing else can. The tile is 1.4 entries
+  whatever it holds — the width was considered as the thing that gives instead and the user chose
+  against it — and `clusterOverlapStep` is fixed at 0.30 so every icon shows the same fraction of
+  itself however many there are.
+* **`ClusterTile` steps its offsets from the middle of the stack it is drawing**, not from a fixed
+  first slot. Stepping from index 0 centres a stack of exactly `clusterStackDepth` and pushes every
+  shorter one aside: measured at **6.4pt left of centre** for a cluster of two at 1.15x, a third of
+  its own margin.
+
+**The stack travels up as well as across, and the second axis is worth more than it looks.** The tile
+is charged 1.4 entries and its icon band is nearly square, so a stack fanned along one axis leaves the
+other entirely unused — and the unused axis is exactly what a deep stack is starving for. The icon
+gains a little, because the step is spread over two axes and costs less width apiece; the real gain is
+that every icon behind the front one shows an **L** of itself, its right edge and its top, instead of
+a vertical strip of the same width. Measured at 1.15x against the horizontal fan:
+
+| members | icon | exposed per background icon |
+|---|---|---|
+| 3 | 40.1 → 40.8 | +10% |
+| 4 | 33.2 → 34.2 | +18% |
+| 5 | 28.3 → 29.3 | +23% |
+| 6 | 24.7 → 25.7 | +20% |
+
+`clusterIconSize` solves for it rather than picking an angle, and that is not decoration. The stack is
+bounded twice — `(depth - 1)·dx + ink ≤ W` and the same in `H` — while the step must stay
+`clusterOverlapStep` of the icon *long*; both bounds are tight at the best icon and the step's length
+is `sqrt(dx² + dy²)`, so the answer is the first root of `(2m² - c²)i² - 2m(W + H)i + (W² + H²)`. A
+**fixed angle makes a stack of three smaller than the horizontal fan it replaced** — a large icon has
+no vertical slack to spend — so the fan has to flatten by itself as the stack gets shallower. A stack
+of two reaches `preferredIconSize`, is left with no vertical room at all, and degenerates back to a
+horizontal pair without being special-cased into one.
+
+**The lean is capped at `clusterRiseSlope`, about 20°.** Left to find its own angle the fan steepens as
+it deepens, because a deeper stack has to climb harder to make each step up to length — 16° at three
+members, 23° at four, 28° at six. That is both too steep to read as a row of icons and *inconsistent*,
+so two clusters of different sizes lean differently side by side. The cap holds four, five and six at a
+flat 20° apiece for about a point of icon at the deepest.
+
+It is enforced in the **sizing**, not in the drawing, and the difference is worth knowing. With the
+angle fixed the step's horizontal share is fixed too, so the bound is the flat horizontal rule with a
+shorter effective stride — `room.width / (m + c·cos)` — and no trigonometry. `clusterStep` deliberately
+carries *no* clamp to the slope: where that bound governs, `across` works out to `wanted·cos` of the
+lean and the climb is its `sin`, so the ratio is the slope on the nose; where a tighter bound governs
+the icon is smaller, `across` larger and the lean shallower still. A clamp there would look like the
+thing enforcing the angle while never once firing. Verified by A/B — removing the clamp fails nothing,
+removing the sizing bound fails **29 checks**.
+
+Two further rules keep the second axis from paying for itself twice, and each was a measured
+regression:
+
+* **A cluster's icon is capped at the plain tile's icon, not at `preferredIconSize`.** The vertical
+  room does not shrink when the row fills up — only the tile's width does — so a crowded strip at 1.6x
+  let the solver lean the whole step upward and grow a cluster's icons to **51pt beside 35pt
+  neighbours**, with the artwork spilling the tile.
+* **`clusterStep` fills across first and always the whole way, then climbs only by what the width fell
+  short of.** Spending all the leftover slack on both axes is the tempting version: an icon held down
+  by that ceiling has vertical room it does not need, and taking it drew a crowded pair at 1.6x with a
+  **29pt rise between two icons**, fanned halfway up the tile. Slack in a direction is only worth
+  taking while something still needs it.
+
+Filling across the whole way is also what gives every cluster the same margin at every depth — the
+step is derived from the icon rather than read as the constant, because a stack bounded by the icon
+band cannot grow to fill its tile and would otherwise sit narrow in the middle of it. The badge is
+left overlapping the icons; that was confirmed as wanted.
+
+The stack's geometry lives on `DeckLayout` and `ClusterTile` reads it, for the same reason the overflow
+control's does: sizing against one overlap and drawing against another is how artwork ends up adrift in
+a box measured for something else. `clusterIconsFillTheirTile` runs every check at every depth from 2
+to the cap, on both axes, and asserts the margin, the no-spill ceiling in each direction, the step's
+length, that it climbs no further than it must, that it never leans past the slope, that it stays flat
+when the width suffices, and that a deeper cluster genuinely draws smaller icons. A/B: restoring the fixed depth of 3 fails **102 checks**;
+the ceiling-sized icon, the `preferredIconSize` cap and the spend-all-slack step fail **5 to 9** each. Centring is not reachable by
+the self-test, which cannot see appearance — it was measured off the offsets directly.
 
 **The strip's size is one setting, and `DeckMetrics` is a value rather than a namespace.** The Dock
 has a single size slider and everything about it follows — a bigger tile means a bigger icon, a taller
@@ -1498,7 +1593,7 @@ an empty group showing nothing looks like a badge that failed to render.
 WINDOWDECK_SELFTEST=1 WINDOWDECK_STATE_DIR=/tmp/wdtest ./build/WindowDeck.app/Contents/MacOS/WindowDeck
 ```
 
-~383 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
+~890 checks, about a second, covering persistence (legacy files, the one-capsule migration, a changed
 field type degrading rather than wiping the file, round-trips), ordering, restore matching, membership
 moves, capture of new windows, pruning, clustering, app stacks, switcher candidate ordering and scope,
 section building and layout. It **refuses to run without `WINDOWDECK_STATE_DIR`**, so it can never

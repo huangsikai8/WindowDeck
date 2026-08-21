@@ -28,8 +28,20 @@ struct ClusterTile: View {
     /// row is built from the same scale the layout pass measured with.
     @Environment(\.deckMetrics) private var metrics
 
-    /// More than three overlapped icons is mush; the badge carries the real count.
-    private var shown: [WindowInfo] { Array(members.prefix(3)) }
+    /// One icon per member, up to `clusterStackDepth`; past that the badge alone
+    /// carries the count. The layout sized `iconSize` against this exact number,
+    /// so drawing one more here would put artwork outside the tile measured for it.
+    private var shown: [WindowInfo] { Array(members.prefix(DeckLayout.clusterStackDepth)) }
+
+    /// How far apart the icons are drawn, across and up. It comes from
+    /// `DeckLayout`, which chose `iconSize` against exactly this — the step is
+    /// what the layout could *not* spend on the icon, so it is derived from the
+    /// icon rather than assumed. Reading a fixed step here would leave a stack
+    /// bounded by the icon band sitting narrow in the middle of its own tile.
+    private var stackStep: CGSize {
+        DeckLayout.clusterStep(depth: shown.count, width: width,
+                               iconSize: iconSize, metrics: metrics)
+    }
 
     /// Filled with the capsule's colour when one of its windows is frontmost,
     /// exactly as a window tile is — a cluster is a window you are in, and it
@@ -87,6 +99,12 @@ struct ClusterTile: View {
 
     /// Overlapped, most recent first, offset by a fraction of the icon so the
     /// stack reads as depth rather than a row.
+    ///
+    /// Offsets are measured from the **middle of the stack being drawn**, not from
+    /// a fixed first slot. Stepping from index 0 centres a stack of exactly
+    /// `clusterStackDepth`, and pulls every shorter one off to one side — a
+    /// cluster of two sat 6.4pt left of its own tile at 1.15x, which is a third of
+    /// its margin, and it read as the tile being wrong rather than the icons.
     private var stack: some View {
         ZStack {
             ForEach(Array(shown.enumerated().reversed()), id: \.offset) { index, member in
@@ -94,13 +112,20 @@ struct ClusterTile: View {
                     Image(nsImage: icon)
                         .resizable()
                         .frame(width: iconSize, height: iconSize)
-                        .offset(x: CGFloat(index) * iconSize * 0.30 - iconSize * 0.30,
-                                y: CGFloat(index) * -1.5)
+                        .offset(x: step(index) * stackStep.width,
+                                y: step(index) * -stackStep.height)
                         .shadow(color: .black.opacity(0.25), radius: 0.5, x: -0.5, y: 0)
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// How far this icon sits from the middle of the stack, in steps. Symmetric
+    /// about zero, so the stack is centred whatever its depth — on both axes,
+    /// since it now travels up as well as across.
+    private func step(_ index: Int) -> CGFloat {
+        CGFloat(index) - CGFloat(shown.count - 1) / 2
     }
 
     private var countBadge: some View {

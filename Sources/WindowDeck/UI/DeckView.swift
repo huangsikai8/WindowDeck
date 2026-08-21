@@ -209,21 +209,22 @@ struct DeckView: View {
         }
     }
 
-    /// The capsule's own tint, and a brighter ring on the one being worked in.
+    /// The capsule's own tint. Every capsule is drawn the same way.
     ///
-    /// Which capsule that is comes from the focused window, so the ring says
-    /// where the next window you open will land. Nothing else marks it: there is
-    /// no selection to show, because there is nothing to select.
+    /// These are the values the capsule holding the focused window used to get on
+    /// its own — the stronger tint and the full-strength ring — and every capsule
+    /// gets them now. Restyling one as focus moved made the row change under you
+    /// while you were reading it, and the weaker pair the others were left with
+    /// read as washed out beside it. `activeGroup` still decides where a new
+    /// window goes; it simply is not drawn any more.
     @ViewBuilder
     private func pillBackground(_ section: DeckSection) -> some View {
         if let color = section.color {
-            let isActive = section.groupID == store.activeGroupID
             RoundedRectangle(cornerRadius: metrics.pillCornerRadius, style: .continuous)
-                .fill(color.opacity(isActive ? 0.22 : 0.13))
+                .fill(color.opacity(0.22))
                 .overlay(
                     RoundedRectangle(cornerRadius: metrics.pillCornerRadius, style: .continuous)
-                        .strokeBorder(color.opacity(isActive ? 0.75 : 0.30),
-                                      lineWidth: isActive ? 1.5 : 1)
+                        .strokeBorder(color.opacity(0.75), lineWidth: 1.5)
                 )
         } else {
             Color.clear

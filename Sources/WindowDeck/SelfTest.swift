@@ -84,6 +84,7 @@ enum SelfTest {
         activeCapsuleTracking()
         activationRaiseIsNotIntent()
         iconInkStaysInsideItsTile()
+        clusterIconsFillTheirTile()
         newWindowPlacement()
         twoInstancesOfOneApp()
         menuIconCaching()
@@ -1409,6 +1410,173 @@ enum SelfTest {
             }
         }
     }
+
+    /// A cluster draws one icon per window it holds, up to the cap, and fills its
+    /// tile at every depth.
+    ///
+    /// Three separate faults, all in this one tile, and each is asserted here.
+    ///
+    /// It drew its icons at a flat `width * 0.42`, a number that predates
+    /// `inkHeadroom` and was never re-derived when plain tiles moved to bounding
+    /// their ink. A cluster is charged `clusterWidthUnits` — 1.4 tiles — so at
+    /// 1.15x a 64.4pt tile drew 27pt icons whose stack spanned 40.5pt: three
+    /// fifths of the width it was charged for was empty, which reads as a tiny
+    /// icon rather than as a tile going to waste.
+    ///
+    /// Sizing to the no-spill ceiling instead is the opposite mistake: that
+    /// ceiling is *defined* as the width at which the artwork touches the edge, so
+    /// the stack ran into the tile's own border with 1.2pt of margin against a
+    /// plain tile's 2.3pt. Hence a margin assertion rather than only an absence of
+    /// overflow.
+    ///
+    /// And it always drew three icons, so the depth was a constant everything else
+    /// was written against — a cluster of two was sized for an absent third and
+    /// centred on a slot that was not there. Every check below therefore runs at
+    /// every depth up to the cap.
+    private static func clusterIconsFillTheirTile() {
+        let worstInk: CGFloat = 0.898
+
+        for scale in [DeckMetrics.minScale, DeckMetrics.defaultScale, DeckMetrics.maxScale] {
+            let metrics = DeckMetrics(scale: scale)
+            let tag = String(format: "%.2gx", Double(scale))
+
+            for depth in 2...DeckLayout.clusterStackDepth {
+                var sizes: [CGFloat] = []
+
+                for count in [2, 8, 30] {
+                    let label = "\(depth) of \(count) at \(tag)"
+                    var items: [DeckItem] = (0..<count).map { i in
+                        DeckItem.window(WindowInfo.testInstance(id: CGWindowID(3000 + i),
+                                                                bundleID: "com.app\(i)",
+                                                                title: "Window \(i)",
+                                                                pid: pid_t(i)))
+                    }
+                    let members = (0..<depth).map { i in
+                        WindowInfo.testInstance(id: CGWindowID(3900 + i),
+                                                bundleID: "com.clustered\(i)",
+                                                title: "Clustered \(i)",
+                                                pid: pid_t(90 + i))
+                    }
+                    items.append(.cluster(WindowCluster(memberIDs: members.map(\.id)), members))
+
+                    let layout = DeckLayout.compute(items: items, pinnedCount: 0,
+                                                    titlesEnabled: true, maxWidth: 1240,
+                                                    metrics: metrics)
+                    guard let slot = layout.slots.last, slot.item.isCluster,
+                          let plain = layout.slots.first(where: { !$0.item.isCluster }) else {
+                        check("the cluster and a plain slot exist, \(label)", false)
+                        continue
+                    }
+                    sizes.append(slot.iconSize)
+
+                    check("the layout sizes a cluster for the icons it draws, \(label)",
+                          DeckLayout.stackDepth(of: slot.item) == depth,
+                          "\(DeckLayout.stackDepth(of: slot.item))")
+
+                    // The step the tile will actually draw with, across and up.
+                    // Everything below measures the stack the user sees, not a
+                    // nominal one.
+                    let step = DeckLayout.clusterStep(depth: depth, width: slot.width,
+                                                      iconSize: slot.iconSize,
+                                                      metrics: metrics)
+                    let room = DeckLayout.clusterRoom(width: slot.width, metrics: metrics)
+                    let band = metrics.tileHeight - metrics.dotClearance
+
+                    // The step keeps its length however it is split between the
+                    // axes: that is what holds each icon's exposed corner at the
+                    // same fraction of itself at every depth. Slack in one
+                    // direction is spent, not lost, so it may only ever be longer.
+                    let travel = (step.width * step.width + step.height * step.height)
+                        .squareRoot()
+                    let wanted = slot.iconSize * DeckLayout.clusterOverlapStep
+                    check("the drawn step never closes below the intended overlap, \(label)",
+                          depth == 1 || travel >= wanted - 0.02,
+                          "travelled \(travel) of \(wanted)")
+
+                    // Nor climbs further than the width fell short by. The rise is
+                    // there to make the step up to length, not to spend slack: an
+                    // icon held down by the plain-tile ceiling has vertical room it
+                    // does not need, and taking it drew a crowded pair at 1.6x with
+                    // a 29pt rise between two icons, fanned halfway up the tile.
+                    check("a cluster's stack climbs only as far as it must, \(label)",
+                          travel <= max(wanted, step.width) + 0.02,
+                          "travelled \(travel), width alone gave \(step.width)")
+                    check("a cluster's stack stays flat when the width suffices, \(label)",
+                          step.width < wanted - 0.02 || step.height == 0,
+                          "rose \(step.height) with \(step.width) across")
+
+                    // Nor leans steeper than the cap, at any depth. Left to find
+                    // its own angle the fan steepens as it deepens — 16° at three
+                    // members against 28° at six — which is both hard to read as a
+                    // row of icons and inconsistent between two clusters on the
+                    // same row.
+                    check("a cluster's stack never leans past its slope, \(label)",
+                          step.height <= step.width * DeckLayout.clusterRiseSlope + 0.02,
+                          "rose \(step.height) over \(step.width)")
+
+                    // Worst-case ink of every icon on the machine, still inside the
+                    // tile — in *both* directions now. This is the guarantee; the
+                    // margin below is the look.
+                    let widest = DeckLayout.clusterSpan(depth: depth, iconSize: slot.iconSize,
+                                                        ink: worstInk, step: step.width)
+                    check("a cluster's stack stays inside its tile, \(label)",
+                          widest <= slot.width + 0.01,
+                          "span \(widest) > width \(slot.width)")
+                    let tallest = DeckLayout.clusterSpan(depth: depth, iconSize: slot.iconSize,
+                                                         ink: worstInk, step: step.height)
+                    check("a cluster's stack stays inside the icon band, \(label)",
+                          tallest <= band + 0.01, "\(tallest) > \(band)")
+
+                    // And typically it leaves the same margin a plain icon does,
+                    // rather than merely not spilling. This is the assertion the
+                    // ceiling-sized version fails.
+                    let typical = DeckLayout.clusterSpan(depth: depth, iconSize: slot.iconSize,
+                                                         ink: DeckLayout.medianInk,
+                                                         step: step.width)
+                    check("a cluster's stack keeps a plain tile's margin, \(label)",
+                          typical <= room.width + 0.01,
+                          "fills \(typical) of \(slot.width), allowed \(room.width)")
+                    // Nor is it adrift in a tile far larger than it, which is the
+                    // fault that started this. The tile is charged 1.4 entries at
+                    // every depth, so at every depth it has to be filled.
+                    check("a cluster's stack is not adrift in its tile, \(label)",
+                          typical >= room.width - 0.5,
+                          "fills only \(typical) of an allowed \(room.width)")
+
+                    check("the row still fits with a cluster in it, \(label)",
+                          layout.totalWidth <= 1240 + 0.01, "\(layout.totalWidth)")
+
+                    // Never visibly larger than a plain icon: several windows
+                    // behind one icon may match its neighbours, not outgrow them.
+                    //
+                    // The half-point tolerance is real, not slack for a rounding
+                    // error. A crowded plain tile is bounded by *worst-case* ink
+                    // and a cluster by the *median*, so where both bind the two
+                    // land a tenth of a point apart and which is nominally larger
+                    // is a property of the two ratios rather than of the design.
+                    check("a cluster's icons are never visibly larger than a plain one, \(label)",
+                          slot.iconSize <= plain.iconSize + 0.5,
+                          "cluster \(slot.iconSize) against plain \(plain.iconSize)")
+                }
+
+                // Deeper stacks draw smaller icons, at a fixed tile and a fixed
+                // overlap. That is the whole shape of the rule: the tile cannot
+                // grow and the separation is held constant, so the icon is what
+                // gives — and asserting it here is what stops a future change
+                // quietly buying icon size back out of the overlap instead.
+                if depth > 2, let widest = sizes.first, let previous = deeperClusterSizes[depth - 1] {
+                    check("a deeper cluster draws smaller icons at \(tag)",
+                          widest < previous - 0.01, "\(widest) against \(previous)")
+                }
+                deeperClusterSizes[depth] = sizes.first
+            }
+            deeperClusterSizes.removeAll()
+        }
+    }
+
+    /// The uncrowded cluster icon size at each depth, so the next depth can be
+    /// compared against it.
+    private static var deeperClusterSizes: [Int: CGFloat] = [:]
 
     /// A window raised by its own application activating is not a statement about
     /// where the user is working.

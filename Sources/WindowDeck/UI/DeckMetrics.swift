@@ -160,10 +160,6 @@ struct DeckMetrics: Equatable {
     /// Scaled, unlike the two floors below it: this is a *preferred* size the
     /// layout clamps down from, never up to, so it carries none of their risk.
     var preferredIconSize: CGFloat { whole(43) }
-    /// Clusters stack several icons in one tile, so they stay at the size they
-    /// were before the icon grew — a number of its own rather than derived from
-    /// `preferredIconSize`, which would have silently enlarged them too.
-    var clusterIconCap: CGFloat { whole(32) }
     /// Unscaled for the same reason as `hardMinimumWidth`: it is a floor the icon
     /// is clamped *up* to, and a tile at that floor is `hardMinimumWidth` wide —
     /// so a scaled minimum would draw a 16pt icon in a 14pt tile.
